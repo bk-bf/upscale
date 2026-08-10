@@ -729,7 +729,13 @@ RSCRIPT=${RSCRIPT:-/root/bench/upscale-ep-rental.sh}
 POLL=${POLL:-60}
 
 cdie(){ say "$*"; exit 1; }
-rsh(){ ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST "$@"; }
+# Every remote call is bounded. A hung ssh here does not fail loudly - it just
+# never returns, and the collector sits in do_wait forever while the GPU box
+# finishes an episode nobody ever collects.
+rsh(){ timeout "${SSHTMO:-90}" ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST "$@"; }
+
+# Is the per-episode worker running on the box right now?
+rworking(){ rsh "pgrep -f $(basename "$RSCRIPT") >/dev/null" >/dev/null 2>&1; }
 
 # Decoded frame count. NOT packet count: a DivX packed-bitstream AVI carries two
 # frames in some packets and emits skip packets, so packets and frames differ by
@@ -772,16 +778,37 @@ cmd_collect(){
       if [ "$rsz" != "$lsz" ]; then say "size mismatch after push"; sleep "$POLL"; continue; fi
     fi
 
-    # setsid+nohup: a dropped ssh session must not kill a 15-minute episode.
-    rsh "rm -f $RWORK/out.mkv; cd $RWORK && setsid nohup bash $RSCRIPT $RWORK/src.avi $RWORK/out.mkv \
-         > $RWORK/current.log 2>&1 < /dev/null & echo ok" >/dev/null 2>&1
-    say "started remotely"
+    # Adopt a job that is already running rather than starting a second one on
+    # top of it. The collector is a service: it restarts after a crash, a reboot
+    # or a redeploy, and the box keeps working through all three.
+    if rworking; then
+      say "remote job already running - adopting it"
+    else
+      # setsid+nohup so a dropped ssh session cannot kill a 15-minute episode.
+      # The launch itself is timeout-wrapped and its failure ignored: this ssh
+      # has been observed not to return even though the job started fine, and
+      # whether the job is running is answered by rworking below, not by the
+      # exit status of the command that asked for it.
+      timeout 30 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST \
+        "rm -f $RWORK/out.mkv; cd $RWORK && setsid nohup bash $RSCRIPT $RWORK/src.avi $RWORK/out.mkv \
+         > $RWORK/current.log 2>&1 < /dev/null & echo ok" >/dev/null 2>&1 || true
+      sleep 10
+      if rworking; then
+        say "started remotely"
+      else
+        say "remote job failed to start; retrying next cycle"; sleep "$POLL"; continue
+      fi
+    fi
 
     while :; do
       sleep "$POLL"
       if rsh "test -f $RWORK/out.mkv" 2>/dev/null; then break; fi
-      if ! rsh "pgrep -f $(basename "$RSCRIPT") >/dev/null" 2>/dev/null; then
-        say "remote process gone with no output"; break
+      if ! rworking; then
+        # one confirmation: a single dropped ssh is not proof the job died
+        sleep 15
+        if ! rworking && ! rsh "test -f $RWORK/out.mkv" 2>/dev/null; then
+          say "remote process gone with no output"; break
+        fi
       fi
       say "  $(rsh "tail -1 $RWORK/current.log 2>/dev/null" 2>/dev/null | tr -d '\r' | cut -c1-70)"
     done
