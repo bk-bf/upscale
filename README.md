@@ -58,7 +58,7 @@ Everything is an environment variable:
 
 | var | default | meaning |
 |---|---|---|
-| `REMOTE` | `ubuntu` | ssh alias of the media server |
+| `REMOTE` | `ubuntu` | ssh alias of the media server; `local` if the library is on this host |
 | `LIB` | `/mnt/media/tv/Bleach` | library root on the server |
 | `ARCHIVE` | `$LIB/.upscale-originals` | where originals go once replaced |
 | `MODEL` / `MODEL_DIR` | `animejanai-suc` | ncnn model name and directory |
@@ -118,6 +118,13 @@ GPUHOST='-p 48726 root@1.2.3.4' upscale --profile odd collect
 | `RWORK` | `/root/upscale-work` | working directory on that box |
 | `RSCRIPT` | `/root/bench/upscale-ep-rental.sh` | per-episode script to invoke there |
 | `POLL` | `60` | seconds between progress polls |
+
+`RSCRIPT` is [`libexec/upscale-worker-remote`](libexec/upscale-worker-remote) — the same
+model and encode settings as the local worker, so both halves of a season come out
+identical, but tuned for a rented box: 4 workers rather than 8, because the instance was
+capped at 9.6 CPUs by its cgroup quota while `nproc` reported 20 (measured there:
+4 → 43.7 fps, 5 → 42.6, 6 → 21.9, 8 → 14.0 — past 5 workers CFS throttling collapses
+throughput). Copy it to the box once; `collect` invokes it per episode.
 
 It uses the same `discover | select_todo` selection as `run`, so a collector and a local
 queue can share one library. The remote job is started detached, so a dropped ssh session

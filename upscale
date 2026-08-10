@@ -108,10 +108,22 @@ load_config(){   # adopt the running queue's config; an explicit env var wins
   return 0
 }
 
+# The library is usually on another machine, but `collect` runs ON the server,
+# where it is local - and `ssh ubuntu` from the server does not resolve. REMOTE=
+# (empty) or `local` means "the library is on this host": same code path, no ssh.
+is_local(){ case "$REMOTE" in ''|local|localhost) return 0 ;; *) return 1 ;; esac; }
+lib_sh(){   # run a script (on stdin) wherever the library lives
+  if is_local; then bash -s; else ssh "$REMOTE" "bash -s"; fi
+}
+lib_cmd(){  # run one command string wherever the library lives
+  if is_local; then bash -c "$1"
+  else ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" "$1"; fi
+}
+
 # Ask the server what is outstanding. Archived sources first, library sources
 # last; both sorted, so the order is stable across restarts.
 discover(){
-  ssh "$REMOTE" "bash -s" <<REMOTE_EOF
+  lib_sh <<REMOTE_EOF
 set -euo pipefail
 lib=$(printf '%q' "$LIB"); arc=$(printf '%q' "$ARCHIVE")
 emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in
@@ -202,8 +214,7 @@ download_part(){       # the local partial of the source being fetched, if any
 }
 
 fetch_target(){        # $1 = base name -> remote size of the source being fetched
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" \
-    "find $(printf '%q' "$LIB") -name $(printf '%q' "$1.avi") -printf '%s\n' 2>/dev/null | head -1" 2>/dev/null
+  lib_cmd "find $(printf '%q' "$LIB") -name $(printf '%q' "$1.avi") -printf '%s\n' 2>/dev/null | head -1" 2>/dev/null
 }
 
 worker_src(){          # the source the per-episode worker is processing, if any
@@ -247,8 +258,7 @@ upload_size(){         # $1 = base name -> size of ITS remote partial, or nothin
   # actually running, its .BASE.mkv.part.XXXXXX temp. The one being written now
   # is the freshly modified one - and it is the only one that reflects progress,
   # because a resumed transfer keeps the old (larger) partial as its basis file.
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" \
-    "find $(printf '%q' "$LIB") \\( -name $(printf '%q' ".$1.mkv.part*") -o -name $(printf '%q' "..$1.mkv.part*") \\) -printf '%T@ %s\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2" 2>/dev/null
+  lib_cmd "find $(printf '%q' "$LIB") \\( -name $(printf '%q' ".$1.mkv.part*") -o -name $(printf '%q' "..$1.mkv.part*") \\) -printf '%T@ %s\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2" 2>/dev/null
 }
 
 # Transfer rate, elapsed and ETA, keyed on the file so a new transfer starts a
