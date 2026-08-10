@@ -185,6 +185,18 @@ previous sample, and calls a stall when the whole tuple stops changing.
 One shape is caught immediately rather than after three samples: a source sitting
 on the box with no worker running is a stall by definition, not a slow patch.
 
+**Alerts.** If `NTFY_PUBLISH_URL` is set (read from an env file, default
+`/run/bws/mediaserver.env`), the watchdog publishes to that ntfy topic — from the
+server, so it does not depend on any session being open. Prove the path with
+`upscale-watch --test-notify`.
+
+It is deliberately narrow about what earns a banner: only states a **human** can do
+something about. A stalled collector restarts itself and says nothing; a box that has
+vanished needs a new instance and a new `GPUHOST`, and no amount of retrying produces
+one. One notification per incident, not one per check — an hour of five-minute checks
+against a box that died at 02:00 is twelve identical banners and a lesson to ignore
+them. Recovery sends exactly one quiet line.
+
 `--fix` restarts a stalled **collector** only, because restarting it is provably
 safe — it adopts a job already running on the box instead of starting a second
 one. It never touches the remote worker or the local queue's episode: killing work

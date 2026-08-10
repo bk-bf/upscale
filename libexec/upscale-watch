@@ -31,17 +31,62 @@ PREV="$STATE/.watch-prev"
 STALL_AFTER=${STALL_AFTER:-3}          # samples, so ~15 min at a 5-minute timer
 mkdir -p "$STATE"
 
+# --- ntfy ---------------------------------------------------------------------
+# Publishes to the same secret ntfy.sh topic as the rest of the server
+# (NTFY_PUBLISH_URL, from Bitwarden Secrets via /run/bws/mediaserver.env), so
+# alerts arrive on the phone whether or not anything else is watching.
+#
+# Only states a HUMAN can do something about are worth a banner. A stalled
+# collector restarts itself; a box that has vanished needs a new instance and a
+# new GPUHOST, and no amount of retrying here will produce one.
+NTFY_ENV_FILE="${NTFY_ENV_FILE:-/run/bws/mediaserver.env}"
+if [ -r "$NTFY_ENV_FILE" ]; then set -a; . "$NTFY_ENV_FILE"; set +a; fi
+NTFY_URL="${NTFY_PUBLISH_URL:-}"
+NOTIFIED="$STATE/.notified"
+RENOTIFY=${RENOTIFY:-3600}      # do not repeat the same alarm more often than this
+
+send_ntfy(){           # $1 title  $2 body  $3 priority  $4 tags
+  [ -n "$NTFY_URL" ] || return 0
+  curl -fsS --max-time 20 \
+    ${NTFY_PUBLISH_USERNAME:+-u "${NTFY_PUBLISH_USERNAME}:${NTFY_PUBLISH_PASSWORD:-}"} \
+    -H "Title: $1" -H "Priority: ${3:-high}" -H "Tags: ${4:-film_frames}" \
+    -d "$2" "$NTFY_URL" >/dev/null 2>&1
+}
+
+# One banner per incident, not one per check. Without this a box that died at
+# 02:00 would send a notification every five minutes until morning.
+notify_once(){         # $1 key  $2 title  $3 body  $4 priority  $5 tags
+  local key=$1 last_key='' last_at=0
+  [ -r "$NOTIFIED" ] && { read -r last_key last_at < "$NOTIFIED" || true; }
+  if [ "$key" = "$last_key" ] && [ "$(( now - ${last_at:-0} ))" -lt "$RENOTIFY" ]; then
+    return 0
+  fi
+  send_ntfy "$2" "$3" "${4:-high}" "${5:-film_frames}" && printf '%s %s\n' "$key" "$now" > "$NOTIFIED"
+}
+
 do_log=0; do_fix=0
 for a in "$@"; do
   case "$a" in
     --log) do_log=1 ;;
     --fix) do_fix=1; do_log=1 ;;
+    --test-notify) : ;;   # handled after the env is loaded, below
     *) printf 'upscale-watch: unknown option %s\n' "$a" >&2; exit 2 ;;
   esac
 done
 
 now=$(date +%s)
 ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+for a in "$@"; do
+  if [ "$a" = --test-notify ]; then
+    if [ -z "$NTFY_URL" ]; then
+      echo "no NTFY_PUBLISH_URL (is /run/bws/mediaserver.env readable?)" >&2; exit 2
+    fi
+    send_ntfy "Bleach upscale: test" \
+      "Alerting works. You will only get a real one if the rental needs a human." \
+      default "film_frames" && { echo "sent"; exit 0; } || { echo "send FAILED" >&2; exit 1; }
+  fi
+done
 
 # --- the collector and the box it drives -------------------------------------
 # GPUHOST moves whenever the rented box is recreated, so read it from the same
@@ -71,7 +116,11 @@ if [ -n "$GPUHOST" ]; then
         \"\$(sed -nE 's#.* ([0-9]+)/[0-9]+ +free.*#\\1#p' $RWORK/current.log 2>/dev/null | tail -1)\" \
         \"\$(ls $RWORK/.src.avi.* >/dev/null 2>&1 && echo 1 || echo 0)\"" ) || true
   c_up=${c_up:-}; c_run=${c_run:-}; c_out=${c_out:-}; c_src=${c_src:-}; c_done=${c_done:-0}; c_pushing=${c_pushing:-0}
-  guard_age=$(rsh "cat $RWORK/guard.heartbeat 2>/dev/null") || guard_age=''
+  # Age computed ON the box, not here. Comparing its timestamp against this
+  # machine's clock makes the answer depend on the two agreeing - they were
+  # already 7 s apart, and a box whose clock drifts hours would either never
+  # report a dead guard or wake someone at 3am because it thought it had.
+  guard_age=$(rsh "b=\$(cat $RWORK/guard.heartbeat 2>/dev/null); [ -n \"\$b\" ] && echo \$(( \$(date +%s) - b ))") || guard_age=''
   if [ -z "$c_up" ]; then
     col_state=unreachable
   else
@@ -174,9 +223,8 @@ esac
 if [ "$col_state" != unreachable ] && [ "$col_state" != not-configured ]; then
   if [ -z "${guard_age:-}" ]; then
     col_verdict=GUARD-MISSING
-  else
-    ga=$(( now - guard_age ))
-    if [ "$ga" -gt 420 ]; then col_verdict=GUARD-DEAD; fi   # cron runs it every 2 min
+  elif [ "$guard_age" -gt 420 ]; then
+    col_verdict=GUARD-DEAD                                  # cron runs it every 2 min
   fi
 fi
 
@@ -196,7 +244,7 @@ fi
   printf 'collector %-12s %-11s %s\n' "$col_verdict" "$col_state" "$col_metric"
   printf 'local     %-12s %-11s %s\n' "$loc_verdict" "$loc_state" "$loc_metric"
   printf 'delivered %s episodes\n' "$delivered"
-  [ -n "${guard_age:-}" ] && printf 'box guard  last beat %ss ago\n' "$(( now - guard_age ))"
+  [ -n "${guard_age:-}" ] && printf 'box guard  last beat %ss ago\n' "$guard_age"
   [ -z "${guard_age:-}" ] && [ -n "$GPUHOST" ] && printf 'box guard  NO HEARTBEAT\n'
 } > "$HEALTH"
 cat "$HEALTH"
@@ -216,6 +264,38 @@ if [ "$do_fix" = 1 ] && [ "$col_verdict" = STALLED ]; then
     printf '%s  restart issued\n' "$ts" >> "$HLOG"
   rm -f "$PREV"     # do not immediately re-trigger on the same sample
 fi
+
+# --- tell someone -------------------------------------------------------------
+# Deliberately narrow. The collector restarting itself, an episode failing once,
+# a slow transfer - none of those need a person, and a banner for them teaches
+# you to ignore banners.
+case "$col_verdict" in
+  UNREACHABLE)
+    notify_once "col-unreachable" "Bleach upscale: rental unreachable" \
+      "The GPU box is not answering. It likely needs a new Vast.ai instance, and GPUHOST in ~/.upscale-queue/gpuhost.env updated. $delivered episodes delivered so far." \
+      urgent "warning,film_frames" ;;
+  GUARD-DEAD|GUARD-MISSING)
+    notify_once "col-guard" "Bleach upscale: box guard not running" \
+      "The GPU box answers but its own guard has stopped, so it can no longer restart a dead job by itself. $delivered delivered." \
+      high "warning,film_frames" ;;
+  STALLED)
+    # only if it is STILL stalled after --fix has had a go at it
+    if [ "${col_same:-0}" -ge "$(( STALL_AFTER + 2 ))" ]; then
+      notify_once "col-stuck" "Bleach upscale: collector stuck" \
+        "The collector has not moved for about $(( col_same * 5 )) minutes and restarting it has not helped. $delivered delivered." \
+        high "warning,film_frames"
+    fi ;;
+  *)
+    # recovery is worth exactly one quiet line, and only if something was wrong
+    if [ -r "$NOTIFIED" ]; then
+      read -r lk _ < "$NOTIFIED" || lk=''
+      if [ -n "$lk" ] && [ "$lk" != recovered ]; then
+        send_ntfy "Bleach upscale: recovered" \
+          "Back to $col_state. $delivered episodes delivered." min "white_check_mark" \
+          && printf 'recovered %s\n' "$now" > "$NOTIFIED"
+      fi
+    fi ;;
+esac
 
 case "$col_verdict$loc_verdict" in
   *STALLED*|*UNREACHABLE*|*GUARD*) exit 1 ;;
