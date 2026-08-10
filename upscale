@@ -866,8 +866,15 @@ cmd_collect_status(){
 
     # --- the transfer this end is doing -------------------------------------
     # Same two-sided percentage as the local view: bytes here over bytes there.
-    part=$(find "$LIB" -name '.*.mkv.part' -type f -printf '%T@ %p\n' 2>/dev/null |
-             sort -n | tail -1 | cut -d' ' -f2-) || part=''
+    # Match the partial for THIS episode by name. Taking the newest partial
+    # anywhere in the library picks up the other machine's upload - the local
+    # view had exactly this bug, and it reported one episode's bytes against
+    # another's total ("106%  487/457 MB").
+    part=''
+    if [ -n "${ep:-}" ]; then
+      part=$(find "$LIB" -name ".$ep.mkv.part*" -type f -printf '%T@ %p\n' 2>/dev/null |
+               sort -n | tail -1 | cut -d' ' -f2-) || part=''
+    fi
     if [ -n "$part" ] && [ "${outb:-0}" -gt 0 ]; then
       psz=$(stat -c%s "$part" 2>/dev/null) || psz=0
       [ "$psz" -gt "${outb:-0}" ] && psz=$outb
