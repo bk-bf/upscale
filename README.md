@@ -127,6 +127,12 @@ judders on slow pans: the frames aren't bit-identical (compression noise differs
 match has to be perceptual, and a perceptual match that's wrong freezes real motion.
 `tools/dedup/` keeps the implementation for anyone whose source tolerates it.
 
+## Notes
+
+[BUGS.md](BUGS.md) documents every failure hit while building this and how each was
+fixed — decoder corruption that passes frame-count checks, `set -e` exit-status traps,
+concurrency mistakes, and the measurement errors that made several of them hard to see.
+
 ## Licence
 
 MIT. The upscaling models are third-party — see [tools/](tools/) for provenance.

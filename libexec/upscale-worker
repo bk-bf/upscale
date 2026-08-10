@@ -37,6 +37,13 @@ CHUNK=${CHUNK:-2000}
 SCALE=${SCALE:-2}
 CRF=${CRF:-18}
 PRESET=${PRESET:-veryfast}
+ENC_THREADS=${ENC_THREADS:-4}   # keep the background encode off the workers' cores
+# ffmpeg 8.1.2 mis-decodes MPEG-4 ASP (XviD/DivX): it silently produces blocky,
+# smeared frames from a byte-identical source that 6.x/7.x decode correctly.
+# The model then faithfully upscales the corruption. Use a known-good build for
+# DECODING; the system ffmpeg is fine for encoding.
+FFDEC=${FFDEC:-$HOME/ffdec/ffmpeg}
+[ -x "$FFDEC" ] || FFDEC=ffmpeg
 WORK=${WORK:-/mnt/scratch/upscale-ep}
 STATE=${STATE:-$HOME/.upscale-ep}
 
@@ -122,7 +129,7 @@ EOF
   # duplicates frames to hit a target rate.
   if [ "$(pngs "$FRAMES")" != "$TOTAL" ]; then
     rm -f "$FRAMES"/*.png
-    ffmpeg -v error -i "$LOCAL" -fps_mode passthrough "$FRAMES/%06d.png" -y
+    "$FFDEC" -v error -i "$LOCAL" -fps_mode passthrough "$FRAMES/%06d.png" -y
     local got; got=$(pngs "$FRAMES")
     [ "$got" = "$TOTAL" ] || die "extracted $got of $TOTAL frames"
     say "extracted $got frames"
@@ -169,7 +176,10 @@ EOF
     encdir="$W/enc_$idx"; mv "$UP" "$encdir"; mkdir -p "$UP"
     [ -n "$enc_pid" ] && { wait "$enc_pid" || die "background encode failed"; }
     (
-      ffmpeg -v error -framerate "$FPS" -pattern_type glob -i "$encdir/*.png" \
+      # -threads: x264 defaults to every core and would fight the upscale workers
+      # it now runs alongside. It only has to keep up with one chunk per ~50s, so
+      # a small pool is plenty and leaves the GPU fed.
+      ffmpeg -v error -threads "$ENC_THREADS" -framerate "$FPS" -pattern_type glob -i "$encdir/*.png" \
              -c:v libx264 -crf "$CRF" -preset "$PRESET" -pix_fmt yuv420p "$seg" -y || exit 1
       e=$(vframes "$seg"); [ "$e" = "$n" ] || { echo "chunk $idx: encoded $e of $n" >&2; exit 1; }
       rm -rf "$encdir"

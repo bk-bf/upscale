@@ -41,6 +41,10 @@ IDLE=${IDLE:-300}                 # seconds to wait when there is no work
 STATE=${STATE:-$HOME/.upscale-queue}
 mkdir -p "$STATE"
 QLOG="$STATE/log"
+DEFER=${DEFER:-$STATE/defer}
+# PARITY=even|odd|any - splits the season between two machines so they cannot
+# collide on the same episode. Derived from the SxxEyy number in the filename.
+PARITY=${PARITY:-any}   # basenames listed here are processed LAST
 # The per-episode worker is a helper, deliberately NOT a second command on
 # $PATH. Override WORKER to relocate it.
 WORKER=${WORKER:-$(command -v upscale-worker 2>/dev/null || echo "${0%/*}/../libexec/upscale-worker")}; FAILED="$STATE/failed"; MAX_FAILS=${MAX_FAILS:-3}; PAUSE="$STATE/pause"; STOP="$STATE/stop"
@@ -122,6 +126,15 @@ resources(){
 # Size of any in-flight upload. rsync --partial writes .NAME.mkv.part.XXXXXX
 # with a random suffix while transferring, hence the trailing glob. Polled on the
 # slow schedule as discover, never per frame.
+fetch_target(){        # remote size of the source currently downloading
+  local part base
+  part=$(find "$WORK" -maxdepth 2 -name 'src.part' -type f 2>/dev/null | head -1)
+  [ -n "$part" ] || return 1
+  base=$(basename "$(dirname "$part")")
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" \
+    "find $(printf '%q' "$LIB") -name $(printf '%q' "$base.avi") -printf '%s\n' 2>/dev/null | head -1" 2>/dev/null
+}
+
 upload_size(){
   ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" \
     "find $(printf '%q' "$LIB") -name '.*.mkv.part*' -printf '%s\n' 2>/dev/null | head -1" 2>/dev/null
@@ -141,27 +154,46 @@ render(){
   fi
   [ -z "$act" ] && { pgrep -f '[u]pscale run|[u]pscale once' >/dev/null 2>&1 && act="waiting for work" || act="not running"; }
 
+  # --- download -------------------------------------------------------------
+  local part psz tsz
+  part=$(find "$WORK" -maxdepth 2 -name 'src.part' -type f 2>/dev/null | head -1)
+  if [ -n "$part" ]; then
+    psz=$(stat -c%s "$part" 2>/dev/null || echo 0); tsz=${FETCHTOTAL:-0}
+    if [ "$tsz" -gt 0 ]; then
+      printf 'download %s %3d%%   %s/%s MB   %s\033[K\n' "$(bar $((psz*100/tsz)) 20)" \
+        "$((psz*100/tsz))" "$((psz/1048576))" "$((tsz/1048576))" \
+        "$(basename "$(dirname "$part")" | cut -c1-28)"
+    else
+      printf 'download %s MB so far   %s\033[K\n' "$((psz/1048576))" "$(basename "$(dirname "$part")" | cut -c1-28)"
+    fi
+  fi
+
+  # --- upscale --------------------------------------------------------------
   if [ -f "$JOB" ]; then
     # shellcheck disable=SC1090
     . "$JOB"
-    local segs=0 inflight=0 df pct chunks el fps eta ph
-    [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
-    local up="${UPDIR:-$WORK/$(basename "${SRC%.*}")/up}"
-    [ -d "$up" ] && inflight=$(find "$up" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
-    [ "$inflight" -ge "$CHUNK" ] && inflight=0
-    df=$(( segs * CHUNK + inflight )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
-    [ "${_hw_src:-}" = "$SRC" ] || { _hw_src="$SRC"; _hw=0; }
-    [ "$df" -lt "${_hw:-0}" ] && df=$_hw || _hw=$df
+    local segs=0 inflight=0 df pct chunks el fps eta
+    # a job file can outlive its work dir (cleaned up, or a killed run); treat a
+    # missing SEGDIR as no progress rather than reporting a stale 100%
+    if [ -d "$SEGDIR" ]; then
+      segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
+      local up="${UPDIR:-$WORK/$(basename "${SRC%.*}")/up}"
+      [ -d "$up" ] && inflight=$(find "$up" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
+      [ "$inflight" -ge "$CHUNK" ] && inflight=0
+      df=$(( segs * CHUNK + inflight )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
+      [ "${_hw_src:-}" = "$SRC" ] || { _hw_src="$SRC"; _hw=0; }
+      [ "$df" -lt "${_hw:-0}" ] && df=$_hw || _hw=$df
+    else
+      df=0
+    fi
     chunks=$(( (TOTAL + CHUNK - 1) / CHUNK )); pct=$(( TOTAL ? df*100/TOTAL : 0 ))
     printf '\033[1m%s\033[0m\033[K\n' "$(basename "${SRC%.*}")"
-    printf '%s %3d%%   %s/%s frames\033[K\n' "$(bar "$pct")" "$pct" "$df" "$TOTAL"
-    el=$(( $(date +%s) - $(cat "$STATE/started" 2>/dev/null || date +%s) ))
+    printf 'upscale  %s %3d%%   %s/%s frames\033[K\n' "$(bar "$pct" 20)" "$pct" "$df" "$TOTAL"
+    el=$(( $(date +%s) - $(cat "$EPSTATE/started" 2>/dev/null || date +%s) ))
     fps=$(awk -v f="$df" -v e="$el" 'BEGIN{printf "%.1f", (e>0)?f/e:0}')
     eta=$(awk -v r="$((TOTAL-df))" -v v="$fps" 'BEGIN{printf "%d", (v>0)?r/v/60:0}')
-    printf 'chunk %d/%d   %s fps   elapsed %dm   eta %dm\033[K\n' \
+    printf '         chunk %d/%d   %s fps   elapsed %dm   eta %dm\033[K\n' \
       "$(( segs < chunks ? segs+1 : chunks ))" "$chunks" "$fps" "$((el/60))" "$eta"
-  else
-    printf '\033[1m(no episode being processed)\033[0m\033[K\n'
   fi
 
   # Upload progress, if one is running. $UPLOAD is the remote .part size, polled
@@ -170,7 +202,7 @@ render(){
   loc=$(find "$WORK" -maxdepth 2 -name '*.mkv' -not -name '.*' -type f 2>/dev/null | head -1)
   if [ -n "$loc" ] && [ -n "${UPLOAD:-}" ] && [ "${UPLOAD:-0}" -gt 0 ]; then
     local ls; ls=$(stat -c%s "$loc" 2>/dev/null || echo 0)
-    [ "$ls" -gt 0 ] && printf 'upload  %s %3d%%   %s/%s MB   %s\033[K\n' \
+    [ "$ls" -gt 0 ] && printf 'upload   %s %3d%%   %s/%s MB   %s\033[K\n' \
       "$(bar $(( UPLOAD*100/ls )) 20)" "$(( UPLOAD*100/ls ))" \
       "$((UPLOAD/1048576))" "$((ls/1048576))" "$(basename "${loc%.mkv}" | cut -c1-28)"
   fi
@@ -201,13 +233,15 @@ cmd_status(){                       # live view; Ctrl-C to leave
   # piped or scripted: prime the rate counters, then print one frame and stop
   [ -t 1 ] || { resources >/dev/null 2>&1; sleep 0.3
                 UPLOAD=$(upload_size); UPLOAD=${UPLOAD:-0}
+                FETCHTOTAL=$(fetch_target) || FETCHTOTAL=0
+                export FETCHTOTAL=${FETCHTOTAL:-0}
                 todo=$(discover 2>/dev/null) || todo=''
                 OUTSTANDING=$(printf '%s' "$todo" | grep -c . || true) UPLOAD="$UPLOAD" \
                   NEXT1="$(printf '%s\n' "$todo" | sed -n 1p)" \
                   NEXT2="$(printf '%s\n' "$todo" | sed -n 2p)" render; return 0; }
   trap 'printf "\033[?25h\033[J\n"; exit 0' INT TERM
   printf '\033[?25l\033[2J'        # hide cursor, clear once at entry only
-  local outstanding='' upload=0 nxt1='' nxt2='' todo='' last=0 now
+  local outstanding='' upload=0 ftot=0 nxt1='' nxt2='' todo='' last=0 now
   while :; do
     now=$(date +%s)
     # the remote count changes once per episode, so poll it rarely; everything
@@ -218,12 +252,15 @@ cmd_status(){                       # live view; Ctrl-C to leave
       nxt1=$(printf '%s\n' "$todo" | sed -n 1p)
       nxt2=$(printf '%s\n' "$todo" | sed -n 2p)
       upload=$(upload_size); upload=${upload:-0}
+      # `var=$(fn)` adopts fn's exit status; fetch_target returns 1 when nothing
+      # is downloading, which under set -e would kill the status display
+      ftot=$(fetch_target) || ftot=0; ftot=${ftot:-0}
       last=$now
     fi
     # render runs in THIS shell, not $(...): a subshell would discard the
     # previous cpu/net sample and both would read as "-" on every frame.
     printf '\033[H'
-    OUTSTANDING="$outstanding" UPLOAD="$upload" NEXT1="$nxt1" NEXT2="$nxt2" render
+    OUTSTANDING="$outstanding" UPLOAD="$upload" FETCHTOTAL="$ftot" NEXT1="$nxt1" NEXT2="$nxt2" render
     printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
     sleep "${INTERVAL:-1}"
   done
@@ -249,7 +286,28 @@ while :; do
   [ -f "$STOP" ] && { say "stopped"; break; }
   while [ -f "$PAUSE" ]; do sleep 10; done
 
-  mapfile -t TODO < <(discover || true)
+  # Watch order beats disk order: anything listed in $DEFER (episodes already
+  # watched, or known-bad ones being redone) is pushed to the back, so the queue
+  # always works on what the viewer needs next.
+  mapfile -t RAW < <(discover || true)
+  TODO=(); LATE=()
+  for c in "${RAW[@]:-}"; do
+    [ -z "$c" ] && continue
+    if [ "$PARITY" != any ]; then
+      # `[ test ] && continue` makes the whole list return non-zero when the test
+      # is false, which set -e treats as a fatal error. if/then, always.
+      en=$(printf '%s' "$(basename "$c")" | grep -oE 'S[0-9]+E[0-9]+' | head -1 | grep -oE 'E[0-9]+' | tr -d 'E' || true)
+      en=$((10#${en:-0}))
+      if [ "$en" -eq 0 ]; then continue; fi              # unnumbered: skip
+      if [ "$PARITY" = even ] && [ $((en % 2)) -ne 0 ]; then continue; fi
+      if [ "$PARITY" = odd  ] && [ $((en % 2)) -eq 0 ]; then continue; fi
+    fi
+    # -f treats each DEFER line as a pattern to look for IN the basename, which
+    # is the direction that lets a short prefix match a long episode title
+    if [ -s "$DEFER" ] && printf '%s' "$(basename "${c%.*}")" | grep -qFf "$DEFER" 2>/dev/null
+      then LATE+=("$c"); else TODO+=("$c"); fi
+  done
+  TODO+=("${LATE[@]:-}")
   if [ "${#TODO[@]}" -eq 0 ]; then
     [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; deliver_pid=""; }
     [ "$MODE" = once ] && { say "nothing outstanding"; break; }
