@@ -458,6 +458,18 @@ runnable(){            # stdin: candidates -> the ones the run loop would start
   done
 }
 
+# --- one place decides what a status line looks like -------------------------
+# The local view and the collector view describe different machines but are the
+# same tool, and they drifted into looking like two different programs. Every
+# line in both goes through these, so the columns line up and a change to the
+# style lands in both at once.
+line_title(){ printf '\033[1m%s\033[0m\033[K\n' "$1"; }
+line_prog(){   # label pct done total unit
+  printf '%-8s %s %3d%%   %s/%s %s\033[K\n' "$1" "$(bar "$2" 20)" "$2" "$3" "$4" "${5:-frames}"
+}
+line_note(){ printf '         %s\033[K\n' "$1"; }        # the detail under a bar
+line_kv(){   printf '%-8s %s\033[K\n' "$1" "$2"; }
+
 render(){
   # Everything the network poll gathered arrives in globals: OUTSTANDING, RUNQ,
   # FETCHTOTAL, UPFILE, UPLOAD. The job file is the WORKER's ($EPSTATE), not the
@@ -529,7 +541,7 @@ render(){
       df=0
     fi
     chunks=$(( (TOTAL + CHUNK - 1) / CHUNK )); pct=$(( TOTAL ? df*100/TOTAL : 0 ))
-    printf '\033[1m%s\033[0m\033[K\n' "$(basename "${SRC%.*}")"
+    line_title "$(basename "${SRC%.*}")"
 
     # The job file is written BEFORE the source is decoded, so "job exists" does
     # not mean "upscaling". Nothing upscaled yet + no upscaler running + the
@@ -543,17 +555,17 @@ render(){
 
     if [ "$phase" = extract ]; then
       pct=$(( TOTAL ? extracted*100/TOTAL : 0 ))
-      printf 'extract  %s %3d%%   %s/%s frames\033[K\n' "$(bar "$pct" 20)" "$pct" "$extracted" "$TOTAL"
+      line_prog extract "$pct" "$extracted" "$TOTAL"
       # extraction begins when the job file is written, so its mtime is this
       # phase's start - correct even when --status is opened halfway through
       t0=$(stat -c%Y "$JOB" 2>/dev/null) || t0=0
       el=$(( $(date +%s) - ${t0:-0} )); [ "$el" -lt 0 ] && el=0
       fps=$(awk -v f="$extracted" -v e="$el" 'BEGIN{printf "%.1f", (e>0)?f/e:0}') || fps=0
       eta=$(awk -v r="$((TOTAL-extracted))" -v v="$fps" 'BEGIN{printf "%d", (v>0)?r/v:0}') || eta=0
-      printf '         decoding source   %s fps   elapsed %s   eta %s\033[K\n' \
-        "$fps" "$(ms "$el")" "$(ms "$eta")"
+      line_note "$(printf 'decoding source   %s fps   elapsed %s   eta %s' \
+        "$fps" "$(ms "$el")" "$(ms "$eta")")"
     else
-      printf 'upscale  %s %3d%%   %s/%s frames\033[K\n' "$(bar "$pct" 20)" "$pct" "$df" "$TOTAL"
+      line_prog upscale "$pct" "$df" "$TOTAL"
       # Measure the GPU from when EXTRACTION ENDED, not from when the episode
       # started: the frames directory's mtime is the moment its last PNG was
       # written. Including the ~2 min extraction understated fps for the whole
@@ -571,15 +583,15 @@ render(){
       if [ "$gpu_busy" -eq 0 ] && pgrep -x ffmpeg >/dev/null 2>&1; then
         if [ "$df" -ge "$TOTAL" ]; then stage='   encoding final cut'; else stage='   encoding chunk'; fi
       fi
-      printf '         chunk %d/%d   %s fps   elapsed %s   eta %s%s\033[K\n' \
+      line_note "$(printf 'chunk %d/%d   %s fps   elapsed %s   eta %s%s' \
         "$(( segs < chunks ? segs+1 : chunks ))" "$chunks" "$fps" \
-        "$(ms "$el")" "$(ms "$eta")" "$stage"
+        "$(ms "$el")" "$(ms "$eta")" "$stage")"
     fi
   else
     # Phase 1: no job file yet. The worker is counting the source's frames and
     # cross-checking the decoders, which showed as nothing at all before.
     if [ -n "$wsrc" ]; then
-      printf '\033[1m%s\033[0m\033[K\n' "$(basename "${wsrc%.*}")"
+      line_title "$(basename "${wsrc%.*}")"
       # the cross-check is the only ffmpeg that decodes single frames; matching
       # plain "ffmpeg" would also catch the background chunk encoder
       if pgrep -f 'ffmpeg .*-frames:v 1' >/dev/null 2>&1; then
@@ -764,6 +776,9 @@ collect_probe(){
   printf 'srcbytes=%s\n' "$(stat -c%s "$src" 2>/dev/null || echo 0)"
   if [ -f "$out" ]; then
     printf 'phase=done\noutbytes=%s\n' "$(stat -c%s "$out" 2>/dev/null || echo 0)"
+    # still report the frame count: "100%  0/0 frames" reads like a failure
+    total=$(sed -nE 's/.* ([0-9]+) frames @ .*/\1/p' "$log" 2>/dev/null | tail -1)
+    [ -n "${total:-}" ] && printf 'total=%s\ndone=%s\n' "$total" "$total"
     return 0
   fi
   total=$(sed -nE 's/.* ([0-9]+) frames @ .*/\1/p' "$log" 2>/dev/null | tail -1)
@@ -803,49 +818,77 @@ collect_read(){
 }
 
 cmd_collect_status(){
-  local k v phase total done_ chunk fps gpu free tail_ srcb outb pct ep n repep
+  # Same layout as the local view (line_title/line_prog/line_note/line_kv), same
+  # bar, same ms(), same xfer_eta - only the machine being described differs.
+  local k v phase total done_ chunk fps gpu free tail_ srcb outb ep n repep
+  local pct el eta cur nchunk started nxt part psz
   local tty=0; [ -t 1 ] && tty=1
+  [ "$tty" = 1 ] && printf '\033[?12l\033[?25l\033[2J'
+  trap 'printf "\033[?25h\033[J\n"; exit 0' INT TERM
   while :; do
-    phase=''; total=''; done_=''; chunk=''; fps=''; gpu=''; free=''; tail_=''; srcb=''; outb=''
+    phase=''; total=''; done_=''; chunk=''; fps=''; gpu=''; free=''; tail_=''
+    srcb=''; outb=''; repep=''
     while IFS='=' read -r k v; do
       case "$k" in
         phase) phase=$v ;; total) total=$v ;; done) done_=$v ;; chunk) chunk=$v ;;
         fps) fps=$v ;; gpu) gpu=$v ;; free) free=$v ;; tail) tail_=$v ;;
-        srcbytes) srcb=$v ;; outbytes) outb=$v ;; extracted) done_=$v ;;
-        ep) repep=$v ;;
+        srcbytes) srcb=$v ;; outbytes) outb=$v ;; extracted) done_=$v ;; ep) repep=$v ;;
       esac
     done < <(collect_read)
 
-    # which episode: the collector knows the real name, the box does not
-    # `|| ep=` and `|| n=0` are both load-bearing under set -e: on the box there
-    # is no collector log and no library to discover, and a bare var=$(cmd) that
-    # fails takes the whole script down with exit 2 and no output.
-    repep=''
     ep=$(sed -nE 's/^.*=== (.*) ===$/\1/p' "$QLOG" 2>/dev/null | tail -1) || ep=''
     n=$(discover 2>/dev/null | select_todo 2>/dev/null | wc -l) || n=0
+    nxt=$(discover 2>/dev/null | select_todo 2>/dev/null | sed -n 2p) || nxt=''
 
-    [ "$tty" = 1 ] && printf '\033[H\033[J'
-    printf '%s\n' "${ep:-${repep:-(no episode)}}"
+    [ "$tty" = 1 ] && printf '\033[H'
+    line_title "${ep:-${repep:-(no episode)}}"
+
+    # --- the episode on the box ---------------------------------------------
     if [ "$phase" = done ]; then
-      printf '%s 100%%   upscaled on the box, waiting to be pulled\n' "$(bar 100)"
+      line_prog upscale 100 "${total:-0}" "${total:-0}"
+      line_note "finished on the box - waiting to be pulled"
+    elif [ "$phase" = idle ]; then
+      line_note "box idle - nothing pushed to it yet"
     elif [ -n "$total" ] && [ "${total:-0}" -gt 0 ]; then
       pct=$(( ${done_:-0} * 100 / total ))
-      printf '%s %3d%%   %s/%s frames\n' "$(bar "$pct")" "$pct" "${done_:-0}" "$total"
-    elif [ "$phase" = idle ]; then
-      printf 'box idle - nothing pushed to it yet\n'
+      line_prog "${phase:-upscale}" "$pct" "${done_:-0}" "$total"
+      # elapsed comes from when the collector announced this episode; eta from
+      # the box's own measured rate, which is the only honest source for it
+      started=$(stat -c%Y "$STATE/collect-started" 2>/dev/null) || started=0
+      el=$(( $(date +%s) - ${started:-0} )); [ "$el" -lt 0 ] && el=0
+      eta=$(awk -v r="$(( total - ${done_:-0} ))" -v v="${fps:-0}" \
+            'BEGIN{printf "%d", (v>0)?r/v:0}') || eta=0
+      line_note "$(printf '%s   %s   elapsed %s   eta %s' \
+        "${chunk:+chunk $chunk}" "${fps:+$fps fps}" "$(ms "$el")" "$(ms "$eta")")"
     else
-      printf 'starting up...\n'
+      line_note "starting up ..."
     fi
-    printf 'remote  %-9s %-12s %s\n' "${phase:-?}" "${chunk:+chunk $chunk}" "${fps:+$fps fps}"
-    [ -n "$srcb" ] && printf 'source  %s MB on the box%s\n' "$((srcb/1048576))" \
-      "${outb:+   result $((outb/1048576)) MB}"
-    # On the box itself there is no library to count, and "0 outstanding" would
-    # read as "all done" rather than "not my job to know".
-    [ "${n:-0}" -gt 0 ] && printf 'queue   %s outstanding (this collector)\n' "$n"
-    printf 'box     gpu %s%%   free %s\n' "${gpu:--}" "${free:--}"
-    [ -n "$tail_" ] && printf 'log     %s\n' "$tail_"
-    [ "$tty" = 1 ] || break
-    sleep "${STATUS_EVERY:-10}"
+
+    # --- the transfer this end is doing -------------------------------------
+    # Same two-sided percentage as the local view: bytes here over bytes there.
+    part=$(find "$LIB" -name '.*.mkv.part' -type f -printf '%T@ %p\n' 2>/dev/null |
+             sort -n | tail -1 | cut -d' ' -f2-) || part=''
+    if [ -n "$part" ] && [ "${outb:-0}" -gt 0 ]; then
+      psz=$(stat -c%s "$part" 2>/dev/null) || psz=0
+      [ "$psz" -gt "${outb:-0}" ] && psz=$outb
+      pct=$(( psz*100/outb ))
+      xfer_eta dl "$part" "$psz" "$outb"
+      line_prog pull "$pct" "$((psz/1048576))" "$((outb/1048576))" "MB$XFER"
+    elif [ "${srcb:-0}" -gt 0 ] && [ "$phase" = idle ]; then
+      line_kv push "$((srcb/1048576)) MB on the box"
+    fi
+
+    line_kv state "$(printf '%s   |   queue %s outstanding' \
+      "$([ "$phase" = done ] && echo 'pulling result' || echo "remote ${phase:-?}")" "$n")"
+    [ -n "$nxt" ] && line_kv next "$(basename "${nxt%.*}" | cut -c1-58)"
+    line_kv box "$(printf 'gpu %s%%   free %s' "${gpu:--}" "${free:--}")"
+    [ -n "$tail_" ] && line_kv log "$tail_"
+    if [ "$tty" = 1 ]; then
+      printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
+      sleep "${STATUS_EVERY:-10}"
+    else
+      break
+    fi
   done
 }
 
@@ -885,6 +928,7 @@ cmd_collect(){
     fi
 
     rsh "printf '%s' $(printf '%q' "$base") > $RWORK/episode" >/dev/null 2>&1 || true
+    : > "$STATE/collect-started"
 
     # Adopt a job that is already running rather than starting a second one on
     # top of it. The collector is a service: it restarts after a crash, a reboot
