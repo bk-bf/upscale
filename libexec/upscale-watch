@@ -146,7 +146,12 @@ col_verdict=OK; loc_verdict=OK
 case "$col_state" in
   unreachable)      col_verdict=UNREACHABLE ;;
   not-configured)   col_verdict=- ;;
-  idle-with-source) col_verdict=STALLED ;;   # a source is on the box, nothing is running
+  # A source on the box with nothing running is the stall shape - but a source
+  # still ARRIVING looks identical at a glance, and a 175 MB push takes minutes.
+  # So it must also have stopped moving: if the byte count changed since the last
+  # sample, it is a transfer, not a stall. Without this, --fix restarted the
+  # collector in the middle of every push, all night.
+  idle-with-source) [ "$col_same" -ge 1 ] && col_verdict=STALLED ;;
   *) [ "$col_same" -ge "$STALL_AFTER" ] && col_verdict=STALLED ;;
 esac
 case "$loc_state" in
