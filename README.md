@@ -17,7 +17,7 @@ from its already-encoded chunks.
 ```
 upscale run          process everything outstanding, then idle for more
 upscale once         process outstanding work, then exit
-upscale --status     live progress bar, rate, ETA, log tail
+upscale --status     live progress, phase, upload, host utilisation
 upscale --pause      hold after the current chunk
 upscale --resume     release a pause
 upscale --stop       finish the current episode, then exit
@@ -25,10 +25,13 @@ upscale --list       show what is outstanding
 ```
 
 ```
-Bleach - S01E02 - A Shinigami's Work SDTV
-[█████████░░░░░░░░░░░░░░░░░░░░░░░░░]  29%   10000/33435 frames
-chunk 6/17   22.0 fps   elapsed 7m   eta 17m
-queue: 96 outstanding   state: running
+Bleach - S01E04 - And Your Bird Can Speak SDTV
+[█████████░░░░░░░░░░░░░░░░░░░░░░░░░]  29%   10000/33527 frames
+chunk 6/17   38.4 fps   elapsed 4m   eta 10m
+upload  [████████████░░░░░░░░]  61%   287/464 MB   Bleach - S01E03
+state   processing + uploading   |   queue 93 outstanding
+next    Bleach - S01E05 - Beat the Invisible Enemy! SDTV Proper
+cpu  99%   ram 3.4/15.5G   gpu  67%  vram 1.0/8.0G   net 1.7 v 15.2 ^ Mbit/s
 ```
 
 ## Requirements
@@ -41,11 +44,9 @@ queue: 96 outstanding   state: running
 ## Install
 
 ```bash
-./install.sh
-
-
-systemctl --user enable --now upscale.service     # survives reboots
+./install.sh                                      # only `upscale` lands on $PATH
 loginctl enable-linger "$USER"                    # start without logging in
+systemctl --user enable --now upscale.service     # survives reboots
 ```
 
 ## Configuration
@@ -58,7 +59,7 @@ Everything is an environment variable:
 | `LIB` | `/mnt/media/tv/Bleach` | library root on the server |
 | `ARCHIVE` | `$LIB/.upscale-originals` | where originals go once replaced |
 | `MODEL` / `MODEL_DIR` | `animejanai-suc` | ncnn model name and directory |
-| `WORKERS` | `4` | concurrent upscaler processes |
+| `WORKERS` | `8` | concurrent upscaler processes (measured optimum) |
 | `CHUNK` | `2000` | frames per resumable chunk |
 | `CRF` / `PRESET` | `18` / `veryfast` | x264 encode settings |
 | `WORK` | `/mnt/scratch/upscale` | scratch dir (needs ~12 GB free) |
