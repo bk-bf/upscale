@@ -1,0 +1,6 @@
+venv/
+*.pth
+*.pt
+*.ncnn.*
+*.bin
+*.param

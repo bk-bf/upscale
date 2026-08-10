@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# upscale — resumable anime upscaling pipeline for a whole series.
+#
+#   upscale run          process everything outstanding, then idle for more
+#   upscale once         process outstanding work, then exit
+#   upscale --status     live progress bar, rate, ETA and log tail (Ctrl-C exits)
+#   upscale --pause      hold after the current chunk
+#   upscale --resume     release a pause
+#   upscale --stop       finish the current episode, then exit
+#   upscale --list       show what is outstanding
+#
+# Bare words work too (`upscale status`, `upscale pause`, ...).
+#
+# Runs on a machine with a GPU, against a media server reached over ssh. Sources
+# are pulled from the server, upscaled locally, and delivered back; originals are
+# moved into a hidden archive so the library only ever shows finished episodes.
+#
+# SELF-HEALING: there is no saved work list and no progress pointer. Every cycle
+# it asks one question - which source has no matching .mkv? - so a power cut, a
+# reboot of either machine, or a killed process needs no recovery step. Finished
+# episodes are visible as .mkv and skipped; a half-finished episode resumes from
+# its already-encoded chunks.
+#
+# Configuration is by environment variable; see the block below.
+set -euo pipefail
+
+REMOTE=${REMOTE:-ubuntu}
+LIB=${LIB:-/mnt/media/tv/Bleach}
+ARCHIVE=${ARCHIVE:-$LIB/.upscale-originals}
+MODEL=${MODEL:-animejanai-suc}
+MODEL_DIR=${MODEL_DIR:-$HOME/upscale-bench/models_janai}
+BIN=${BIN:-$HOME/upscale-bench/bin/realesrgan-ncnn-vulkan}
+WORKERS=${WORKERS:-4}
+CHUNK=${CHUNK:-2000}
+SCALE=${SCALE:-2}
+CRF=${CRF:-18}
+PRESET=${PRESET:-veryfast}
+WORK=${WORK:-/mnt/scratch/upscale}
+STATE=${STATE:-$HOME/.upscale}
+LIMIT=${LIMIT:-0}                 # 0 = unlimited; bounds a test run
+IDLE=${IDLE:-300}                 # seconds to wait when there is no work
+
+mkdir -p "$STATE"
+JOB="$STATE/job"; PAUSE="$STATE/pause"; STOP="$STATE/stop"; LOG="$STATE/log"
+QLOG="$LOG"
+say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; }
+die(){ printf 'upscale: %s\n' "$*" >&2; exit 1; }
+pngs(){ find "$1" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l; }
+# Network ops retry with backoff: the server rebooting mid-run must pause the
+# pipeline, not fail the episode.
+retry(){ local n=0 max=${RETRIES:-60}
+  until "$@"; do n=$((n+1)); [ "$n" -ge "$max" ] && return 1
+    say "retry $n/$max: $1 ..."; sleep $(( n<10 ? 10 : 30 )); done; }
+vframes(){ ffprobe -v error -count_frames -select_streams v \
+             -show_entries stream=nb_read_frames -of csv=p=0 "$1"; }
+
+
+# ---------------------------------------------------------------- worker ----
+ep_status(){
+  [ -f "$JOB" ] || { echo "no job"; return 0; }
+  # shellcheck disable=SC1090
+  . "$JOB"
+  local segs=0 chunks state=running
+  [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
+  chunks=$(( (TOTAL + CHUNK - 1) / CHUNK ))
+  [ -f "$PAUSE" ] && state=paused
+  [ -f "$STOP" ]  && state=stopping
+  kill -0 "$PID" 2>/dev/null || state="not running"
+  local df=$(( segs * CHUNK )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
+  printf 'episode : %s\nstate   : %s (pid %s)\nprogress: %d/%d chunks, %d/%d frames (%d%%)\n' \
+    "$(basename "$SRC")" "$state" "$PID" "$segs" "$chunks" "$df" "$TOTAL" \
+    "$(( TOTAL ? df*100/TOTAL : 0 ))"
+  if [ -f "$STATE/started" ] && [ "$df" -gt 0 ]; then
+    awk -v f="$df" -v e="$(( $(date +%s) - $(cat "$STATE/started") ))" -v r="$((TOTAL-df))" \
+      'BEGIN{fps=(e>0)?f/e:0; printf "rate    : %.2f fps  elapsed %dm  eta %dm\n", fps, e/60, (fps>0)?r/fps/60:0}'
+  fi
+}
+
+
+# ----------------------------------------------------------------- queue ----
+# Ask the server what is outstanding. Archived sources first, library sources
+# last; both sorted, so the order is stable across restarts.
+discover(){
+  ssh "$REMOTE" "bash -s" <<REMOTE_EOF
+set -euo pipefail
+lib=$(printf '%q' "$LIB"); arc=$(printf '%q' "$ARCHIVE")
+emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in
+  base=\$(basename "\${1%.*}")
+  [ -f "\$2/\$base.mkv" ] || printf '%s\n' "\$1"
+}
+# archived sources -> output goes back to the matching library folder
+if [ -d "\$arc" ]; then
+  find "\$arc" -type f -name '*.avi' | sort | while read -r f; do
+    rel=\${f#"\$arc"/}; emit "\$f" "\$lib/\$(dirname "\$rel")"
+  done
+fi
+# sources still in the library -> output lands beside them
+find "\$lib" -type f -name '*.avi' -not -path "\$lib/.*" | sort | while read -r f; do
+  emit "\$f" "\$(dirname "\$f")"
+done
+REMOTE_EOF
+}
+
+# Progress is read from the in-flight job file plus a live count of the frames
+# already upscaled in the current chunk, so the bar advances continuously
+# rather than jumping once per chunk.
+bar(){ local p=$1 w=${2:-34} f e i out=''
+  f=$(( p * w / 100 )); [ "$f" -lt 0 ] && f=0; [ "$f" -gt "$w" ] && f=$w
+  e=$(( w - f ))
+  for ((i=0;i<f;i++)); do out+='█'; done
+  for ((i=0;i<e;i++)); do out+='░'; done
+  printf '[%s]' "$out"
+}
+
+# Host utilisation. Everything here is a local /proc or /sys read - a few
+# hundred microseconds per frame - so it is safe to sample every second.
+# Rate metrics (cpu, net) need two samples, so the first frame shows "-".
+_p_tot=0; _p_idle=0; _p_rx=0; _p_tx=0; _p_t=0
+NETIF=${NETIF:-$(ip route show default 2>/dev/null | awk '{print $5; exit}')}
+GPUBUSY=$(ls /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | head -1)
+GPUDIR=${GPUBUSY%/gpu_busy_percent}
+
+resources(){
+  local tot idle dt didle cpu='-' ram gpu='-' vram='' rx tx now drx='' dtx=''
+  read -r _ a b c d e f g h _ < /proc/stat
+  tot=$((a+b+c+d+e+f+g+h)); idle=$((d+e))
+  if [ "$_p_tot" -gt 0 ]; then
+    dt=$((tot-_p_tot)); didle=$((idle-_p_idle))
+    [ "$dt" -gt 0 ] && cpu=$(( (dt-didle)*100/dt ))
+  fi
+  _p_tot=$tot; _p_idle=$idle
+
+  ram=$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{printf "%.1f/%.1fG", (t-a)/1048576, t/1048576}' /proc/meminfo)
+  [ -n "$GPUBUSY" ] && [ -r "$GPUBUSY" ] && gpu=$(cat "$GPUBUSY" 2>/dev/null)
+  if [ -r "$GPUDIR/mem_info_vram_used" ]; then
+    vram=$(awk -v u="$(cat "$GPUDIR/mem_info_vram_used")" -v t="$(cat "$GPUDIR/mem_info_vram_total")" \
+      'BEGIN{printf "  vram %.1f/%.1fG", u/1073741824, t/1073741824}')
+  fi
+
+  now=$(date +%s%N)
+  if [ -n "$NETIF" ] && [ -r "/sys/class/net/$NETIF/statistics/rx_bytes" ]; then
+    rx=$(cat "/sys/class/net/$NETIF/statistics/rx_bytes")
+    tx=$(cat "/sys/class/net/$NETIF/statistics/tx_bytes")
+    if [ "$_p_t" -gt 0 ]; then
+      drx=$(awk -v x="$((rx-_p_rx))" -v s="$(( (now-_p_t)/1000000 ))" 'BEGIN{printf "%.1f", (s>0)?x*8/s/1000:0}')
+      dtx=$(awk -v x="$((tx-_p_tx))" -v s="$(( (now-_p_t)/1000000 ))" 'BEGIN{printf "%.1f", (s>0)?x*8/s/1000:0}')
+    fi
+    _p_rx=$rx; _p_tx=$tx; _p_t=$now
+  fi
+  printf 'cpu %3s%%   ram %s   gpu %3s%%%s   net %s v %s ^ Mbit/s\n' \
+    "$cpu" "$ram" "$gpu" "$vram" "${drx:--}" "${dtx:--}"
+}
+
+render(){
+  local n
+  # $OUTSTANDING is supplied by the live loop, which refreshes it rarely -
+  # discover() is an ssh round-trip and must not run once per frame
+  n=${OUTSTANDING:-$(discover 2>/dev/null | wc -l || echo '?')}
+  if [ -f "$JOB" ]; then
+    # shellcheck disable=SC1090
+    . "$JOB"
+    local segs=0 inflight=0 df pct chunks el fps eta
+    [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
+    [ -n "${UPDIR:-}" ] && [ -d "$UPDIR" ] &&
+      inflight=$(find "$UPDIR" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
+    df=$(( segs * CHUNK + inflight )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
+    chunks=$(( (TOTAL + CHUNK - 1) / CHUNK ))
+    pct=$(( TOTAL ? df * 100 / TOTAL : 0 ))
+    printf '\033[1m%s\033[0m\n' "$(basename "${SRC%.*}")"
+    printf '%s %3d%%   %s/%s frames\n' "$(bar "$pct")" "$pct" "$df" "$TOTAL"
+    el=$(( $(date +%s) - $(cat "$STATE/started" 2>/dev/null || date +%s) ))
+    fps=$(awk -v f="$df" -v e="$el" 'BEGIN{printf "%.1f", (e>0)?f/e:0}')
+    eta=$(awk -v r="$((TOTAL-df))" -v v="$fps" 'BEGIN{printf "%d", (v>0)?r/v/60:0}')
+    printf 'chunk %d/%d   %s fps   elapsed %dm   eta %dm\n' \
+      "$((segs+1))" "$chunks" "$fps" "$((el/60))" "$eta"
+  else
+    printf '\033[1m(no episode in flight)\033[0m\n'
+  fi
+  local state=idle
+  [ -f "$STOP" ] && state='stopping after current episode'
+  [ -f "$PAUSE" ] && state='PAUSED'
+  pgrep -f 'upscale _process' >/dev/null 2>&1 && [ ! -f "$PAUSE" ] && state=running
+  printf 'queue: %s outstanding   state: %s\n' "$n" "$state"
+  resources
+  printf '\n'
+  tail -n "${TAIL:-10}" "$QLOG" 2>/dev/null
+}
+
+cmd_status(){                       # live view; Ctrl-C to leave
+  # piped or scripted: prime the rate counters, then print one frame and stop
+  [ -t 1 ] || { resources >/dev/null 2>&1; sleep 0.3; render; return 0; }
+  trap 'printf "\033[?25h\033[J\n"; exit 0' INT TERM
+  printf '\033[?25l\033[2J'        # hide cursor, clear once at entry only
+  local outstanding='' last=0 now frame
+  while :; do
+    now=$(date +%s)
+    # the remote count changes once per episode, so poll it rarely; everything
+    # else in the frame is local and cheap
+    if [ $(( now - last )) -ge "${DISCOVER_EVERY:-60}" ]; then
+      outstanding=$(discover 2>/dev/null | wc -l) || outstanding='?'
+      last=$now
+    fi
+    frame=$(OUTSTANDING="$outstanding" render)
+    # Redraw without blanking: home, then overwrite each line and clear only to
+    # its end. Clearing the screen first is what made it flicker.
+    { printf '\033[H'
+      while IFS= read -r l; do printf '%s\033[K\n' "$l"; done <<< "$frame"
+      printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
+    } 2>/dev/null
+    sleep "${INTERVAL:-1}"
+  done
+}
+
+# --------------------------------------------------------------- dispatch ----
+case "${1:-}" in
+  list|--list)     discover | nl; exit 0 ;;
+  status|--status) cmd_status; exit 0 ;;
+  pause|--pause)   touch "$PAUSE"; echo "paused - will hold after the current chunk"; exit 0 ;;
+  resume|--resume) rm -f "$PAUSE"; echo "resumed"; exit 0 ;;
+  stop|--stop)     touch "$STOP";  echo "stopping after the current episode"; exit 0 ;;
+  run|--run)       MODE=run ;;
+  once|--once)     MODE=once ;;
+  # internal phase entry points - the queue re-executes this script so that
+  # fetch and deliver can run as background processes alongside the GPU work
+  _fetch|_process|_deliver) : ;;
+  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
+
+if [ "${1}" = _fetch ] || [ "${1}" = _process ] || [ "${1}" = _deliver ]; then
+
+  case "$1" in
+    _fetch)   do_fetch ;;
+    _process) do_process ;;
+    _deliver) do_deliver "${3:-}" ;;
+  esac
+  exit 0
+fi
+
+rm -f "$STOP"
+deliver_pid=""; done_n=0
+while :; do
+  [ -f "$STOP" ] && { say "stopped"; break; }
+  while [ -f "$PAUSE" ]; do sleep 10; done
+
+  mapfile -t TODO < <(discover || true)
+  if [ "${#TODO[@]}" -eq 0 ]; then
+    [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; deliver_pid=""; }
+    [ "$MODE" = once ] && { say "nothing outstanding"; break; }
+    sleep "$IDLE"; continue
+  fi
+
+  src="${TODO[0]}"
+  base=$(basename "${src%.*}")
+  say "[$((done_n+1))] processing $base  (${#TODO[@]} outstanding)"
+
+  "$0" _fetch "$src"
+
+  # next episode downloads while this one is on the GPU
+  prefetch_pid=""
+  if [ "${#TODO[@]}" -gt 1 ]; then
+    ( "$0" _fetch "${TODO[1]}" >/dev/null 2>&1 ) & prefetch_pid=$!
+  fi
+
+  "$0" _process "$src"
+
+  # the previous upload must finish before this one starts, so two transfers
+  # never split a 2.2 MB/s link between them
+  [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; }
+  ( "$0" _deliver "$src" ) & deliver_pid=$!
+
+  [ -n "$prefetch_pid" ] && { wait "$prefetch_pid" 2>/dev/null || true; }
+  done_n=$((done_n+1))
+  if [ "$LIMIT" -gt 0 ] && [ "$done_n" -ge "$LIMIT" ]; then
+    say "limit $LIMIT reached"; break
+  fi
+done
+[ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; }
+say "queue done: $done_n episode(s) this run"
