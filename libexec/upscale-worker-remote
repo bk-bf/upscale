@@ -167,6 +167,9 @@ final=$(vframes "$OUT.part")
 [ "$final" = "$TOTAL" ] || die "FINAL MISMATCH: $final frames, source had $TOTAL"
 mv "$OUT.part" "$OUT"
 t2=$(date +%s)
-rm -f "$EPSTATE/job"
+# The job file is NOT removed here. The next episode overwrites it, and leaving
+# it means the status keeps showing which episode this is - and that it reached
+# 100% - through the several minutes the server spends collecting the result.
+# Deleting it made the box show a blank screen for the whole delivery.
 say "done: $OUT  $(du -h "$OUT" | cut -f1)  $final frames  wall $((t2-t0))s ($(echo "scale=1;($t2-$t0)/60"|bc) min)"
 rm -rf "$FRAMES" "$UP" "$W/shard" "$SEGDIR"

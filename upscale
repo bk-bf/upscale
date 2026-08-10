@@ -221,7 +221,22 @@ resources(){
 # temp on top of that). Both remote lookups are ssh round-trips, so they run on
 # a poll schedule, never per frame.
 
+# Am I the GPU box rather than a queue? On the box the transfers still exist -
+# the collector pushes a source in and pulls a result out - but they are in
+# different places and belong to the other end. Without this the box drew no
+# transfer bars at all, because it was being asked the queue's questions ("which
+# file is MY rsync sending, and how big is it on the server?") and had no answer.
+is_box(){ [ -z "${GPUHOST:-}" ] && [ -n "${RWORK:-}" ] && [ -d "${RWORK:-/nonexistent}" ]; }
+
 download_part(){       # the local partial of the source being fetched, if any
+  if is_box; then
+    # ONLY the partial. rsync renames .src.avi.XXXXXX to src.avi the moment the
+    # push completes, so matching the finished name too left a "download" on
+    # screen for the entire episode after the transfer had ended.
+    find "$RWORK" -maxdepth 1 -name '.src.avi.*' -type f \
+         -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
+    return 0
+  fi
   # rsync writes .src.part.XXXXXX while the transfer runs and only renames it to
   # src.part when it is interrupted, so looking for 'src.part' alone meant the
   # download line was missing for the whole of a healthy download.
@@ -230,6 +245,9 @@ download_part(){       # the local partial of the source being fetched, if any
 }
 
 fetch_target(){        # $1 = base name -> remote size of the source being fetched
+  # The box cannot see the library, so it cannot know how big the incoming file
+  # is - the collector writes it down when it starts pushing.
+  if is_box; then cat "$RWORK/srcsize" 2>/dev/null; return 0; fi
   lib_cmd "find $(printf '%q' "$LIB") -name $(printf '%q' "$1.avi") -printf '%s\n' 2>/dev/null | head -1" 2>/dev/null
 }
 
@@ -250,6 +268,7 @@ worker_src(){          # the source the per-episode worker is processing, if any
 }
 
 upload_file(){         # the local .mkv rsync is delivering right now, if any
+  if is_box; then [ -f "$RWORK/out.mkv" ] && printf '%s\n' "$RWORK/out.mkv"; return 0; fi
   local pid a
   for pid in $(pgrep -x rsync 2>/dev/null || true); do
     [ -r "/proc/$pid/cmdline" ] || continue
@@ -266,6 +285,11 @@ upload_file(){         # the local .mkv rsync is delivering right now, if any
 }
 
 upload_size(){         # $1 = base name -> size of ITS remote partial, or nothing
+  # On the box the receiver is the server, and how much of the file has ARRIVED
+  # there is not knowable from here. Rather than invent a percentage, the box
+  # reports the result as ready-and-being-collected; the true two-sided bar is
+  # in the collector's own view, which is the only place both numbers exist.
+  if is_box; then return 0; fi
   # Matching by name is the point. Taking whatever `find -name '.*.mkv.part*'`
   # printed first picked up partials left behind by interrupted deliveries of
   # OTHER episodes, which is where "106%  487/457 MB" came from.
@@ -498,8 +522,17 @@ render(){
   # as an elif, a simultaneous download was simply never reported.
   local act=""
   if pgrep -f 'realesrgan-ncnn-vulkan|upscale-ep process|upscale _process' >/dev/null 2>&1; then act=processing; fi
-  if pgrep -f '[r]sync .*mkv' >/dev/null 2>&1; then act="${act:+$act + }uploading"; fi
-  if pgrep -f '[r]sync .*avi' >/dev/null 2>&1; then act="${act:+$act + }fetching"; fi
+  if is_box; then
+    # On the box the transfers are the other end's: the collector pushes a source
+    # IN and pulls a result OUT. Calling an incoming push "uploading" - which is
+    # what the queue's wording did here - describes the opposite of what is
+    # happening, on the machine where it is easiest to misread.
+    if pgrep -f '[r]sync --server.*avi' >/dev/null 2>&1; then act="${act:+$act + }receiving source"; fi
+    if pgrep -f '[r]sync --server.*mkv' >/dev/null 2>&1; then act="${act:+$act + }sending result"; fi
+  else
+    if pgrep -f '[r]sync .*mkv' >/dev/null 2>&1; then act="${act:+$act + }uploading"; fi
+    if pgrep -f '[r]sync .*avi' >/dev/null 2>&1; then act="${act:+$act + }fetching"; fi
+  fi
   if [ -z "$act" ]; then
     if pgrep -f '[u]pscale run|[u]pscale once' >/dev/null 2>&1
       then act="waiting for work"; else act="not running"; fi
@@ -518,7 +551,9 @@ render(){
       printf 'download %s %3d%%   %s/%s MB%s\033[K\n' "$(bar "$pc" 20)" \
         "$pc" "$((psz/1048576))" "$((tsz/1048576))" "$XFER"
     else
-      printf 'download %s MB so far   %s\033[K\n' "$((psz/1048576))" "$(basename "$(dirname "$part")" | cut -c1-28)"
+      printf 'download %s MB so far   %s\033[K\n' "$((psz/1048576))" \
+        "$(if is_box; then cat "$RWORK/episode" 2>/dev/null | cut -c1-40
+           else basename "$(dirname "$part")" | cut -c1-28; fi)"
     fi
   fi
 
@@ -606,7 +641,12 @@ render(){
   else
     # Phase 1: no job file yet. The worker is counting the source's frames and
     # cross-checking the decoders, which showed as nothing at all before.
-    if [ -n "$wsrc" ]; then
+    # On the box the source is always called src.avi; the collector leaves the
+    # real title in $RWORK/episode, and using it means the screen is never blank
+    # while an episode is starting or being collected.
+    if is_box && [ -s "$RWORK/episode" ]; then
+      line_title "$(cat "$RWORK/episode" 2>/dev/null)"
+    elif [ -n "$wsrc" ]; then
       line_title "$(basename "${wsrc%.*}")"
       # the cross-check is the only ffmpeg that decodes single frames; matching
       # plain "ffmpeg" would also catch the background chunk encoder
@@ -635,6 +675,22 @@ render(){
       printf 'upload   %s %3d%%   %s/%s MB%s\033[K\n' "$(bar "$upc" 20)" "$upc" \
         "$((sent/1048576))" "$((usz/1048576))" "$XFER"
       printf '         %s\033[K\n' "$(basename "${UPFILE%.*}" | cut -c1-60)"
+    fi
+  fi
+
+  # The box's half of the delivery: the file is finished and the server is
+  # collecting it. No percentage - see upload_size() - but silence during a
+  # four-minute transfer reads as a hang, which is what it looked like.
+  # poll_xfer normalises an unknown size to 0, not to empty - testing for empty
+  # meant this line never appeared at all.
+  if is_box && [ -n "${UPFILE:-}" ] && [ "${UPLOAD:-0}" -eq 0 ]; then
+    local osz; osz=$(stat -c%s "$UPFILE" 2>/dev/null) || osz=0
+    if [ "$osz" -gt 0 ]; then
+      if pgrep -f '[r]sync --server' >/dev/null 2>&1; then
+        printf 'deliver  %s MB being collected by the server\033[K\n' "$((osz/1048576))"
+      else
+        printf 'deliver  %s MB ready, waiting to be collected\033[K\n' "$((osz/1048576))"
+      fi
     fi
   fi
 
@@ -894,6 +950,9 @@ cmd_collect(){
     rsz=$(rsh "stat -c%s $RWORK/src.avi 2>/dev/null || echo 0" 2>/dev/null | tr -d '\r') || rsz=0
     if [ "${rsz:-0}" != "$lsz" ]; then
       say "pushing source ($((lsz/1048576)) MB)"
+      # tell the box how big it will be, so its own status can show a real
+      # percentage while the push is in flight instead of a bare byte count
+      rsh "printf '%s' $lsz > $RWORK/srcsize" >/dev/null 2>&1 || true
       if ! rsync -q --partial -e "ssh -o BatchMode=yes -o ControlPath=none $GPUHOST" "$src" ":$RWORK/src.avi"; then
         say "push failed; retrying"; sleep "$POLL"; continue
       fi
@@ -1006,7 +1065,11 @@ case "${1:-}" in
   # A collector has no local worker: cmd_status would describe the SERVER, which
   # is idle by definition, and say nothing about the box doing the work.
   status|--status) load_config
-                   if [ -n "${GPUHOST:-}" ] || [ -d "${RWORK:-/nonexistent}" ]
+                   # GPUHOST alone decides: it means "I am driving a box over
+                   # there". Also treating a local RWORK as the collector made
+                   # the BOX try to ssh to an empty GPUHOST and report itself
+                   # unreachable - RWORK is set there so it can find its own work.
+                   if [ -n "${GPUHOST:-}" ]
                      then cmd_collect_status; else cmd_status; fi
                    exit 0 ;;
   # write BOTH: the worker polls its own state dir, so a flag written only
