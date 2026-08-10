@@ -167,9 +167,11 @@ final=$(vframes "$OUT.part")
 [ "$final" = "$TOTAL" ] || die "FINAL MISMATCH: $final frames, source had $TOTAL"
 mv "$OUT.part" "$OUT"
 t2=$(date +%s)
-# The job file is NOT removed here. The next episode overwrites it, and leaving
-# it means the status keeps showing which episode this is - and that it reached
-# 100% - through the several minutes the server spends collecting the result.
-# Deleting it made the box show a blank screen for the whole delivery.
+# The job file is kept - the next episode overwrites it - so the status still
+# names this episode through the several minutes the server spends collecting
+# the result. But the work directory is gone by now, and a renderer that counts
+# progress from it reads that as 0%: "stuck at 0%" for a finished episode is a
+# worse lie than the blank screen this replaced. So say outright that it is done.
+printf 'DONE=1\n' >> "$EPSTATE/job"
 say "done: $OUT  $(du -h "$OUT" | cut -f1)  $final frames  wall $((t2-t0))s ($(echo "scale=1;($t2-$t0)/60"|bc) min)"
 rm -rf "$FRAMES" "$UP" "$W/shard" "$SEGDIR"

@@ -570,12 +570,20 @@ render(){
   # Scoped so the job file's values cannot leak into the next frame: without
   # this, SRC survived the job being deleted and "next" kept excluding an
   # episode that had already finished.
-  local SRC='' TOTAL=0 CHUNK="${CHUNK:-2000}" SEGDIR='' UPDIR='' PID=''
+  local SRC='' TOTAL=0 CHUNK="${CHUNK:-2000}" SEGDIR='' UPDIR='' PID='' DONE=0
   local wsrc=''
   wsrc=$(worker_src) || wsrc=''
   if [ -f "$JOB" ]; then
     # shellcheck disable=SC1090
     . "$JOB"
+    # A finished episode's work directory has been cleaned, so every count-based
+    # measure reads zero. Without this the bar sat at 0% with 0.0 fps for the
+    # whole delivery - which looks exactly like a hang, and was reported as one.
+    if [ "${DONE:-0}" = 1 ]; then
+      line_title "$(basename "${SRC%.*}")"
+      line_prog upscale 100 "${TOTAL:-0}" "${TOTAL:-0}"
+      line_note "finished - the result is being collected"
+    else
     local segs=0 inflight=0 df pct chunks el fps eta fdir extracted=0 phase=upscale t0 fmt gpu_busy=0
     if pgrep -f realesrgan-ncnn-vulkan >/dev/null 2>&1; then gpu_busy=1; fi
     # a job file can outlive its work dir (cleaned up, or a killed run); treat a
@@ -637,6 +645,7 @@ render(){
       line_note "$(printf 'chunk %d/%d   %s fps   elapsed %s   eta %s%s' \
         "$(( segs < chunks ? segs+1 : chunks ))" "$chunks" "$fps" \
         "$(ms "$el")" "$(ms "$eta")" "$stage")"
+    fi
     fi
   else
     # Phase 1: no job file yet. The worker is counting the source's frames and
