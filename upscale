@@ -748,7 +748,17 @@ cdie(){ say "$*"; exit 1; }
 rsh(){ timeout "${SSHTMO:-90}" ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST "$@"; }
 
 # Is the per-episode worker running on the box right now?
-rworking(){ rsh "pgrep -f $(basename "$RSCRIPT") >/dev/null" >/dev/null 2>&1; }
+#
+# The bracket around the first character is load-bearing. `pgrep -f foo.sh` sent
+# over ssh matches the remote `bash -c pgrep -f foo.sh ...` that is asking the
+# question, so this returned true whether or not anything was running - the
+# collector "adopted" a job that had finished twelve minutes earlier and never
+# launched the next episode. `[f]oo.sh` appears in the asking process's command
+# line but does not match itself as a regex.
+rworking(){
+  local b; b=$(basename "$RSCRIPT")
+  rsh "pgrep -f '[${b:0:1}]${b:1}' >/dev/null" >/dev/null 2>&1
+}
 
 # Decoded frame count. NOT packet count: a DivX packed-bitstream AVI carries two
 # frames in some packets and emits skip packets, so packets and frames differ by
@@ -777,7 +787,15 @@ collect_probe(){
   if [ -f "$out" ]; then
     printf 'phase=done\noutbytes=%s\n' "$(stat -c%s "$out" 2>/dev/null || echo 0)"
     # still report the frame count: "100%  0/0 frames" reads like a failure
-    total=$(sed -nE 's/.* ([0-9]+) frames @ .*/\1/p' "$log" 2>/dev/null | tail -1)
+    # A finished episode leaves its log behind, and the next source is pushed
+  # before the next job truncates it - so a log older than src.avi describes the
+  # PREVIOUS episode. Reporting it showed "chunk 18/18, done" for an episode that
+  # had not started, which is exactly backwards from the truth.
+  if [ "$log" -ot "$src" ]; then
+    printf 'phase=starting\n'
+    return 0
+  fi
+  total=$(sed -nE 's/.* ([0-9]+) frames @ .*/\1/p' "$log" 2>/dev/null | tail -1)
     [ -n "${total:-}" ] && printf 'total=%s\ndone=%s\n' "$total" "$total"
     return 0
   fi
@@ -854,12 +872,19 @@ cmd_collect_status(){
       line_prog "${phase:-upscale}" "$pct" "${done_:-0}" "$total"
       # elapsed comes from when the collector announced this episode; eta from
       # the box's own measured rate, which is the only honest source for it
+      # No stamp means we are not the collector (this is the box looking at its
+      # own work), and "elapsed 29773176m" is worse than saying nothing.
       started=$(stat -c%Y "$STATE/collect-started" 2>/dev/null) || started=0
-      el=$(( $(date +%s) - ${started:-0} )); [ "$el" -lt 0 ] && el=0
+      if [ "${started:-0}" -gt 0 ]; then
+        el=$(( $(date +%s) - started )); [ "$el" -lt 0 ] && el=0
+        el="elapsed $(ms "$el")"
+      else
+        el=''
+      fi
       eta=$(awk -v r="$(( total - ${done_:-0} ))" -v v="${fps:-0}" \
             'BEGIN{printf "%d", (v>0)?r/v:0}') || eta=0
-      line_note "$(printf '%s   %s   elapsed %s   eta %s' \
-        "${chunk:+chunk $chunk}" "${fps:+$fps fps}" "$(ms "$el")" "$(ms "$eta")")"
+      line_note "$(printf '%s   %s   %s   eta %s' \
+        "${chunk:+chunk $chunk}" "${fps:+$fps fps}" "$el" "$(ms "$eta")")"
     else
       line_note "starting up ..."
     fi
@@ -885,8 +910,9 @@ cmd_collect_status(){
       line_kv push "$((srcb/1048576)) MB on the box"
     fi
 
-    line_kv state "$(printf '%s   |   queue %s outstanding' \
-      "$([ "$phase" = done ] && echo 'pulling result' || echo "remote ${phase:-?}")" "$n")"
+    line_kv state "$(printf '%s%s' \
+      "$([ "$phase" = done ] && echo 'pulling result' || echo "remote ${phase:-starting}")" \
+      "$([ "${n:-0}" -gt 0 ] && printf '   |   queue %s outstanding' "$n")")"
     [ -n "$nxt" ] && line_kv next "$(basename "${nxt%.*}" | cut -c1-58)"
     line_kv box "$(printf 'gpu %s%%   free %s' "${gpu:--}" "${free:--}")"
     [ -n "$tail_" ] && line_kv log "$tail_"

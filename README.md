@@ -157,6 +157,39 @@ queue can share one library. The remote job is started detached, so a dropped ss
 cannot kill a 15-minute episode, and the result is frame-counted and checked for an audio
 stream before it is published.
 
+## Watchdog
+
+`upscale-watch` answers one question: **has a number changed since last time?**
+
+```bash
+upscale-watch                 # sample both pipelines, print the health file
+systemctl --user enable --now upscale-watch.timer   # every 5 min, with --fix
+cat ~/.upscale-queue/health   # last verdict
+```
+
+```
+checked   2026-08-10 19:40:18
+collector OK           upscaling   up=0 out=0 src=178318050 part=0
+local     OK           working     up=1998 seg=15 out=0
+delivered 11 episodes
+```
+
+Liveness is worthless here. Both real stalls this pipeline has had looked
+perfectly healthy: the service was `active`, ssh answered, and a log line was
+written every 70 seconds — while in one case the collector tailed a log from an
+episode that had finished twelve minutes earlier, and in the other a process sat
+in `do_wait` forever. Nothing was down; nothing was moving either. So the watchdog
+compares frames upscaled, bytes in flight and episodes delivered against the
+previous sample, and calls a stall when the whole tuple stops changing.
+
+One shape is caught immediately rather than after three samples: a source sitting
+on the box with no worker running is a stall by definition, not a slow patch.
+
+`--fix` restarts a stalled **collector** only, because restarting it is provably
+safe — it adopts a job already running on the box instead of starting a second
+one. It never touches the remote worker or the local queue's episode: killing work
+in progress to clear a stall is a worse outcome than the stall.
+
 ## How it works
 
 **Phases overlap across episodes.** While episode N is on the GPU, N+1 is downloading

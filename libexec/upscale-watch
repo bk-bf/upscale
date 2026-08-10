@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# upscale-watch — is each pipeline actually making progress?
+#
+#   upscale-watch          take one sample, update the health file, print it
+#   upscale-watch --log    same, and append a line to health.log
+#   upscale-watch --fix    additionally restart a stalled COLLECTOR (see below)
+#
+# Liveness is not progress. Both stalls this pipeline has had looked perfectly
+# healthy from the outside: a service in `active` state, an ssh that answers, a
+# log being written every 70 seconds. In one the collector was tailing a log
+# from an episode that had finished twelve minutes earlier; in the other a
+# process sat in do_wait forever. Nothing was down. Nothing was moving either.
+#
+# So the only question asked here is: has a NUMBER changed since last time?
+#   local     frames upscaled, episodes delivered, bytes of the upload in flight
+#   collector frames on the box, bytes of the pull in flight, episodes delivered
+# If the whole tuple is identical for STALL_AFTER consecutive samples while the
+# pipeline claims to be working, it is stalled - whatever its service says.
+set -uo pipefail
+
+STATE=${STATE:-$HOME/.upscale-queue}
+LIB=${LIB:-/mnt/media/tv/Bleach}
+DESKTOP=${DESKTOP:-desktop}            # ssh alias; empty to skip the local half
+HEALTH="$STATE/health"
+HLOG="$STATE/health.log"
+PREV="$STATE/.watch-prev"
+STALL_AFTER=${STALL_AFTER:-3}          # samples, so ~15 min at a 5-minute timer
+mkdir -p "$STATE"
+
+do_log=0; do_fix=0
+for a in "$@"; do
+  case "$a" in
+    --log) do_log=1 ;;
+    --fix) do_fix=1; do_log=1 ;;
+    *) printf 'upscale-watch: unknown option %s\n' "$a" >&2; exit 2 ;;
+  esac
+done
+
+now=$(date +%s)
+ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+# --- the collector and the box it drives -------------------------------------
+# GPUHOST moves whenever the rented box is recreated, so read it from the same
+# file the service does rather than assuming an address.
+[ -r "$STATE/gpuhost.env" ] && { set -a; . "$STATE/gpuhost.env"; set +a; }
+GPUHOST=${GPUHOST:-}
+RWORK=${RWORK:-/root/drive}
+RGPUWORK=${RGPUWORK:-/root/work}
+
+rsh(){ timeout 45 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST "$@" 2>/dev/null; }
+
+col_state=unknown; col_metric=''; col_detail=''
+if [ -n "$GPUHOST" ]; then
+  # One round trip for everything: frames upscaled so far, whether the worker is
+  # alive, and whether a result is waiting. The bracket in the pgrep pattern
+  # stops it matching the very ssh command that carries it - without it this
+  # always answered "running".
+  read -r c_up c_run c_out c_src < <(rsh "
+      printf '%s %s %s %s\n' \
+        \"\$(ls $RGPUWORK/src/up 2>/dev/null | wc -l)\" \
+        \"\$(pgrep -f '[u]pscale-ep-rental' >/dev/null && echo 1 || echo 0)\" \
+        \"\$(test -f $RWORK/out.mkv && echo 1 || echo 0)\" \
+        \"\$(stat -c%s $RWORK/src.avi 2>/dev/null || echo 0)\"" ) || true
+  c_up=${c_up:-}; c_run=${c_run:-}; c_out=${c_out:-}; c_src=${c_src:-}
+  if [ -z "$c_up" ]; then
+    col_state=unreachable
+  else
+    # bytes of the pull in flight, so a slow transfer still counts as progress
+    c_part=$(find "$LIB" -name '.*.mkv.part*' -type f -printf '%s\n' 2>/dev/null | sort -n | tail -1)
+    col_metric="up=$c_up out=$c_out src=$c_src part=${c_part:-0}"
+    if   [ "$c_out" = 1 ]; then col_state=pulling
+    elif [ "$c_run" = 1 ]; then col_state=upscaling
+    elif [ "${c_src:-0}" -gt 0 ]; then col_state=idle-with-source   # <- the stall shape
+    else col_state=waiting
+    fi
+    col_detail="worker=$c_run"
+  fi
+else
+  col_state=not-configured
+fi
+
+# --- the local (desktop) queue ------------------------------------------------
+loc_state=unknown; loc_metric=''
+if [ -n "$DESKTOP" ]; then
+  read -r l_up l_seg l_run l_part < <(ssh -o BatchMode=yes -o ConnectTimeout=15 "$DESKTOP" '
+      w=$(ls -d /mnt/scratch/upscale-ep/*/ 2>/dev/null | head -1)
+      printf "%s %s %s %s\n" \
+        "$(ls "$w"up 2>/dev/null | wc -l)" \
+        "$(ls "$w"seg 2>/dev/null | wc -l)" \
+        "$(pgrep -f "[u]pscale-ep" >/dev/null && echo 1 || echo 0)" \
+        "$(ls -l "$w"*.mkv 2>/dev/null | awk "{print \$5}" | head -1)"' 2>/dev/null) || true
+  if [ -z "${l_up:-}" ]; then
+    loc_state=unreachable
+  else
+    loc_metric="up=${l_up:-0} seg=${l_seg:-0} out=${l_part:-0}"
+    if [ "${l_run:-0}" = 1 ]; then loc_state=working; else loc_state=idle; fi
+  fi
+else
+  loc_state=not-configured
+fi
+
+# episodes delivered is the metric that matters most: it moves only when an
+# episode actually lands, and it is the one number the user cares about
+delivered=$(find "$LIB" -name '*.mkv' -not -name '.*' 2>/dev/null | wc -l)
+
+# --- has anything moved? ------------------------------------------------------
+sample="d=$delivered | col[$col_state] $col_metric | loc[$loc_state] $loc_metric"
+p_sample=''; col_same=0; loc_same=0
+if [ -r "$PREV" ]; then
+  # shellcheck disable=SC1090
+  . "$PREV"
+fi
+[ "$col_metric" = "${p_col_metric:-}" ] && col_same=$(( ${p_col_same:-0} + 1 )) || col_same=0
+[ "$loc_metric" = "${p_loc_metric:-}" ] && loc_same=$(( ${p_loc_same:-0} + 1 )) || loc_same=0
+
+col_verdict=OK; loc_verdict=OK
+case "$col_state" in
+  unreachable)      col_verdict=UNREACHABLE ;;
+  not-configured)   col_verdict=- ;;
+  idle-with-source) col_verdict=STALLED ;;   # a source is on the box, nothing is running
+  *) [ "$col_same" -ge "$STALL_AFTER" ] && col_verdict=STALLED ;;
+esac
+case "$loc_state" in
+  unreachable)    loc_verdict=UNREACHABLE ;;
+  not-configured) loc_verdict=- ;;
+  idle)           [ "$loc_same" -ge "$STALL_AFTER" ] && loc_verdict=IDLE ;;
+  *) [ "$loc_same" -ge "$STALL_AFTER" ] && loc_verdict=STALLED ;;
+esac
+
+{ printf 'p_col_metric=%q\np_col_same=%s\np_loc_metric=%q\np_loc_same=%s\np_when=%s\n' \
+    "$col_metric" "$col_same" "$loc_metric" "$loc_same" "$now"; } > "$PREV"
+
+{ printf 'checked   %s\n' "$ts"
+  printf 'collector %-12s %-11s %s\n' "$col_verdict" "$col_state" "$col_metric"
+  printf 'local     %-12s %-11s %s\n' "$loc_verdict" "$loc_state" "$loc_metric"
+  printf 'delivered %s episodes\n' "$delivered"
+} > "$HEALTH"
+cat "$HEALTH"
+
+[ "$do_log" = 1 ] && printf '%s  col=%s/%s loc=%s/%s  %s\n' \
+  "$ts" "$col_verdict" "$col_state" "$loc_verdict" "$loc_state" "$sample" >> "$HLOG"
+
+# --- remediation --------------------------------------------------------------
+# Only the collector is restarted, and only because restarting it is provably
+# safe: it adopts a job already running on the box rather than starting a second
+# one. Nothing here ever touches the remote worker or the local queue's episode -
+# killing work in progress to fix a display problem is a worse outcome than the
+# stall. Everything else is reported for a human to look at.
+if [ "$do_fix" = 1 ] && [ "$col_verdict" = STALLED ]; then
+  printf '%s  restarting upscale-collect.service (collector stalled)\n' "$ts" >> "$HLOG"
+  systemctl --user restart upscale-collect.service 2>>"$HLOG" && \
+    printf '%s  restart issued\n' "$ts" >> "$HLOG"
+  rm -f "$PREV"     # do not immediately re-trigger on the same sample
+fi
+
+case "$col_verdict$loc_verdict" in
+  *STALLED*|*UNREACHABLE*) exit 1 ;;
+esac
+exit 0
