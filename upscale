@@ -780,6 +780,7 @@ collect_probe(){
   # written by the collector when it pushes, so `upscale --status` ON the box
   # names the episode instead of showing "(no episode)"
   [ -f "$rw/episode" ] && printf 'ep=%s\n' "$(cat "$rw/episode" 2>/dev/null)"
+  [ -f "$rw/started" ] && printf 'started=%s\n' "$(cat "$rw/started" 2>/dev/null)"
   w="$work/$(basename "${src%.*}")"
   # the episode's real name is not on the box - it works on "src.avi" - so the
   # caller supplies it; here we report only what the box can actually know
@@ -839,18 +840,19 @@ cmd_collect_status(){
   # Same layout as the local view (line_title/line_prog/line_note/line_kv), same
   # bar, same ms(), same xfer_eta - only the machine being described differs.
   local k v phase total done_ chunk fps gpu free tail_ srcb outb ep n repep
-  local pct el eta cur nchunk started nxt part psz
+  local pct el eta cur nchunk started nxt part psz repstart
   local tty=0; [ -t 1 ] && tty=1
   [ "$tty" = 1 ] && printf '\033[?12l\033[?25l\033[2J'
   trap 'printf "\033[?25h\033[J\n"; exit 0' INT TERM
   while :; do
     phase=''; total=''; done_=''; chunk=''; fps=''; gpu=''; free=''; tail_=''
-    srcb=''; outb=''; repep=''
+    srcb=''; outb=''; repep=''; repstart=''
     while IFS='=' read -r k v; do
       case "$k" in
         phase) phase=$v ;; total) total=$v ;; done) done_=$v ;; chunk) chunk=$v ;;
         fps) fps=$v ;; gpu) gpu=$v ;; free) free=$v ;; tail) tail_=$v ;;
         srcbytes) srcb=$v ;; outbytes) outb=$v ;; extracted) done_=$v ;; ep) repep=$v ;;
+        started) repstart=$v ;;
       esac
     done < <(collect_read)
 
@@ -875,6 +877,8 @@ cmd_collect_status(){
       # No stamp means we are not the collector (this is the box looking at its
       # own work), and "elapsed 29773176m" is worse than saying nothing.
       started=$(stat -c%Y "$STATE/collect-started" 2>/dev/null) || started=0
+      # on the box there is no local stamp, so use the one the collector left
+      [ "${started:-0}" -gt 0 ] || started=${repstart:-0}
       if [ "${started:-0}" -gt 0 ]; then
         el=$(( $(date +%s) - started )); [ "$el" -lt 0 ] && el=0
         el="elapsed $(ms "$el")"
@@ -960,7 +964,11 @@ cmd_collect(){
       if [ "$rsz" != "$lsz" ]; then say "size mismatch after push"; sleep "$POLL"; continue; fi
     fi
 
-    rsh "printf '%s' $(printf '%q' "$base") > $RWORK/episode" >/dev/null 2>&1 || true
+    # The box knows nothing but "src.avi": the episode's name and when the
+    # collector started it both have to be handed over, or `upscale --status`
+    # run ON the box has no title and no elapsed to show.
+    rsh "printf '%s' $(printf '%q' "$base") > $RWORK/episode
+         date +%s > $RWORK/started" >/dev/null 2>&1 || true
     : > "$STATE/collect-started"
 
     # Adopt a job that is already running rather than starting a second one on
