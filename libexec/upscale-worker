@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# upscale-ep — episode upscale on the desktop, split into overlappable phases.
+#
+#   upscale-ep run     <remote-src> [remote-dest-dir]   fetch + process + deliver
+#   upscale-ep fetch   <remote-src>                     pull source (idempotent)
+#   upscale-ep process <remote-src>                     GPU work, no network
+#   upscale-ep deliver <remote-src> [remote-dest-dir]   upload, verify, archive
+#   upscale-ep status | pause | resume | stop
+#
+# The phases exist so upscale-queue can overlap them across episodes: the server
+# link is ~2.2 MB/s (WiFi repeater + CAKE shaper), so ~5-6 min/episode of
+# transfer is unavoidable, but it is free if it happens while the GPU is busy on
+# a different episode.
+#
+# Design notes:
+#   * Four concurrent workers. One process leaves the GPU at ~65% between frames
+#     (9.97 fps); four peg it at 99% (measured 3.6x with animejanai-suc). Beyond
+#     four gains nothing - the GPU becomes the wall.
+#   * All workers write into ONE output dir. Filenames are preserved and
+#     distinct, so the merged dir is the sequence; nothing to reassemble.
+#   * All work is on ONE filesystem so chunk staging hardlinks instead of
+#     copying. Hardlinks cannot cross devices.
+#   * Frame counts are asserted at every stage; a dropped frame aborts the run
+#     rather than silently shortening the episode.
+#   * Delivery is verified by size BEFORE the original is archived, and the move
+#     uses `mv -n`, so a rerun can never clobber an archived original.
+set -euo pipefail
+
+REMOTE=${REMOTE:-ubuntu}
+LIB=${LIB:-/mnt/media/tv/Bleach}
+ARCHIVE=${ARCHIVE:-$LIB/.upscale-originals}
+MODEL=${MODEL:-animejanai-suc}
+MODEL_DIR=${MODEL_DIR:-$HOME/upscale-bench/models_janai}
+BIN=${BIN:-$HOME/upscale-bench/bin/realesrgan-ncnn-vulkan}
+WORKERS=${WORKERS:-8}   # measured: 4->33.1 fps, 8->38.7, 12->36.4 (contention)
+CHUNK=${CHUNK:-2000}
+SCALE=${SCALE:-2}
+CRF=${CRF:-18}
+PRESET=${PRESET:-veryfast}
+WORK=${WORK:-/mnt/scratch/upscale-ep}
+STATE=${STATE:-$HOME/.upscale-ep}
+
+mkdir -p "$STATE"
+JOB="$STATE/job"; PAUSE="$STATE/pause"; STOP="$STATE/stop"; LOG="$STATE/log"
+say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; }
+die(){ printf 'upscale-ep: %s\n' "$*" >&2; exit 1; }
+pngs(){ find "$1" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l; }
+# Network ops retry with backoff: the server rebooting mid-run must pause the
+# pipeline, not fail the episode.
+retry(){ local n=0 max=${RETRIES:-60}
+  until "$@"; do n=$((n+1)); [ "$n" -ge "$max" ] && return 1
+    say "retry $n/$max: $1 ..."; sleep $(( n<10 ? 10 : 30 )); done; }
+vframes(){ ffprobe -v error -count_frames -select_streams v \
+             -show_entries stream=nb_read_frames -of csv=p=0 "$1"; }
+
+cmd_status(){
+  [ -f "$JOB" ] || { echo "no job"; return 0; }
+  # shellcheck disable=SC1090
+  . "$JOB"
+  local segs=0 chunks state=running
+  [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
+  chunks=$(( (TOTAL + CHUNK - 1) / CHUNK ))
+  [ -f "$PAUSE" ] && state=paused
+  [ -f "$STOP" ]  && state=stopping
+  kill -0 "$PID" 2>/dev/null || state="not running"
+  local df=$(( segs * CHUNK )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
+  printf 'episode : %s\nstate   : %s (pid %s)\nprogress: %d/%d chunks, %d/%d frames (%d%%)\n' \
+    "$(basename "$SRC")" "$state" "$PID" "$segs" "$chunks" "$df" "$TOTAL" \
+    "$(( TOTAL ? df*100/TOTAL : 0 ))"
+  if [ -f "$STATE/started" ] && [ "$df" -gt 0 ]; then
+    awk -v f="$df" -v e="$(( $(date +%s) - $(cat "$STATE/started") ))" -v r="$((TOTAL-df))" \
+      'BEGIN{fps=(e>0)?f/e:0; printf "rate    : %.2f fps  elapsed %dm  eta %dm\n", fps, e/60, (fps>0)?r/fps/60:0}'
+  fi
+}
+
+PHASE="${1:-}"
+case "$PHASE" in
+  status) cmd_status; exit 0 ;;
+  pause)  touch "$PAUSE"; echo "pausing after current chunk"; exit 0 ;;
+  resume) rm -f "$PAUSE"; echo resumed; exit 0 ;;
+  stop)   touch "$STOP";  echo "stopping after current chunk"; exit 0 ;;
+  run|fetch|process|deliver) shift ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
+
+SRC_REMOTE="${1:?need remote source path}"
+BASE=$(basename "${SRC_REMOTE%.*}")
+W="$WORK/$BASE"
+FRAMES="$W/frames"; UP="$W/up"; SEGDIR="$W/seg"; LOCAL="$W/src"; OUT="$W/$BASE.mkv"
+
+do_fetch(){
+  mkdir -p "$W"
+  [ -f "$LOCAL" ] && return 0
+  say "fetching $(basename "$SRC_REMOTE")"
+  retry rsync -q --partial "$REMOTE:$SRC_REMOTE" "$LOCAL.part" || die "fetch failed: $SRC_REMOTE"
+  mv "$LOCAL.part" "$LOCAL"          # rename only on success: a partial file
+}                                    # must never look like a complete fetch
+
+do_process(){
+  [ -f "$LOCAL" ] || die "no local source; run fetch first"
+  [ -x "$BIN" ] || die "upscaler missing: $BIN"
+  [ -f "$MODEL_DIR/$MODEL.param" ] || die "model missing: $MODEL_DIR/$MODEL.param"
+  [ -f "$OUT" ] && { say "already processed: $BASE"; return 0; }
+  mkdir -p "$FRAMES" "$UP" "$SEGDIR"; rm -f "$PAUSE" "$STOP"
+
+  local FPS TOTAL
+  FPS=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$LOCAL")
+  TOTAL=$(vframes "$LOCAL")
+  say "$BASE: $TOTAL frames @ $FPS, $MODEL x$SCALE, $WORKERS workers"
+
+  cat > "$JOB" <<EOF
+SRC="$SRC_REMOTE"
+TOTAL=$TOTAL
+CHUNK=$CHUNK
+SEGDIR="$SEGDIR"
+UPDIR="$UP"
+PID=$$
+EOF
+  date +%s > "$STATE/started"
+
+  # -fps_mode passthrough is essential: the default silently drops or
+  # duplicates frames to hit a target rate.
+  if [ "$(pngs "$FRAMES")" != "$TOTAL" ]; then
+    rm -f "$FRAMES"/*.png
+    ffmpeg -v error -i "$LOCAL" -fps_mode passthrough "$FRAMES/%06d.png" -y
+    local got; got=$(pngs "$FRAMES")
+    [ "$got" = "$TOTAL" ] || die "extracted $got of $TOTAL frames"
+    say "extracted $got frames"
+  fi
+
+
+  mapfile -t ALL < <(find "$FRAMES" -maxdepth 1 -name '*.png' -type f | sort)
+  [ "${#ALL[@]}" = "$TOTAL" ] || die "listed ${#ALL[@]} files, expected $TOTAL"
+
+  local i=0 idx=0 seg n staged got enc_pid="" wpids wp
+  while [ "$i" -lt "$TOTAL" ]; do
+    idx=$((idx+1))
+    seg=$(printf '%s/seg_%04d.mkv' "$SEGDIR" "$idx")
+    n=$CHUNK; [ $((i+n)) -gt "$TOTAL" ] && n=$((TOTAL-i))
+    if [ -f "$seg" ] && [ "$(vframes "$seg")" = "$n" ]; then
+      say "chunk $idx complete, skipping"; i=$((i+n)); continue
+    fi
+    while [ -f "$PAUSE" ]; do sleep 5; done
+    [ -f "$STOP" ] && { say "stopped after chunk $((idx-1))"; break; }
+
+    rm -rf "$W/shard"; mkdir -p "$W/shard"
+    for ((k=i; k<i+n; k++)); do
+      d="$W/shard/$(( (k-i) % WORKERS ))"; mkdir -p "$d"; ln -f "${ALL[$k]}" "$d/"
+    done
+    staged=0; for ((p=0; p<WORKERS; p++)); do staged=$((staged + $(pngs "$W/shard/$p"))); done
+    [ "$staged" = "$n" ] || die "chunk $idx staged $staged of $n"
+
+    mkdir -p "$UP"
+    # Collect worker PIDs and wait on those specifically. A bare `wait` waits for
+    # ALL children, which would reap the background encode from the previous
+    # chunk and make the later `wait "$enc_pid"` fail with "not a child".
+    wpids=()
+    for ((p=0; p<WORKERS; p++)); do
+      "$BIN" -i "$W/shard/$p" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png >/dev/null 2>&1 &
+      wpids+=($!)
+    done
+    for wp in "${wpids[@]}"; do wait "$wp" || die "an upscale worker failed"; done
+    got=$(pngs "$UP"); [ "$got" = "$n" ] || die "chunk $idx upscaled $got of $n"
+
+    # Hand the frames off by RENAME (instant, same filesystem) and encode them in
+    # the background, so the GPU starts the next chunk immediately. Profiling
+    # showed encode (~9s) and the delete of 2000 PNGs (~14s) cost 26% of wall
+    # time with the GPU sitting at 1-2%.
+    encdir="$W/enc_$idx"; mv "$UP" "$encdir"; mkdir -p "$UP"
+    [ -n "$enc_pid" ] && { wait "$enc_pid" || die "background encode failed"; }
+    (
+      ffmpeg -v error -framerate "$FPS" -pattern_type glob -i "$encdir/*.png" \
+             -c:v libx264 -crf "$CRF" -preset "$PRESET" -pix_fmt yuv420p "$seg" -y || exit 1
+      e=$(vframes "$seg"); [ "$e" = "$n" ] || { echo "chunk $idx: encoded $e of $n" >&2; exit 1; }
+      rm -rf "$encdir"
+    ) &
+    enc_pid=$!
+
+    say "chunk $idx/$(( (TOTAL+CHUNK-1)/CHUNK )) upscaled ($((i+n))/$TOTAL)"
+    i=$((i+n))
+  done
+  # the last chunk's encode is still running in the background
+  [ -n "$enc_pid" ] && { wait "$enc_pid" || die "final background encode failed"; }
+
+  # ffmpeg concat: ' inside a quoted path must be written '\''  - episode
+  # titles like "A Shinigami's Work" otherwise truncate the filename.
+  find "$SEGDIR" -name 'seg_*.mkv' | sort |
+    sed -e "s/'/'\\\\''/g" -e "s|^|file '|" -e "s|$|'|" > "$SEGDIR/list"
+  # Mux the ORIGINAL audio back in. The video is rebuilt from frames, so it
+  # carries no audio of its own; without this the episode is silent.
+  # -map 1:a? is optional so a source with no audio track still succeeds.
+  # -f matroska: ffmpeg cannot infer a container from the ".part" suffix
+  ffmpeg -v error -f concat -safe 0 -i "$SEGDIR/list" -i "$LOCAL" \
+         -map 0:v:0 -map "1:a?" -c copy -f matroska "$OUT.part" -y
+  local final; final=$(vframes "$OUT.part")
+  [ "$final" = "$TOTAL" ] || die "FINAL MISMATCH: $final frames, source had $TOTAL"
+  mv "$OUT.part" "$OUT"
+  rm -rf "$FRAMES" "$UP" "$W/shard" "$SEGDIR"
+  rm -f "$JOB" "$STATE/started"
+  say "processed $final frames, $(du -h "$OUT" | cut -f1)"
+}
+
+do_deliver(){
+  # Sources may already live in the archive (the whole library was moved there
+  # up front, so Jellyfin shows only finished upscales). In that case the
+  # destination is the matching path back in the library, and there is nothing
+  # left to archive afterwards.
+  local dest pre_archived=0
+  case "$SRC_REMOTE" in
+    "$ARCHIVE"/*) pre_archived=1
+                  dest="${1:-$LIB/$(dirname "${SRC_REMOTE#"$ARCHIVE"/}")}" ;;
+    *)            dest="${1:-$(dirname "$SRC_REMOTE")}" ;;
+  esac
+  [ -f "$OUT" ] || die "nothing to deliver; run process first"
+
+  say "delivering $BASE.mkv -> $dest"
+  # Upload to a hidden temp name and rename only after the size is verified, so
+  # Jellyfin and Sonarr never see a half-written episode.
+  local tmp=".$BASE.mkv.part"
+  retry ssh "$REMOTE" "mkdir -p $(printf '%q' "$dest")" || die "cannot reach server"
+  retry rsync -q --partial "$OUT" "$REMOTE:$dest/$tmp" || die "delivery failed"
+  local lsz rsz
+  lsz=$(stat -c%s "$OUT")
+  rsz=$(retry ssh "$REMOTE" "stat -c%s $(printf '%q' "$dest/$tmp")") || die "delivered file not found"
+  [ "$lsz" = "$rsz" ] || die "delivered size $rsz != local $lsz"
+  retry ssh "$REMOTE" "mv -f $(printf '%q' "$dest/$tmp") $(printf '%q' "$dest/$BASE.mkv")" \
+    || die "could not publish $BASE.mkv"
+
+  if [ "$pre_archived" = 1 ]; then
+    say "original already archived, leaving in place"
+  else
+    local rel="${SRC_REMOTE#"$LIB"/}"
+    retry ssh "$REMOTE" "mkdir -p $(printf '%q' "$ARCHIVE/$(dirname "$rel")") && \
+                   mv -n $(printf '%q' "$SRC_REMOTE") $(printf '%q' "$ARCHIVE/$rel")"
+    say "archived original -> $ARCHIVE/$rel"
+  fi
+  rm -rf "$W"
+}
+
+case "$PHASE" in
+  fetch)   do_fetch ;;
+  process) do_process ;;
+  deliver) do_deliver "${2:-}" ;;
+  run)     do_fetch; do_process; do_deliver "${2:-}" ;;
+esac

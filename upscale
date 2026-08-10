@@ -1,83 +1,51 @@
 #!/usr/bin/env bash
-# upscale — resumable anime upscaling pipeline for a whole series.
+# upscale — keep upscaling episodes until nothing is left. Self-healing.
 #
 #   upscale run          process everything outstanding, then idle for more
 #   upscale once         process outstanding work, then exit
-#   upscale --status     live progress bar, rate, ETA and log tail (Ctrl-C exits)
-#   upscale --pause      hold after the current chunk
+#   upscale --status     live progress bar, rate, ETA and log tail (Ctrl-C to exit)
+#                        piped/non-tty: prints once and exits
+#   upscale --pause      finish the current chunk, then hold
 #   upscale --resume     release a pause
 #   upscale --stop       finish the current episode, then exit
-#   upscale --list       show what is outstanding
+#   upscale --list       show what is outstanding and stop
 #
 # Bare words work too (`upscale status`, `upscale pause`, ...).
 #
-# Runs on a machine with a GPU, against a media server reached over ssh. Sources
-# are pulled from the server, upscaled locally, and delivered back; originals are
-# moved into a hidden archive so the library only ever shows finished episodes.
+# There is NO saved work list and no progress pointer, deliberately. The queue
+# asks the server what is outstanding every cycle:
 #
-# SELF-HEALING: there is no saved work list and no progress pointer. Every cycle
-# it asks one question - which source has no matching .mkv? - so a power cut, a
-# reboot of either machine, or a killed process needs no recovery step. Finished
-# episodes are visible as .mkv and skipped; a half-finished episode resumes from
-# its already-encoded chunks.
+#     an episode needs work  <=>  its source .avi exists
+#                                 AND the matching .mkv does not
 #
-# Configuration is by environment variable; see the block below.
+# So a power cut, a desktop reboot or a server reboot needs no recovery step:
+# whatever is unfinished is still unfinished, and whatever completed is visible
+# as a .mkv and is skipped. Partly-done episodes resume mid-way too, because
+# upscale-ep verifies and skips already-encoded chunks in /mnt/scratch.
+#
+# Ordering: sources already in the archive come first, sources still sitting in
+# the library come last. That is how the already-watched episode 1 is kept
+# visible in Jellyfin and processed at the very end.
+#
+# Transfers overlap compute across episodes - while episode N is on the GPU,
+# N+1 is downloading and N-1 is uploading. The link is only ~2.2 MB/s, so this
+# matters: overlapped it is free, serial it would add ~6 min per episode.
 set -euo pipefail
 
 REMOTE=${REMOTE:-ubuntu}
 LIB=${LIB:-/mnt/media/tv/Bleach}
 ARCHIVE=${ARCHIVE:-$LIB/.upscale-originals}
-MODEL=${MODEL:-animejanai-suc}
-MODEL_DIR=${MODEL_DIR:-$HOME/upscale-bench/models_janai}
-BIN=${BIN:-$HOME/upscale-bench/bin/realesrgan-ncnn-vulkan}
-WORKERS=${WORKERS:-4}
-CHUNK=${CHUNK:-2000}
-SCALE=${SCALE:-2}
-CRF=${CRF:-18}
-PRESET=${PRESET:-veryfast}
-WORK=${WORK:-/mnt/scratch/upscale}
-STATE=${STATE:-$HOME/.upscale}
-LIMIT=${LIMIT:-0}                 # 0 = unlimited; bounds a test run
+WORK=${WORK:-/mnt/scratch/upscale-ep}   # must match the worker's scratch dir
+LIMIT=${LIMIT:-0}                 # 0 = no limit; used to bound test runs
 IDLE=${IDLE:-300}                 # seconds to wait when there is no work
-
+STATE=${STATE:-$HOME/.upscale-queue}
 mkdir -p "$STATE"
-JOB="$STATE/job"; PAUSE="$STATE/pause"; STOP="$STATE/stop"; LOG="$STATE/log"
-QLOG="$LOG"
-say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; }
-die(){ printf 'upscale: %s\n' "$*" >&2; exit 1; }
-pngs(){ find "$1" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l; }
-# Network ops retry with backoff: the server rebooting mid-run must pause the
-# pipeline, not fail the episode.
-retry(){ local n=0 max=${RETRIES:-60}
-  until "$@"; do n=$((n+1)); [ "$n" -ge "$max" ] && return 1
-    say "retry $n/$max: $1 ..."; sleep $(( n<10 ? 10 : 30 )); done; }
-vframes(){ ffprobe -v error -count_frames -select_streams v \
-             -show_entries stream=nb_read_frames -of csv=p=0 "$1"; }
+QLOG="$STATE/log"
+# The per-episode worker is a helper, deliberately NOT a second command on
+# $PATH. Override WORKER to relocate it.
+WORKER=${WORKER:-$(command -v upscale-worker 2>/dev/null || echo "${0%/*}/../libexec/upscale-worker")}; FAILED="$STATE/failed"; MAX_FAILS=${MAX_FAILS:-3}; PAUSE="$STATE/pause"; STOP="$STATE/stop"
+say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$QLOG" >&2; }
 
-
-# ---------------------------------------------------------------- worker ----
-ep_status(){
-  [ -f "$JOB" ] || { echo "no job"; return 0; }
-  # shellcheck disable=SC1090
-  . "$JOB"
-  local segs=0 chunks state=running
-  [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
-  chunks=$(( (TOTAL + CHUNK - 1) / CHUNK ))
-  [ -f "$PAUSE" ] && state=paused
-  [ -f "$STOP" ]  && state=stopping
-  kill -0 "$PID" 2>/dev/null || state="not running"
-  local df=$(( segs * CHUNK )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
-  printf 'episode : %s\nstate   : %s (pid %s)\nprogress: %d/%d chunks, %d/%d frames (%d%%)\n' \
-    "$(basename "$SRC")" "$state" "$PID" "$segs" "$chunks" "$df" "$TOTAL" \
-    "$(( TOTAL ? df*100/TOTAL : 0 ))"
-  if [ -f "$STATE/started" ] && [ "$df" -gt 0 ]; then
-    awk -v f="$df" -v e="$(( $(date +%s) - $(cat "$STATE/started") ))" -v r="$((TOTAL-df))" \
-      'BEGIN{fps=(e>0)?f/e:0; printf "rate    : %.2f fps  elapsed %dm  eta %dm\n", fps, e/60, (fps>0)?r/fps/60:0}'
-  fi
-}
-
-
-# ----------------------------------------------------------------- queue ----
 # Ask the server what is outstanding. Archived sources first, library sources
 # last; both sorted, so the order is stable across restarts.
 discover(){
@@ -101,7 +69,7 @@ done
 REMOTE_EOF
 }
 
-# Progress is read from the in-flight job file plus a live count of the frames
+# Progress is read from upscale-ep's job file plus a live count of the frames
 # already upscaled in the current chunk, so the bar advances continuously
 # rather than jumping once per chunk.
 bar(){ local p=$1 w=${2:-34} f e i out=''
@@ -147,71 +115,120 @@ resources(){
     fi
     _p_rx=$rx; _p_tx=$tx; _p_t=$now
   fi
-  printf 'cpu %3s%%   ram %s   gpu %3s%%%s   net %s v %s ^ Mbit/s\n' \
+  printf 'cpu %3s%%   ram %s   gpu %3s%%%s   net %s v %s ^ Mbit/s\033[K\n' \
     "$cpu" "$ram" "$gpu" "$vram" "${drx:--}" "${dtx:--}"
 }
 
+# Size of any in-flight upload. rsync --partial writes .NAME.mkv.part.XXXXXX
+# with a random suffix while transferring, hence the trailing glob. Polled on the
+# slow schedule as discover, never per frame.
+upload_size(){
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" \
+    "find $(printf '%q' "$LIB") -name '.*.mkv.part*' -printf '%s\n' 2>/dev/null | head -1" 2>/dev/null
+}
+
 render(){
-  local n
-  # $OUTSTANDING is supplied by the live loop, which refreshes it rarely -
-  # discover() is an ssh round-trip and must not run once per frame
-  n=${OUTSTANDING:-$(discover 2>/dev/null | wc -l || echo '?')}
+  local n=${OUTSTANDING:-?} JOB="$STATE/job"
+
+  # What is the pipeline actually doing? Processing is only one of four states;
+  # reporting "idle" while a 400 MB upload is in flight is what this fixes.
+  local act="" ep="" pid_up pid_dl pid_proc
+  pgrep -f 'realesrgan-ncnn-vulkan|"$WORKER" process|upscale _process' >/dev/null 2>&1 && act=processing
+  if pgrep -f '[r]sync .*mkv' >/dev/null 2>&1; then
+    [ -n "$act" ] && act="$act + uploading" || act=uploading
+  elif pgrep -f '[r]sync .*avi' >/dev/null 2>&1; then
+    [ -n "$act" ] && act="$act + fetching" || act=fetching
+  fi
+  [ -z "$act" ] && { pgrep -f '[u]pscale run|[u]pscale once' >/dev/null 2>&1 && act="waiting for work" || act="not running"; }
+
   if [ -f "$JOB" ]; then
     # shellcheck disable=SC1090
     . "$JOB"
-    local segs=0 inflight=0 df pct chunks el fps eta
+    local segs=0 inflight=0 df pct chunks el fps eta ph
     [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
-    [ -n "${UPDIR:-}" ] && [ -d "$UPDIR" ] &&
-      inflight=$(find "$UPDIR" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
+    local up="${UPDIR:-$WORK/$(basename "${SRC%.*}")/up}"
+    [ -d "$up" ] && inflight=$(find "$up" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
+    [ "$inflight" -ge "$CHUNK" ] && inflight=0
     df=$(( segs * CHUNK + inflight )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
-    chunks=$(( (TOTAL + CHUNK - 1) / CHUNK ))
-    pct=$(( TOTAL ? df * 100 / TOTAL : 0 ))
-    printf '\033[1m%s\033[0m\n' "$(basename "${SRC%.*}")"
-    printf '%s %3d%%   %s/%s frames\n' "$(bar "$pct")" "$pct" "$df" "$TOTAL"
+    [ "${_hw_src:-}" = "$SRC" ] || { _hw_src="$SRC"; _hw=0; }
+    [ "$df" -lt "${_hw:-0}" ] && df=$_hw || _hw=$df
+    chunks=$(( (TOTAL + CHUNK - 1) / CHUNK )); pct=$(( TOTAL ? df*100/TOTAL : 0 ))
+    printf '\033[1m%s\033[0m\033[K\n' "$(basename "${SRC%.*}")"
+    printf '%s %3d%%   %s/%s frames\033[K\n' "$(bar "$pct")" "$pct" "$df" "$TOTAL"
     el=$(( $(date +%s) - $(cat "$STATE/started" 2>/dev/null || date +%s) ))
     fps=$(awk -v f="$df" -v e="$el" 'BEGIN{printf "%.1f", (e>0)?f/e:0}')
     eta=$(awk -v r="$((TOTAL-df))" -v v="$fps" 'BEGIN{printf "%d", (v>0)?r/v/60:0}')
-    printf 'chunk %d/%d   %s fps   elapsed %dm   eta %dm\n' \
-      "$((segs+1))" "$chunks" "$fps" "$((el/60))" "$eta"
+    printf 'chunk %d/%d   %s fps   elapsed %dm   eta %dm\033[K\n' \
+      "$(( segs < chunks ? segs+1 : chunks ))" "$chunks" "$fps" "$((el/60))" "$eta"
   else
-    printf '\033[1m(no episode in flight)\033[0m\n'
+    printf '\033[1m(no episode being processed)\033[0m\033[K\n'
   fi
-  local state=idle
-  [ -f "$STOP" ] && state='stopping after current episode'
-  [ -f "$PAUSE" ] && state='PAUSED'
-  pgrep -f 'upscale _process' >/dev/null 2>&1 && [ ! -f "$PAUSE" ] && state=running
-  printf 'queue: %s outstanding   state: %s\n' "$n" "$state"
+
+  # Upload progress, if one is running. $UPLOAD is the remote .part size, polled
+  # on the same slow schedule as the outstanding count.
+  local loc
+  loc=$(find "$WORK" -maxdepth 2 -name '*.mkv' -not -name '.*' -type f 2>/dev/null | head -1)
+  if [ -n "$loc" ] && [ -n "${UPLOAD:-}" ] && [ "${UPLOAD:-0}" -gt 0 ]; then
+    local ls; ls=$(stat -c%s "$loc" 2>/dev/null || echo 0)
+    [ "$ls" -gt 0 ] && printf 'upload  %s %3d%%   %s/%s MB   %s\033[K\n' \
+      "$(bar $(( UPLOAD*100/ls )) 20)" "$(( UPLOAD*100/ls ))" \
+      "$((UPLOAD/1048576))" "$((ls/1048576))" "$(basename "${loc%.mkv}" | cut -c1-28)"
+  fi
+
+  # Name what runs next. If nothing does, say so - that is the explanation for
+  # why an upload is not overlapping any compute.
+  local nx='' cand cur=''
+  [ -f "$JOB" ] && cur=$(basename "${SRC%.*}")
+  while IFS= read -r cand; do
+    [ -z "$cand" ] && continue
+    cb=$(basename "${cand%.*}")
+    [ "$cb" = "$cur" ] && continue
+    [ -f "$WORK/$cb/$cb.mkv" ] && continue
+    nx="$cb"; break
+  done <<< "$(printf '%s\n%s\n' "${NEXT1:-}" "${NEXT2:-}")"
+  printf 'state   %s   |   queue %s outstanding\033[K\n' "$act" "$n"
+  if [ -n "$nx" ]; then
+    printf 'next    %s\033[K\n' "$(echo "$nx" | cut -c1-60)"
+  else
+    pgrep -f '[u]pscale run|[u]pscale once' >/dev/null 2>&1 &&
+      printf 'next    (none queued - nothing to overlap with)\033[K\n' ||
+      printf 'next    (queue not running)\033[K\n'
+  fi
   resources
-  printf '\n'
-  tail -n "${TAIL:-10}" "$QLOG" 2>/dev/null
 }
 
 cmd_status(){                       # live view; Ctrl-C to leave
   # piped or scripted: prime the rate counters, then print one frame and stop
-  [ -t 1 ] || { resources >/dev/null 2>&1; sleep 0.3; render; return 0; }
+  [ -t 1 ] || { resources >/dev/null 2>&1; sleep 0.3
+                UPLOAD=$(upload_size); UPLOAD=${UPLOAD:-0}
+                todo=$(discover 2>/dev/null) || todo=''
+                OUTSTANDING=$(printf '%s' "$todo" | grep -c . || true) UPLOAD="$UPLOAD" \
+                  NEXT1="$(printf '%s\n' "$todo" | sed -n 1p)" \
+                  NEXT2="$(printf '%s\n' "$todo" | sed -n 2p)" render; return 0; }
   trap 'printf "\033[?25h\033[J\n"; exit 0' INT TERM
   printf '\033[?25l\033[2J'        # hide cursor, clear once at entry only
-  local outstanding='' last=0 now frame
+  local outstanding='' upload=0 nxt1='' nxt2='' todo='' last=0 now
   while :; do
     now=$(date +%s)
     # the remote count changes once per episode, so poll it rarely; everything
     # else in the frame is local and cheap
-    if [ $(( now - last )) -ge "${DISCOVER_EVERY:-60}" ]; then
-      outstanding=$(discover 2>/dev/null | wc -l) || outstanding='?'
+    if [ $(( now - last )) -ge "${DISCOVER_EVERY:-20}" ]; then
+      todo=$(discover 2>/dev/null) || todo=''
+      outstanding=$(printf '%s' "$todo" | grep -c . || true)
+      nxt1=$(printf '%s\n' "$todo" | sed -n 1p)
+      nxt2=$(printf '%s\n' "$todo" | sed -n 2p)
+      upload=$(upload_size); upload=${upload:-0}
       last=$now
     fi
-    frame=$(OUTSTANDING="$outstanding" render)
-    # Redraw without blanking: home, then overwrite each line and clear only to
-    # its end. Clearing the screen first is what made it flicker.
-    { printf '\033[H'
-      while IFS= read -r l; do printf '%s\033[K\n' "$l"; done <<< "$frame"
-      printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
-    } 2>/dev/null
+    # render runs in THIS shell, not $(...): a subshell would discard the
+    # previous cpu/net sample and both would read as "-" on every frame.
+    printf '\033[H'
+    OUTSTANDING="$outstanding" UPLOAD="$upload" NEXT1="$nxt1" NEXT2="$nxt2" render
+    printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
     sleep "${INTERVAL:-1}"
   done
 }
 
-# --------------------------------------------------------------- dispatch ----
 case "${1:-}" in
   list|--list)     discover | nl; exit 0 ;;
   status|--status) cmd_status; exit 0 ;;
@@ -220,23 +237,13 @@ case "${1:-}" in
   stop|--stop)     touch "$STOP";  echo "stopping after the current episode"; exit 0 ;;
   run|--run)       MODE=run ;;
   once|--once)     MODE=once ;;
-  # internal phase entry points - the queue re-executes this script so that
-  # fetch and deliver can run as background processes alongside the GPU work
-  _fetch|_process|_deliver) : ;;
-  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 
-if [ "${1}" = _fetch ] || [ "${1}" = _process ] || [ "${1}" = _deliver ]; then
-
-  case "$1" in
-    _fetch)   do_fetch ;;
-    _process) do_process ;;
-    _deliver) do_deliver "${3:-}" ;;
-  esac
-  exit 0
-fi
-
 rm -f "$STOP"
+# mark each run: the log is appended across restarts, and the [N] counter
+# resets, so without this a resumed episode looks like a duplicate
+say "=== run start (pid $$) ==="
 deliver_pid=""; done_n=0
 while :; do
   [ -f "$STOP" ] && { say "stopped"; break; }
@@ -249,24 +256,46 @@ while :; do
     sleep "$IDLE"; continue
   fi
 
-  src="${TODO[0]}"
+  # Skip anything already processed and merely awaiting upload - it is still
+  # "outstanding" from the server's point of view, and re-selecting it would
+  # spin instead of starting the next episode, losing the transfer overlap.
+  src=""
+  for cand in "${TODO[@]}"; do
+    cb=$(basename "${cand%.*}")
+    [ -f "$WORK/$cb/$cb.mkv" ] && continue
+    fc=$(grep -cFx "$cand" "$FAILED" 2>/dev/null) || fc=0
+    [ "$fc" -ge "$MAX_FAILS" ] && continue
+    src="$cand"; break
+  done
+  if [ -z "$src" ]; then
+    [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; deliver_pid=""; }
+    [ "$MODE" = once ] && { say "nothing left to process"; break; }
+    sleep 20; continue
+  fi
   base=$(basename "${src%.*}")
   say "[$((done_n+1))] processing $base  (${#TODO[@]} outstanding)"
 
-  "$0" _fetch "$src"
+  "$WORKER" fetch "$src"
 
   # next episode downloads while this one is on the GPU
   prefetch_pid=""
   if [ "${#TODO[@]}" -gt 1 ]; then
-    ( "$0" _fetch "${TODO[1]}" >/dev/null 2>&1 ) & prefetch_pid=$!
+    ( "$WORKER" fetch "${TODO[1]}" >/dev/null 2>&1 ) & prefetch_pid=$!
   fi
 
-  "$0" _process "$src"
+  # A failing episode must not end the run.
+  if ! "$WORKER" process "$src"; then
+    fails=$(grep -cFx "$src" "$FAILED" 2>/dev/null) || fails=0
+    fails=$((fails + 1))
+    printf '%s\n' "$src" >> "$FAILED"
+    say "FAILED ($fails/$MAX_FAILS): $base"
+    continue
+  fi
 
   # the previous upload must finish before this one starts, so two transfers
   # never split a 2.2 MB/s link between them
   [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; }
-  ( "$0" _deliver "$src" ) & deliver_pid=$!
+  ( "$WORKER" deliver "$src" || say "DELIVERY FAILED: $base" ) & deliver_pid=$!
 
   [ -n "$prefetch_pid" ] && { wait "$prefetch_pid" 2>/dev/null || true; }
   done_n=$((done_n+1))

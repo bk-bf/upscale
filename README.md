@@ -41,9 +41,9 @@ queue: 96 outstanding   state: running
 ## Install
 
 ```bash
-install -Dm755 upscale ~/.local/bin/upscale
-install -Dm644 upscale.service ~/.config/systemd/user/upscale.service
-systemctl --user daemon-reload
+./install.sh
+
+
 systemctl --user enable --now upscale.service     # survives reboots
 loginctl enable-linger "$USER"                    # start without logging in
 ```
@@ -94,22 +94,37 @@ that sounded promising did nothing:
 | `waifu2x` upconv_7 | +10%, worse quality |
 | `waifu2x` cunet | −50% |
 | perceptual frame dedup | 45–53% fewer frames, but visibly judders |
-| **4 concurrent workers** | **+58%** |
-| **+ a smaller model** | **+118% on top** |
+| **concurrent workers** | **+58%**, then +17% again once the model got cheaper |
+| **a smaller model** | **+118%**, but only once the GPU was saturated |
+| **overlapping encode + delete** | GPU idle 62% → 33% |
 
-The two that worked compound, and the order matters. A single upscaler process leaves
-the GPU idle between frames — it sat at ~65% busy, and per-frame overhead dominated, so
-a model with 12× fewer parameters ran at *identical* speed. Four workers peg the GPU at
-99%; only *then* does a cheaper model pay off, because only then is model compute
-actually the constraint. Tested separately, both look worthless.
+The order matters more than the list. A single worker leaves the GPU at ~65% busy with
+per-frame overhead dominating, so a model with 12× fewer parameters ran at *identical*
+speed. Add workers and the GPU saturates; only *then* does a cheaper model pay off.
+Tested separately, both look worthless.
 
-Net: **9.97 → 34.4 fps**, about 3.45×.
+Then profiling showed the reverse problem. With the cheap model the card was idle 62% of
+the time — 26% of wall clock in phases where it did nothing at all (x264 encoding each
+chunk, and deleting 2000 upscaled PNGs), plus starvation inside the upscale phase itself.
+Handing finished frames to a background encoder by `mv` and deleting asynchronously took
+GPU idle from 62% to 33%.
+
+Worker counts, 1200 frames per run:
+
+| model | 4 workers | 8 | 12 |
+|---|---|---|---|
+| `2x_AnimeJaNai_V2_SuperUltraCompact` | 33.1 fps | **38.7** | 36.4 |
+| `realesr-animevideov3` | 16.0 fps | 16.2 | 16.2 |
+
+The heavy model is flat — genuinely GPU-bound, so extra workers just queue behind the
+card. The light one was starved, gains 17% at 8 workers, and loses ground at 12 as they
+contend. Net: **9.97 → 38.7 fps, about 3.9×**, or ~15 min for a 23-minute episode.
 
 Frame dedup deserves a note. Anime is animated on 2s/3s, so ~50% of frames are visually
-duplicate — reusing their upscales is a huge saving and is *nearly* free. It was rejected
-here because it judders on slow pans: the frames aren't bit-identical (compression noise
-differs), so the match has to be perceptual, and a perceptual match that's wrong freezes
-real motion. `tools/dedup/` keeps the implementation for anyone whose source tolerates it.
+duplicate and reusing their upscales is nearly free. It was rejected here because it
+judders on slow pans: the frames aren't bit-identical (compression noise differs), so the
+match has to be perceptual, and a perceptual match that's wrong freezes real motion.
+`tools/dedup/` keeps the implementation for anyone whose source tolerates it.
 
 ## Licence
 
