@@ -365,9 +365,15 @@ load_profile(){        # $1 = profile name; sets EPISODES/WORKERS/... from its f
   fi
   # shellcheck disable=SC1090
   . "$f"
+  # A profile is an explicit choice, so it must outrank the configuration the
+  # running queue recorded. Without this, load_config() overwrote REMOTE=local
+  # from the profile with the saved `ubuntu` and every lookup went back down an
+  # ssh hop that does not resolve from the server.
+  local _k
+  while IFS= read -r _k; do
+    [ -n "$_k" ] && _from_env[$_k]=1
+  done < <(sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p' "$f")
   EPISODES=${EPISODES:-any}
-  say(){ :; }   # no-op during load; real say is defined already
-  unset -f say
 }
 
 profiles_seed(){       # create the obvious ones on first use
@@ -855,9 +861,15 @@ case "${1:-}" in
   *) awk 'NR<2{next} /^#$/{if(++b>=2)exit; print ""; next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 1 ;;
 esac
 
-if [ "${DOCOLLECT:-0}" = 1 ]; then rm -f "$STOP"; save_config; cmd_collect; exit 0; fi
+# Clear BOTH stop flags, not just the queue's. `--stop` writes the worker's flag
+# too (or a running episode would never notice), so a queue restarted after a
+# stop had its very first episode abort instantly - and counted that as a
+# failure, three of which blacklist the episode.
+clear_stop(){ rm -f "$STOP" "$EPSTATE/stop"; }
 
-rm -f "$STOP"
+if [ "${DOCOLLECT:-0}" = 1 ]; then clear_stop; save_config; cmd_collect; exit 0; fi
+
+clear_stop
 # Record what this run is actually configured with, so `upscale --status` in
 # another shell (with none of these variables in its environment) reports on THIS
 # queue instead of inventing a configuration of its own.
