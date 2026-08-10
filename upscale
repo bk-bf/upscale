@@ -128,7 +128,16 @@ set -euo pipefail
 lib=$(printf '%q' "$LIB"); arc=$(printf '%q' "$ARCHIVE")
 emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in
   base=\$(basename "\${1%.*}")
-  [ -f "\$2/\$base.mkv" ] || printf '%s\n' "\$1"
+  # A .part means someone is delivering this episode RIGHT NOW. Two queues
+  # converging from opposite ends will meet, and without this the second one
+  # starts a fifteen-minute upscale of an episode already arriving. Only a FRESH
+  # partial counts: one left behind by a dead transfer must not hide an episode
+  # for ever, so anything untouched for 30 minutes is ignored.
+  if [ -f "\$2/\$base.mkv" ]; then return 0; fi
+  if find "\$2" -maxdepth 1 -name ".\$base.mkv.part*" -newermt '30 minutes ago' 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  printf '%s\n' "\$1"
 }
 # archived sources -> output goes back to the matching library folder
 if [ -d "\$arc" ]; then
@@ -1109,7 +1118,11 @@ case "${1:-}" in
   # here would silently never reach the running episode
   pause|--pause)   load_config; touch "$PAUSE" "$EPSTATE/pause"; echo "paused - will hold after the current chunk"; exit 0 ;;
   resume|--resume) load_config; rm -f "$PAUSE" "$EPSTATE/pause"; echo "resumed"; exit 0 ;;
-  stop|--stop)     load_config; touch "$STOP" "$EPSTATE/stop"; echo "stopping after the current episode"; exit 0 ;;
+  # ONLY the queue's flag. Writing the worker's stop flag too made --stop abort
+  # the episode in flight - it says "finish the current episode", and it was
+  # throwing away fifteen minutes of GPU work and recording a failure for it.
+  # --pause is the one that reaches into the running episode.
+  stop|--stop)     load_config; touch "$STOP"; echo "stopping after the current episode"; exit 0 ;;
   run|--run)       MODE=run ;;
   collect)         MODE=run;  DOCOLLECT=1 ;;
   collect-once)    MODE=once; DOCOLLECT=1 ;;
