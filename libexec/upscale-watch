@@ -58,14 +58,15 @@ if [ -n "$GPUHOST" ]; then
   # `up` alone is not a progress metric: it cycles 0 -> CHUNK -> 0 with every
   # chunk, so three samples could read the same value by coincidence and trip a
   # false stall. The cumulative frame count from the log only ever increases.
-  read -r c_up c_run c_out c_src c_done < <(rsh "
+  read -r c_up c_run c_out c_src c_done c_pushing < <(rsh "
       printf '%s %s %s %s %s\n' \
         \"\$(ls $RGPUWORK/src/up 2>/dev/null | wc -l)\" \
         \"\$(pgrep -f '[u]pscale-ep-rental' >/dev/null && echo 1 || echo 0)\" \
         \"\$(test -f $RWORK/out.mkv && echo 1 || echo 0)\" \
-        \"\$(stat -c%s $RWORK/src.avi 2>/dev/null || echo 0)\" \
-        \"\$(sed -nE 's#.* ([0-9]+)/[0-9]+ +free.*#\\1#p' $RWORK/current.log 2>/dev/null | tail -1)\"" ) || true
-  c_up=${c_up:-}; c_run=${c_run:-}; c_out=${c_out:-}; c_src=${c_src:-}; c_done=${c_done:-0}
+        \"\$(stat -c%s $RWORK/src.avi $RWORK/.src.avi.* 2>/dev/null | paste -sd+ | bc 2>/dev/null || echo 0)\" \
+        \"\$(sed -nE 's#.* ([0-9]+)/[0-9]+ +free.*#\\1#p' $RWORK/current.log 2>/dev/null | tail -1)\" \
+        \"\$(ls $RWORK/.src.avi.* >/dev/null 2>&1 && echo 1 || echo 0)\"" ) || true
+  c_up=${c_up:-}; c_run=${c_run:-}; c_out=${c_out:-}; c_src=${c_src:-}; c_done=${c_done:-0}; c_pushing=${c_pushing:-0}
   if [ -z "$c_up" ]; then
     col_state=unreachable
   else
@@ -77,8 +78,13 @@ if [ -n "$GPUHOST" ]; then
     c_part=0
     [ -n "$c_ep" ] && c_part=$(find "$LIB" -name ".$c_ep.mkv.part*" -type f -printf '%s\n' 2>/dev/null | sort -n | tail -1)
     col_metric="done=${c_done:-0} up=$c_up out=$c_out src=$c_src part=${c_part:-0}"
-    if   [ "$c_out" = 1 ]; then col_state=pulling
-    elif [ "$c_run" = 1 ]; then col_state=upscaling
+    # A push in progress is progress: rsync writes .src.avi.XXXXXX, so counting
+    # only the finished src.avi made a 175 MB upload look like a dead collector
+    # with an all-zero metric - three samples of that and --fix would have
+    # restarted it mid-push, every time, all night.
+    if   [ "$c_out" = 1 ];        then col_state=pulling
+    elif [ "$c_run" = 1 ];        then col_state=upscaling
+    elif [ "${c_pushing:-0}" = 1 ]; then col_state=pushing
     elif [ "${c_src:-0}" -gt 0 ]; then col_state=idle-with-source   # <- the stall shape
     else col_state=waiting
     fi
