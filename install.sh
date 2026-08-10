@@ -6,6 +6,7 @@ install -Dm755 upscale              "$PREFIX/bin/upscale"
 install -Dm755 libexec/upscale-worker "$PREFIX/libexec/upscale-worker"
 install -Dm755 libexec/upscale-worker-remote "$PREFIX/libexec/upscale-worker-remote"
 install -Dm644 upscale.service      "$HOME/.config/systemd/user/upscale.service"
+install -Dm644 upscale-collect.service "$HOME/.config/systemd/user/upscale-collect.service"
 systemctl --user daemon-reload 2>/dev/null || true
 echo "installed. enable at boot with:"
 echo "  loginctl enable-linger \"\$USER\""

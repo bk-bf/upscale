@@ -1,0 +1,21 @@
+[Unit]
+Description=Bleach upscale collector (drives a remote GPU that cannot reach back)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The profile carries REMOTE=local, ORDER and EPISODES. GPUHOST belongs in
+# %h/.upscale-queue/gpuhost.env because a rented box gets a new address every
+# time it is recreated - editing one line there beats editing this unit.
+Environment=PROFILE=rental
+EnvironmentFile=-%h/.upscale-queue/gpuhost.env
+ExecStart=%h/.local/bin/upscale collect
+# The remote box is ephemeral and its ssh endpoint moves; a collector that exits
+# because the box vanished should come back and keep trying.
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=default.target

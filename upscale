@@ -45,7 +45,7 @@ set -euo pipefail
 # did NOT set here - otherwise it guesses, and a guess of PARITY=any made the
 # status view describe the whole season instead of this machine's half.
 declare -A _from_env=()
-for _v in PARITY WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS; do
+for _v in PARITY EPISODES ORDER WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS; do
   if [ -n "${!_v+x}" ]; then _from_env[$_v]=1; fi
 done
 unset _v
@@ -81,7 +81,7 @@ say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$QLOG" >&2; }
 save_config(){
   : "${PROFILE:=}"
   local v tmp="$CONFIG.$$"
-  { for v in PARITY WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS IDLE LIMIT; do
+  { for v in PARITY EPISODES ORDER PROFILE WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS IDLE LIMIT; do
       printf '%s=%q\n' "$v" "${!v}"
     done
     printf 'QUEUE_PID=%q\n' "$$"
@@ -97,7 +97,7 @@ load_config(){   # adopt the running queue's config; an explicit env var wins
     while IFS= read -r line; do
       k=${line%%=*}
       case "$k" in
-        PARITY|WORKERS|CHUNK|LIB|ARCHIVE|REMOTE|WORK|DEFER|EPSTATE|MAX_FAILS|QUEUE_PID) ;;
+        PARITY|EPISODES|ORDER|PROFILE|WORKERS|CHUNK|LIB|ARCHIVE|REMOTE|WORK|DEFER|EPSTATE|MAX_FAILS|QUEUE_PID) ;;
         *) continue ;;
       esac
       if [ -n "${_from_env[$k]:-}" ]; then continue; fi
@@ -305,6 +305,19 @@ xfer_eta(){   # $1=dl|up  $2=key  $3=bytes now  $4=total  -> sets $XFER
 # --list and by --status. When these were separate copies they drifted, and the
 # status view started counting - and offering - episodes this machine will never
 # touch.
+# Sort key for ORDER, NOT for EPISODES matching. epnum() is per-season on
+# purpose - "even" means even episode number within its season - but ordering
+# across a multi-season library needs the season too, or S04E28 sorts above
+# S05E01 and "start from the back" starts in the middle.
+epkey(){               # $1 = basename -> season*1000 + episode, 0 when unnumbered
+  local se s e
+  se=$(printf '%s' "$1" | grep -oiE 'S[0-9]+E[0-9]+' | head -1) || se=''
+  if [ -z "$se" ]; then printf '0'; return 0; fi
+  s=$(printf '%s' "$se" | sed -E 's/^[Ss]0*([0-9]+)[Ee].*/\1/')
+  e=$(printf '%s' "$se" | sed -E 's/.*[Ee]0*([0-9]+)$/\1/')
+  printf '%s' "$(( 10#${s:-0} * 1000 + 10#${e:-0} ))"
+}
+
 epnum(){               # $1 = basename -> episode number, 0 when there is none
   local n
   n=$(printf '%s' "$1" | grep -oE 'S[0-9]+E[0-9]+' | head -1 | grep -oE 'E[0-9]+' | tr -d 'E') || n=''
@@ -359,13 +372,33 @@ load_profile(){        # $1 = profile name; sets EPISODES/WORKERS/... from its f
 
 profiles_seed(){       # create the obvious ones on first use
   mkdir -p "$PROFILE_DIR"
-  [ -f "$PROFILE_DIR/all.conf" ]  || printf '# every episode\nEPISODES=any\n' > "$PROFILE_DIR/all.conf"
-  [ -f "$PROFILE_DIR/even.conf" ] || printf '# even half - pairs with a machine running "odd"\nEPISODES=even\n' > "$PROFILE_DIR/even.conf"
-  [ -f "$PROFILE_DIR/odd.conf" ]  || printf '# odd half\nEPISODES=odd\n' > "$PROFILE_DIR/odd.conf"
+  [ -f "$PROFILE_DIR/all.conf" ]  || printf '%s\n' \
+    '# Every episode, lowest number first. Pair this with a machine running' \
+    '# "backwards" and the two converge on the middle, with the next episode to' \
+    '# watch always coming from this one.' \
+    'EPISODES=any' 'ORDER=forward' > "$PROFILE_DIR/all.conf"
+  [ -f "$PROFILE_DIR/backwards.conf" ] || printf '%s\n' \
+    '# Every episode, HIGHEST first - the other end of a two-machine split.' \
+    '# Preferred over even/odd: if this machine stalls, the sequence the viewer' \
+    '# is actually watching keeps advancing, instead of gaining a permanent hole.' \
+    'EPISODES=any' 'ORDER=reverse' > "$PROFILE_DIR/backwards.conf"
+  [ -f "$PROFILE_DIR/even.conf" ] || printf '%s\n' \
+    '# Even half. Splits throughput evenly but NOT sequentially: a stall here' \
+    '# leaves gaps the other machine will never fill. Prefer all/backwards.' \
+    'EPISODES=even' > "$PROFILE_DIR/even.conf"
+  [ -f "$PROFILE_DIR/odd.conf" ]  || printf '%s\n' \
+    '# Odd half - see the caveat in even.conf.' 'EPISODES=odd' > "$PROFILE_DIR/odd.conf"
 }
 
+# ORDER=forward starts at the lowest-numbered outstanding episode; ORDER=reverse
+# starts at the highest. Two machines pointed at the SAME set (EPISODES=any) but
+# opposite orders converge on the middle from both ends, which keeps the next
+# episode to watch always coming from the forward one - unlike an even/odd split,
+# where a stalled machine leaves a permanent hole in the sequence.
+ORDER=${ORDER:-forward}
+
 select_todo(){         # stdin: discovered sources -> this machine's half, in the
-  local c cb n late=()  # order the run loop takes them (deferred episodes last)
+  local c cb n late=() early=()  # order the run loop takes them (deferred last)
   while IFS= read -r c; do
     if [ -z "$c" ]; then continue; fi
     cb=$(basename "${c%.*}")
@@ -379,9 +412,29 @@ select_todo(){         # stdin: discovered sources -> this machine's half, in th
     # line as a pattern to look for IN the basename, which is the direction that
     # lets a short prefix match a long episode title.
     if [ -s "$DEFER" ] && printf '%s' "$cb" | grep -qFf "$DEFER" 2>/dev/null
-      then late+=("$c"); else printf '%s\n' "$c"; fi
+      then late+=("$c"); else early+=("$c"); fi
   done
-  if [ "${#late[@]}" -gt 0 ]; then printf '%s\n' "${late[@]}"; fi
+  # Reverse means HIGHEST EPISODE NUMBER first, not "the list backwards". The
+  # discovered order is archive-then-library, and episode 1 is deliberately the
+  # one left in the library - so simply reversing the list handed the reverse
+  # queue episode 1, the single episode it must never take.
+  #
+  # Deferred episodes stay last in both directions: they are already watched or
+  # being redone, and must never displace the episode a queue is racing towards.
+  emit_ordered(){       # $@ = paths, ordered by episode number descending
+    local x
+    for x in "$@"; do
+      [ -n "$x" ] || continue
+      printf '%s\t%s\n' "$(epkey "$(basename "${x%.*}")" || echo 0)" "$x"
+    done | sort -k1,1rn -s | cut -f2-
+  }
+  if [ "$ORDER" = reverse ]; then
+    if [ "${#early[@]}" -gt 0 ]; then emit_ordered "${early[@]}"; fi
+    if [ "${#late[@]}" -gt 0 ];  then emit_ordered "${late[@]}"; fi
+  else
+    if [ "${#early[@]}" -gt 0 ]; then printf '%s\n' "${early[@]}"; fi
+    if [ "${#late[@]}" -gt 0 ];  then printf '%s\n' "${late[@]}"; fi
+  fi
 }
 
 runnable(){            # stdin: candidates -> the ones the run loop would start
@@ -757,9 +810,13 @@ cmd_collect(){
 
 
 profiles_seed
-# --profile <name> may precede any command
+# --profile <name> may precede any command. PROFILE in the environment does the
+# same thing, so a systemd unit can select one with a single Environment= line
+# instead of a shell wrapper; the flag wins when both are given.
 if [ "${1:-}" = --profile ] || [ "${1:-}" = -p ]; then
   PROFILE="${2:?--profile needs a name}"; load_profile "$PROFILE"; shift 2
+elif [ -n "${PROFILE:-}" ]; then
+  load_profile "$PROFILE"
 fi
 
 case "${1:-}" in
