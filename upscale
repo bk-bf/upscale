@@ -824,8 +824,12 @@ case "${1:-}" in
     printf 'profiles in %s:\n' "$PROFILE_DIR"
     for f in "$PROFILE_DIR"/*.conf; do
       [ -e "$f" ] || continue
-      printf '  %-12s EPISODES=%s\n' "$(basename "${f%.conf}")" \
-        "$(grep -m1 '^EPISODES=' "$f" 2>/dev/null | cut -d= -f2-)"
+      # ORDER belongs here too: `all` and `backwards` are both EPISODES=any and
+      # were indistinguishable in the one listing you check to confirm that two
+      # machines have not been pointed at the same work.
+      printf '  %-12s EPISODES=%-6s ORDER=%s\n' "$(basename "${f%.conf}")" \
+        "$(grep -m1 '^EPISODES=' "$f" 2>/dev/null | cut -d= -f2-)" \
+        "$(grep -m1 '^ORDER=' "$f" 2>/dev/null | cut -d= -f2- || true)"
     done
     exit 0 ;;
   # --list, like --status, describes the queue that is running: same config,
