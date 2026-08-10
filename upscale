@@ -920,8 +920,8 @@ cmd_collect(){
       # whether the job is running is answered by rworking below, not by the
       # exit status of the command that asked for it.
       timeout 30 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST \
-        "rm -f $RWORK/out.mkv; cd $RWORK && setsid nohup bash $RSCRIPT $RWORK/src.avi $RWORK/out.mkv \
-         > $RWORK/current.log 2>&1 < /dev/null & echo ok" >/dev/null 2>&1 || true
+        "flock -n $RWORK/.launch.lock -c 'rm -f $RWORK/out.mkv; cd $RWORK && setsid nohup bash $RSCRIPT $RWORK/src.avi $RWORK/out.mkv \
+         > $RWORK/current.log 2>&1 < /dev/null & echo ok'" >/dev/null 2>&1 || true
       sleep 10
       if rworking; then
         say "started remotely"

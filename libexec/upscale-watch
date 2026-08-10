@@ -20,7 +20,11 @@ set -uo pipefail
 
 STATE=${STATE:-$HOME/.upscale-queue}
 LIB=${LIB:-/mnt/media/tv/Bleach}
-DESKTOP=${DESKTOP:-desktop}            # ssh alias; empty to skip the local half
+# ${DESKTOP-desktop}, not ${DESKTOP:-desktop}: the colon form treats an EMPTY
+# value as unset, so "DESKTOP=" - the documented way to say "that machine is off
+# tonight" - silently kept checking it and reported UNREACHABLE every five
+# minutes, which is exactly the noise it was meant to remove.
+DESKTOP=${DESKTOP-desktop}             # ssh alias; set empty to skip the local half
 HEALTH="$STATE/health"
 HLOG="$STATE/health.log"
 PREV="$STATE/.watch-prev"
@@ -67,6 +71,7 @@ if [ -n "$GPUHOST" ]; then
         \"\$(sed -nE 's#.* ([0-9]+)/[0-9]+ +free.*#\\1#p' $RWORK/current.log 2>/dev/null | tail -1)\" \
         \"\$(ls $RWORK/.src.avi.* >/dev/null 2>&1 && echo 1 || echo 0)\"" ) || true
   c_up=${c_up:-}; c_run=${c_run:-}; c_out=${c_out:-}; c_src=${c_src:-}; c_done=${c_done:-0}; c_pushing=${c_pushing:-0}
+  guard_age=$(rsh "cat $RWORK/guard.heartbeat 2>/dev/null") || guard_age=''
   if [ -z "$c_up" ]; then
     col_state=unreachable
   else
@@ -161,13 +166,38 @@ case "$loc_state" in
   *) [ "$loc_same" -ge "$STALL_AFTER" ] && loc_verdict=STALLED ;;
 esac
 
-{ printf 'p_col_metric=%q\np_col_same=%s\np_loc_metric=%q\np_loc_same=%s\np_when=%s\n' \
+# The box runs its own guard from cron, and its heartbeat is a second, INDEPENDENT
+# witness. It separates "the box is fine and simply between episodes" from "the
+# box, or its cron, is gone" - which from the server look identical, because both
+# are just a quiet ssh connection. Nothing here can fix that case: a box that is
+# not running its own recovery needs a human.
+if [ "$col_state" != unreachable ] && [ "$col_state" != not-configured ]; then
+  if [ -z "${guard_age:-}" ]; then
+    col_verdict=GUARD-MISSING
+  else
+    ga=$(( now - guard_age ))
+    if [ "$ga" -gt 420 ]; then col_verdict=GUARD-DEAD; fi   # cron runs it every 2 min
+  fi
+fi
+
+# A durable record of every state change, so what happened overnight can be read
+# back in the morning. health.log is one line per sample and rolls over; this is
+# only the transitions, and it is never truncated.
+if [ "$col_verdict$loc_verdict" != "${p_verdicts:-}" ]; then
+  printf '%s  collector=%s (%s)  local=%s (%s)  delivered=%s\n' \
+    "$ts" "$col_verdict" "$col_state" "$loc_verdict" "$loc_state" "$delivered" >> "$STATE/alerts.log"
+fi
+
+{ printf 'p_verdicts=%q\n' "$col_verdict$loc_verdict"
+  printf 'p_col_metric=%q\np_col_same=%s\np_loc_metric=%q\np_loc_same=%s\np_when=%s\n' \
     "$col_metric" "$col_same" "$loc_metric" "$loc_same" "$now"; } > "$PREV"
 
 { printf 'checked   %s\n' "$ts"
   printf 'collector %-12s %-11s %s\n' "$col_verdict" "$col_state" "$col_metric"
   printf 'local     %-12s %-11s %s\n' "$loc_verdict" "$loc_state" "$loc_metric"
   printf 'delivered %s episodes\n' "$delivered"
+  [ -n "${guard_age:-}" ] && printf 'box guard  last beat %ss ago\n' "$(( now - guard_age ))"
+  [ -z "${guard_age:-}" ] && [ -n "$GPUHOST" ] && printf 'box guard  NO HEARTBEAT\n'
 } > "$HEALTH"
 cat "$HEALTH"
 
@@ -188,6 +218,6 @@ if [ "$do_fix" = 1 ] && [ "$col_verdict" = STALLED ]; then
 fi
 
 case "$col_verdict$loc_verdict" in
-  *STALLED*|*UNREACHABLE*) exit 1 ;;
+  *STALLED*|*UNREACHABLE*|*GUARD*) exit 1 ;;
 esac
 exit 0

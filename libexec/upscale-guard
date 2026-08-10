@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# upscale-guard — runs ON the GPU box, from cron, every two minutes.
+#
+# The collector drives this box from the server, and every instruction has to
+# cross a link that can drop. When it does, the box is left holding a source it
+# will never be told to start: it sits idle all night with the work sitting
+# right there. This is the local half of that recovery, so getting going again
+# does not depend on anything off-box noticing.
+#
+# It does exactly three things:
+#   1. relaunch a job that should be running and is not
+#   2. keep the disk from filling with work directories nothing will finish
+#   3. leave a heartbeat, so the server can tell "box is fine" from "box is gone"
+#
+# What it will NOT do is touch a running job. A guard that restarts work in
+# progress because it misread the state is worse than no guard at all.
+set -uo pipefail
+
+RWORK=${RWORK:-/root/drive}
+GWORK=${GWORK:-/root/work}
+RSCRIPT=${RSCRIPT:-/root/bench/upscale-ep-rental.sh}
+LOG="$RWORK/guard.log"
+BEAT="$RWORK/guard.heartbeat"
+MISS="$RWORK/.guard-misses"
+LOCK="$RWORK/.launch.lock"
+MIN_FREE_GB=${MIN_FREE_GB:-4}
+mkdir -p "$RWORK"
+
+say(){ printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+# keep the log from growing without bound - nothing here is worth a full disk
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
+  tail -400 "$LOG" > "$LOG.tmp" && mv -f "$LOG.tmp" "$LOG"
+fi
+
+date +%s > "$BEAT"
+
+# Derived from $RSCRIPT, not hard-coded: pointing the guard at a different worker
+# left it watching for a process name that would never appear - or, worse,
+# watching for one that was always there.
+#
+# The bracket stops pgrep matching the shell that is asking. Without it this
+# always answers "running" and the guard never does anything at all - the same
+# trap that made the collector adopt a job which had finished twelve minutes
+# earlier.
+_wpat(){ local b; b=$(basename "$RSCRIPT"); printf '[%s]%s' "${b:0:1}" "${b:1}"; }
+worker_running(){ pgrep -f "$(_wpat)" >/dev/null 2>&1; }
+
+# --- 1. relaunch a job that should be running --------------------------------
+if [ -f "$RWORK/src.avi" ] && [ ! -f "$RWORK/out.mkv" ] && ! worker_running; then
+  n=$(cat "$MISS" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$MISS"
+  # Two consecutive misses, so the collector - which launches within seconds of
+  # finishing its push - is never raced. One miss is normal between episodes.
+  if [ "$n" -ge 2 ]; then
+    # ...and both sides take the same lock, so a launch can never be doubled.
+    if flock -n 9 9>"$LOCK"; then
+      if ! worker_running; then
+        say "no worker but a source is waiting (miss $n) - relaunching"
+        cd "$RWORK" && setsid nohup bash "$RSCRIPT" "$RWORK/src.avi" "$RWORK/out.mkv" \
+          > "$RWORK/current.log" 2>&1 < /dev/null &
+        sleep 8
+        if worker_running; then say "relaunched"; printf '0' > "$MISS"
+        else say "RELAUNCH FAILED - see current.log: $(tail -1 "$RWORK/current.log" 2>/dev/null)"; fi
+      fi
+      flock -u 9 2>/dev/null
+    else
+      say "launch lock held by the collector - leaving it alone"
+    fi
+  fi
+else
+  printf '0' > "$MISS"
+fi
+
+# --- 2. keep the disk usable --------------------------------------------------
+# An episode needs ~12 GB of PNGs. A work directory left by an abandoned episode
+# is dead weight, and a full disk fails every future episode silently.
+free_gb=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
+if [ "${free_gb:-99}" -lt "$MIN_FREE_GB" ]; then
+  cur=''
+  [ -f "$RWORK/src.avi" ] && cur=$(basename "${RWORK}/src.avi"); cur=${cur%.*}
+  for d in "$GWORK"/*/; do
+    [ -d "$d" ] || continue
+    b=$(basename "$d")
+    # never the directory the current source is using
+    if [ "$b" = "${cur:-__none__}" ]; then continue; fi
+    if worker_running && [ "$b" = src ]; then continue; fi
+    say "low disk (${free_gb}G) - removing stale work dir $b"
+    rm -rf "$d"
+  done
+fi
+
+# --- 3. report ----------------------------------------------------------------
+# One line the server can read to distinguish "working", "idle with work
+# waiting" (which is a stall) and "nothing to do".
+{ printf 'when=%s\n' "$(date +%s)"
+  printf 'worker=%s\n' "$(worker_running && echo 1 || echo 0)"
+  printf 'src=%s\n'    "$(stat -c%s "$RWORK/src.avi" 2>/dev/null || echo 0)"
+  printf 'out=%s\n'    "$(stat -c%s "$RWORK/out.mkv" 2>/dev/null || echo 0)"
+  printf 'freegb=%s\n' "${free_gb:-0}"
+  printf 'misses=%s\n' "$(cat "$MISS" 2>/dev/null || echo 0)"
+} > "$RWORK/guard.state"
