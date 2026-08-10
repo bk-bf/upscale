@@ -103,6 +103,33 @@ do_fetch(){
   mv "$LOCAL.part" "$LOCAL"          # rename only on success: a partial file
 }                                    # must never look like a complete fetch
 
+
+# Two independent decoders must agree before a single frame is upscaled.
+#
+# ffmpeg 8.1.2 silently mis-decodes MPEG-4 ASP: byte-identical input, visibly
+# corrupt output, correct frame COUNT - so every count-based check passed and two
+# episodes shipped damaged. Content checks are the only thing that catches this,
+# and it matters more on rented machines whose ffmpeg version is unknown.
+#
+# Cost is ~5 seconds per episode: five sampled frames, decoded twice, compared.
+verify_decoder(){
+  local ref="${FFDEC_REF:-ffmpeg}" bad=0 n=0 t d
+  [ "$(command -v "$FFDEC")" = "$(command -v "$ref")" ] && { say "only one decoder available - cross-check skipped"; return 0; }
+  for t in 10 40 70 300 900; do
+    "$FFDEC" -v error -ss "$t" -i "$LOCAL" -frames:v 1 "$W/.d1.png" -y 2>/dev/null || continue
+    "$ref"   -v error -ss "$t" -i "$LOCAL" -frames:v 1 "$W/.d2.png" -y 2>/dev/null || continue
+    n=$((n+1))
+    d=$("$FFDEC" -v error -i "$W/.d1.png" -i "$W/.d2.png" \
+        -lavfi "blend=all_mode=difference,format=gray,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" \
+        -f null - 2>/dev/null | grep -o '=[0-9.]*$' | tr -d '=' | head -1)
+    awk -v x="${d:-0}" 'BEGIN{exit !(x>0.5)}' && { bad=$((bad+1)); say "decoder mismatch at ${t}s (mean diff ${d})"; }
+  done
+  rm -f "$W/.d1.png" "$W/.d2.png"
+  [ "$n" -gt 0 ] || { say "decoder cross-check inconclusive"; return 0; }
+  [ "$bad" -eq 0 ] || die "DECODER DISAGREEMENT on $bad/$n frames - refusing to upscale corrupt input. Check ffmpeg versions ($FFDEC vs $ref)."
+  say "decoder cross-check passed ($n frames)"
+}
+
 do_process(){
   [ -f "$LOCAL" ] || die "no local source; run fetch first"
   [ -x "$BIN" ] || die "upscaler missing: $BIN"
@@ -114,6 +141,7 @@ do_process(){
   FPS=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$LOCAL")
   TOTAL=$(vframes "$LOCAL")
   say "$BASE: $TOTAL frames @ $FPS, $MODEL x$SCALE, $WORKERS workers"
+  verify_decoder
 
   cat > "$JOB" <<EOF
 SRC="$SRC_REMOTE"

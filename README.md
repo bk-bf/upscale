@@ -17,11 +17,14 @@ from its already-encoded chunks.
 ```
 upscale run          process everything outstanding, then idle for more
 upscale once         process outstanding work, then exit
+upscale collect      drive a remote GPU that cannot reach back into this network
 upscale --status     live progress, phase, upload, host utilisation
 upscale --pause      hold after the current chunk
 upscale --resume     release a pause
 upscale --stop       finish the current episode, then exit
 upscale --list       show what is outstanding
+upscale --profile N  run under a named profile
+upscale --profiles   list available profiles
 ```
 
 ```
@@ -64,6 +67,62 @@ Everything is an environment variable:
 | `CRF` / `PRESET` | `18` / `veryfast` | x264 encode settings |
 | `WORK` | `/mnt/scratch/upscale` | scratch dir (needs ~12 GB free) |
 | `LIMIT` | `0` | stop after N episodes (`0` = unlimited) |
+| `EPISODES` | `any` | which episodes this machine owns (see below) |
+
+## Splitting the season across machines
+
+`EPISODES` decides which episodes a queue will take, from the `SxxEyy` number in the
+filename. Two machines pointed at the same library will never collide as long as their
+sets do not overlap:
+
+```
+EPISODES=even    even | odd            one half each
+EPISODES=9-12    3,7,9-12              numbers, ranges, and lists of both
+EPISODES=20-     -9                    open-ended in either direction
+EPISODES=odd,1-10                      terms compose: odd AND within 1–10
+```
+
+A **profile** is that plus any other settings, saved under a name in
+`$STATE/profiles/<name>.conf`, so switching a machine between halves is one flag
+instead of remembering which variables to export:
+
+```bash
+upscale --profiles                 # list them
+upscale --profile even run         # this box takes the even half
+upscale --profile catchup --status # ...and status describes that half, not the season
+```
+
+```
+# ~/.upscale-queue/profiles/even.conf
+EPISODES=even
+WORKERS=8
+```
+
+`all`, `even` and `odd` are created on first run. `--profile` may precede any command,
+including `--status` and `--list`, so every view agrees about which episodes are "yours".
+
+## Driving a GPU that cannot reach back
+
+A rented GPU box usually has no route into a home network — CGNAT, no inbound ports,
+not on the tailnet — so it can neither fetch its own work nor deliver results. Instead
+of granting it access, the **server** runs the same tool in `collect` mode and initiates
+every step: push source, poll, pull result, verify, publish.
+
+```bash
+GPUHOST='-p 48726 root@1.2.3.4' upscale --profile odd collect
+```
+
+| var | default | meaning |
+|---|---|---|
+| `GPUHOST` | — | ssh destination of the worker (required) |
+| `RWORK` | `/root/upscale-work` | working directory on that box |
+| `RSCRIPT` | `/root/bench/upscale-ep-rental.sh` | per-episode script to invoke there |
+| `POLL` | `60` | seconds between progress polls |
+
+It uses the same `discover | select_todo` selection as `run`, so a collector and a local
+queue can share one library. The remote job is started detached, so a dropped ssh session
+cannot kill a 15-minute episode, and the result is frame-counted and checked for an audio
+stream before it is published.
 
 ## How it works
 

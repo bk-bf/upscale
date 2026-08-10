@@ -69,16 +69,19 @@ keyframe's PTS lands on the *previous* one. Cutting at `83.416666` when the keyf
 at `83.417000` silently took 42 extra frames.
 → Cut by verified frame count, not computed timestamp, and assert the total afterwards.
 
-## `set -e` and exit status — four separate outages
+## `set -e` and exit status — five separate outages
 
 `var=$(cmd)` **adopts cmd's exit status**. Under `set -euo pipefail` that kills the
-script, with no message. This caused four different failures before the pattern was
+script, with no message. This caused five different failures before the pattern was
 recognised:
 
 - the profiler died the moment nothing matched a `pgrep`
 - the per-episode failure counter corrupted, marking a good episode failed 3×
 - `--status` printed nothing at all
 - the parity filter exited the queue instantly
+- `GPUBUSY=$(ls /sys/class/drm/card*/...)` killed the entire script, before it
+  printed a single character, on any machine with no GPU. Which is exactly the
+  machine `collect` mode is meant to run on: the server.
 
 Related: **`grep -c` and `pgrep -c` print `0` *and* exit non-zero.** So
 `n=$(grep -c x f || echo 0)` yields the string `"0\n0"`, which then blows up any
@@ -161,6 +164,49 @@ Every one of these made the pipeline *look* broken or fine when it wasn't:
   of 9.6. Tuning workers on `nproc` caused hard CFS throttling — 2654 of 7294 periods
   throttled — and made 8 workers **three times slower** than 4 on that box. Read
   `cpu.cfs_quota_us`, not `nproc`.
+
+## Advertised but not implemented
+
+`collect` mode reached the header comment and the argument dispatch — `collect)
+MODE=run; DOCOLLECT=1 ;;` — while its body never made it into the file. Nothing read
+`DOCOLLECT`, so `upscale collect` silently ran the **local** pipeline instead of
+driving the remote GPU, on a machine that has no GPU at all.
+
+The cause was a patch script whose insertion was guarded (`if 'cmd_collect' not in t`)
+while its documentation and dispatch edits were unconditional. When the anchor for the
+body failed to match, two of the three edits still landed and the script reported
+success.
+
+Lessons that generalise:
+
+- **A guarded edit and an unguarded edit in the same patch can disagree.** Either all
+  the edits assert, or none of them do.
+- **Grep for the callee, not the flag.** `grep -c DOCOLLECT` was `2` and looked fine;
+  `grep -c cmd_collect` was `0`.
+- **Exercise every advertised command once on every machine it claims to support.**
+  Both of this section's bugs — and the `set -e` GPU one above — would have been caught
+  by running `upscale collect-once` on the server a single time.
+
+A related shape: the usage text was printed with `sed -n '2,12p'`, a fixed line range.
+Adding three lines to the header pushed `--profile` and `--profiles` off the end, so two
+working commands became invisible. Slicing documentation by line number rots silently;
+match its shape instead.
+
+## Prefetching the wrong episode
+
+The queue prefetched `TODO[1]` — "the second thing outstanding" — on the assumption that
+it was processing `TODO[0]`. But the selection loop skips candidates that are already
+processed and merely awaiting upload, so `TODO[1]` was frequently *the very episode being
+processed*: the prefetch re-downloaded a file that was already local, and the genuinely
+next episode was never fetched ahead of time.
+
+Cost: the GPU sat idle for a full source download (~90 s at 2.2 MB/s, longer when a
+400 MB upload was competing for the link) at the start of nearly every episode. The
+prefetch's stderr was also being discarded, so its failures were invisible — for the one
+background job whose silent failure directly wastes GPU time.
+
+Fix: prefetch the next candidate *after the one actually chosen*, from the same
+`runnable` list the run loop takes from, and log its output.
 
 ## Measurement mistakes
 
