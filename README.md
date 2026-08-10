@@ -98,8 +98,28 @@ EPISODES=even
 WORKERS=8
 ```
 
-`all`, `even` and `odd` are created on first run. `--profile` may precede any command,
-including `--status` and `--list`, so every view agrees about which episodes are "yours".
+`all`, `backwards`, `even` and `odd` are created on first run. `--profile` may precede
+any command, including `--status` and `--list`, so every view agrees about which episodes
+are "yours". A service can select one with `Environment=PROFILE=all`.
+
+**Prefer converging queues to an even/odd split.** `ORDER=forward|reverse` decides which
+end a queue starts from, so two machines can both take `EPISODES=any` and meet in the
+middle:
+
+```bash
+upscale --profile all       run      # machine A: lowest outstanding first
+upscale --profile backwards run      # machine B: highest first
+```
+
+Even/odd looks like the obvious split and is worse for anyone watching as the episodes
+arrive: each machine owns half the sequence, so the viewer advances only as fast as the
+*slower* machine, and if one stalls its half becomes a permanent hole. Converging queues
+degrade gracefully — the forward machine always produces the next episode to watch, and
+a stall on the other side only slows the meeting point.
+
+They will eventually collide on one episode where they meet; both would upscale it, and
+the second to finish overwrites the first with an identical file. Watch the outstanding
+count and stop one side as it approaches zero.
 
 ## Driving a GPU that cannot reach back
 
