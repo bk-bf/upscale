@@ -827,12 +827,32 @@ collect_probe(){
 
 # Ask whoever holds the work. Local when RWORK is on this machine (running this
 # on the box itself), over ssh when we are the collector driving it.
+#
+# STATUS_MUX is a shared ssh connection used ONLY by the status loop. A fresh
+# connection to a rented box measured 4.3 s, which is what set the refresh
+# interval - not the data, which takes 6 ms to read. Multiplexed, each probe is
+# a round trip on an already-open channel. The rest of the collector keeps
+# ControlPath=none deliberately: a long-running episode must not depend on a
+# socket a status viewer opened and closed.
+STATUS_MUX=''
+collect_reads_locally(){ [ -z "${GPUHOST:-}" ] || [ -d "$RWORK" ]; }
+
+status_mux_open(){
+  collect_reads_locally && return 0
+  STATUS_MUX="$STATE/.statusmux.$$"
+  ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=yes \
+      -o ControlPath="$STATUS_MUX" -o ControlPersist=60 -N -f $GPUHOST 2>/dev/null || STATUS_MUX=''
+}
+status_mux_close(){ [ -n "$STATUS_MUX" ] && { ssh -O exit -o ControlPath="$STATUS_MUX" $GPUHOST 2>/dev/null; rm -f "$STATUS_MUX"; }; return 0; }
+
 collect_read(){
-  if [ -n "${GPUHOST:-}" ] && [ ! -d "$RWORK" ]; then
-    { declare -f collect_probe; printf 'collect_probe %q %q\n' "$RWORK" "${RGPUWORK:-/root/work}"; } |
-      timeout "${SSHTMO:-90}" ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST "bash -s" 2>/dev/null
-  else
+  if collect_reads_locally; then
     collect_probe "$RWORK" "${RGPUWORK:-/root/work}"
+  else
+    { declare -f collect_probe; printf 'collect_probe %q %q\n' "$RWORK" "${RGPUWORK:-/root/work}"; } |
+      timeout "${SSHTMO:-90}" ssh -o BatchMode=yes -o ConnectTimeout=20 \
+        ${STATUS_MUX:+-o ControlPath="$STATUS_MUX"} ${STATUS_MUX:--o ControlPath=none} \
+        $GPUHOST "bash -s" 2>/dev/null
   fi
 }
 
@@ -843,7 +863,18 @@ cmd_collect_status(){
   local pct el eta cur nchunk started nxt part psz repstart
   local tty=0; [ -t 1 ] && tty=1
   [ "$tty" = 1 ] && printf '\033[?12l\033[?25l\033[2J'
-  trap 'printf "\033[?25h\033[J\n"; exit 0' INT TERM
+  # Only a live loop amortises the ~4 s of opening a shared connection; a
+  # one-shot (piped) frame would pay it for a single read.
+  [ "$tty" = 1 ] && status_mux_open
+  trap 'status_mux_close; printf "\033[?25h\033[J\n"; exit 0' INT TERM
+  # A local read costs 6 ms, so refresh like the local view does; a multiplexed
+  # remote read costs a round trip, so refresh often but not every second. The
+  # old flat 10 s applied a remote-connection cost to the local case, where
+  # there is no connection at all.
+  local every=${STATUS_EVERY:-}
+  if [ -z "$every" ]; then
+    if collect_reads_locally; then every=1; else every=3; fi
+  fi
   while :; do
     phase=''; total=''; done_=''; chunk=''; fps=''; gpu=''; free=''; tail_=''
     srcb=''; outb=''; repep=''; repstart=''
@@ -857,8 +888,15 @@ cmd_collect_status(){
     done < <(collect_read)
 
     ep=$(sed -nE 's/^.*=== (.*) ===$/\1/p' "$QLOG" 2>/dev/null | tail -1) || ep=''
-    n=$(discover 2>/dev/null | select_todo 2>/dev/null | wc -l) || n=0
-    nxt=$(discover 2>/dev/null | select_todo 2>/dev/null | sed -n 2p) || nxt=''
+    # discover walks the whole library; at a 1 s refresh that is the slowest
+    # thing in the frame by three orders of magnitude, and the answer changes
+    # once an episode - so it is sampled on its own slow schedule.
+    if [ "$(( ${_dsc_at:-0} + 60 ))" -lt "$(date +%s)" ]; then
+      _dsc_at=$(date +%s)
+      _dsc_n=$(discover 2>/dev/null | select_todo 2>/dev/null | wc -l) || _dsc_n=0
+      _dsc_nxt=$(discover 2>/dev/null | select_todo 2>/dev/null | sed -n 2p) || _dsc_nxt=''
+    fi
+    n=${_dsc_n:-0}; nxt=${_dsc_nxt:-}
 
     [ "$tty" = 1 ] && printf '\033[H'
     line_title "${ep:-${repep:-(no episode)}}"
@@ -922,7 +960,7 @@ cmd_collect_status(){
     [ -n "$tail_" ] && line_kv log "$tail_"
     if [ "$tty" = 1 ]; then
       printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
-      sleep "${STATUS_EVERY:-10}"
+      sleep "$every"
     else
       break
     fi

@@ -69,8 +69,13 @@ if [ -n "$GPUHOST" ]; then
   if [ -z "$c_up" ]; then
     col_state=unreachable
   else
-    # bytes of the pull in flight, so a slow transfer still counts as progress
-    c_part=$(find "$LIB" -name '.*.mkv.part*' -type f -printf '%s\n' 2>/dev/null | sort -n | tail -1)
+    # Bytes of the pull in flight, so a slow transfer still counts as progress -
+    # but attributed BY EPISODE. Taking the newest .part anywhere in the library
+    # picked up the desktop's upload instead, so the collector looked busy
+    # because the other machine was working.
+    c_ep=$(sed -nE 's/^.*=== (.*) ===$/\1/p' "$STATE/log" 2>/dev/null | tail -1)
+    c_part=0
+    [ -n "$c_ep" ] && c_part=$(find "$LIB" -name ".$c_ep.mkv.part*" -type f -printf '%s\n' 2>/dev/null | sort -n | tail -1)
     col_metric="done=${c_done:-0} up=$c_up out=$c_out src=$c_src part=${c_part:-0}"
     if   [ "$c_out" = 1 ]; then col_state=pulling
     elif [ "$c_run" = 1 ]; then col_state=upscaling
@@ -86,18 +91,32 @@ fi
 # --- the local (desktop) queue ------------------------------------------------
 loc_state=unknown; loc_metric=''
 if [ -n "$DESKTOP" ]; then
-  read -r l_up l_seg l_run l_part < <(ssh -o BatchMode=yes -o ConnectTimeout=15 "$DESKTOP" '
-      w=$(ls -d /mnt/scratch/upscale-ep/*/ 2>/dev/null | head -1)
+  # The work dir's name is the episode, and it is needed here: while an episode
+  # UPLOADS, up and seg are both 0 and the finished file's size is constant, so
+  # a metric built only from the scratch dir stops moving for the whole delivery
+  # and reads as a stall. The bytes arriving on this side are the progress.
+  # Episode names contain spaces, so the name gets a LINE of its own - reading it
+  # as the fifth whitespace field put "Bleach" in the size column and the rest of
+  # the title nowhere.
+  l_up=''; l_seg=''; l_run=''; l_out=''; l_ep=''
+  { read -r l_up l_seg l_run l_out; IFS= read -r l_ep; } < <(
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$DESKTOP" '
+      w=$(ls -dt /mnt/scratch/upscale-ep/*/ 2>/dev/null | head -1)
       printf "%s %s %s %s\n" \
         "$(ls "$w"up 2>/dev/null | wc -l)" \
         "$(ls "$w"seg 2>/dev/null | wc -l)" \
         "$(pgrep -f "[u]pscale-ep" >/dev/null && echo 1 || echo 0)" \
-        "$(ls -l "$w"*.mkv 2>/dev/null | awk "{print \$5}" | head -1)"' 2>/dev/null) || true
+        "$(stat -c%s "$w"*.mkv 2>/dev/null | head -1)"
+      basename "$w"' 2>/dev/null) || true
   if [ -z "${l_up:-}" ]; then
     loc_state=unreachable
   else
-    loc_metric="up=${l_up:-0} seg=${l_seg:-0} out=${l_part:-0}"
-    if [ "${l_run:-0}" = 1 ]; then loc_state=working; else loc_state=idle; fi
+    l_part=0
+    [ -n "${l_ep:-}" ] && l_part=$(find "$LIB" -name ".$l_ep.mkv.part*" -type f -printf '%s\n' 2>/dev/null | sort -n | tail -1)
+    loc_metric="up=${l_up:-0} seg=${l_seg:-0} out=${l_out:-0} part=${l_part:-0}"
+    if   [ "${l_run:-0}" = 1 ]; then loc_state=working
+    elif [ "${l_part:-0}" -gt 0 ]; then loc_state=uploading
+    else loc_state=idle; fi
   fi
 else
   loc_state=not-configured
