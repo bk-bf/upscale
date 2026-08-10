@@ -81,7 +81,7 @@ say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$QLOG" >&2; }
 save_config(){
   : "${PROFILE:=}"
   local v tmp="$CONFIG.$$"
-  { for v in PARITY EPISODES ORDER PROFILE WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS IDLE LIMIT; do
+  { for v in PARITY EPISODES ORDER PROFILE WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS IDLE LIMIT GPUHOST RWORK RGPUWORK RSCRIPT; do
       printf '%s=%q\n' "$v" "${!v}"
     done
     printf 'QUEUE_PID=%q\n' "$$"
@@ -97,7 +97,7 @@ load_config(){   # adopt the running queue's config; an explicit env var wins
     while IFS= read -r line; do
       k=${line%%=*}
       case "$k" in
-        PARITY|EPISODES|ORDER|PROFILE|WORKERS|CHUNK|LIB|ARCHIVE|REMOTE|WORK|DEFER|EPSTATE|MAX_FAILS|QUEUE_PID) ;;
+        PARITY|EPISODES|ORDER|PROFILE|WORKERS|CHUNK|LIB|ARCHIVE|REMOTE|WORK|DEFER|EPSTATE|MAX_FAILS|QUEUE_PID|GPUHOST|RWORK|RGPUWORK|RSCRIPT) ;;
         *) continue ;;
       esac
       if [ -n "${_from_env[$k]:-}" ]; then continue; fi
@@ -725,6 +725,7 @@ cmd_status(){                       # live view; Ctrl-C to leave
 # their EPISODES sets do not overlap (even/odd is the usual split).
 GPUHOST=${GPUHOST:-}
 RWORK=${RWORK:-/root/upscale-work}
+RGPUWORK=${RGPUWORK:-/root/work}   # the worker's scratch root ON the box
 RSCRIPT=${RSCRIPT:-/root/bench/upscale-ep-rental.sh}
 POLL=${POLL:-60}
 
@@ -742,6 +743,111 @@ rworking(){ rsh "pgrep -f $(basename "$RSCRIPT") >/dev/null" >/dev/null 2>&1; }
 # a handful - comparing those rejected a perfectly good episode (33438 vs 33440).
 dframes(){ ffprobe -v error -count_frames -select_streams v \
              -show_entries stream=nb_read_frames -of csv=p=0 "$1" 2>/dev/null; }
+
+# ------------------------------------------------- collect: status ----------
+# The rented box holds all the state, so ONE function reads it, and the same
+# function text is shipped to the box over ssh (declare -f | bash -s) when the
+# server is the one asking. Two readers - one local, one remote - would drift,
+# which is how the local queue and its status view disagreed for a whole day.
+#
+# Output is key=value lines: anything it cannot determine it simply omits.
+collect_probe(){
+  local rw=${1:?} work=${2:-/root/work} log src out w done_ total line fps up
+  log="$rw/current.log"; src="$rw/src.avi"; out="$rw/out.mkv"
+  [ -f "$src" ] || { echo "phase=idle"; return 0; }
+  # written by the collector when it pushes, so `upscale --status` ON the box
+  # names the episode instead of showing "(no episode)"
+  [ -f "$rw/episode" ] && printf 'ep=%s\n' "$(cat "$rw/episode" 2>/dev/null)"
+  w="$work/$(basename "${src%.*}")"
+  # the episode's real name is not on the box - it works on "src.avi" - so the
+  # caller supplies it; here we report only what the box can actually know
+  printf 'srcbytes=%s\n' "$(stat -c%s "$src" 2>/dev/null || echo 0)"
+  if [ -f "$out" ]; then
+    printf 'phase=done\noutbytes=%s\n' "$(stat -c%s "$out" 2>/dev/null || echo 0)"
+    return 0
+  fi
+  total=$(sed -nE 's/.* ([0-9]+) frames @ .*/\1/p' "$log" 2>/dev/null | tail -1)
+  [ -n "${total:-}" ] && printf 'total=%s\n' "$total"
+  line=$(grep -E 'chunk [0-9]+/[0-9]+ upscaled' "$log" 2>/dev/null | tail -1)
+  if [ -n "$line" ]; then
+    done_=$(printf '%s' "$line" | sed -nE 's#.* ([0-9]+)/[0-9]+ +free.*#\1#p')
+    fps=$(printf '%s' "$line" | sed -nE 's/.*\(([0-9.]+) fps\).*/\1/p')
+    printf 'chunk=%s\n' "$(printf '%s' "$line" | sed -nE 's/.*chunk ([0-9]+\/[0-9]+).*/\1/p')"
+    [ -n "${fps:-}" ] && printf 'fps=%s\n' "$fps"
+  fi
+  # frames finished in the CHUNK now on the GPU, so the bar moves continuously
+  # instead of jumping once every 2000 frames
+  up=$(find "$w/up" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l)
+  printf 'done=%s\n' "$(( ${done_:-0} + up ))"
+  if [ -d "$w/frames" ] && [ ! -d "$w/up" ]; then
+    printf 'phase=extract\nextracted=%s\n' "$(find "$w/frames" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l)"
+  elif [ -z "$line" ] && [ "${up:-0}" -eq 0 ]; then
+    printf 'phase=extract\nextracted=%s\n' "$(find "$w/frames" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l)"
+  else
+    printf 'phase=upscale\n'
+  fi
+  printf 'gpu=%s\n' "$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)"
+  printf 'free=%s\n' "$(df -h / 2>/dev/null | awk 'NR==2{print $4}')"
+  printf 'tail=%s\n' "$(tail -1 "$log" 2>/dev/null | cut -c1-72)"
+}
+
+# Ask whoever holds the work. Local when RWORK is on this machine (running this
+# on the box itself), over ssh when we are the collector driving it.
+collect_read(){
+  if [ -n "${GPUHOST:-}" ] && [ ! -d "$RWORK" ]; then
+    { declare -f collect_probe; printf 'collect_probe %q %q\n' "$RWORK" "${RGPUWORK:-/root/work}"; } |
+      timeout "${SSHTMO:-90}" ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST "bash -s" 2>/dev/null
+  else
+    collect_probe "$RWORK" "${RGPUWORK:-/root/work}"
+  fi
+}
+
+cmd_collect_status(){
+  local k v phase total done_ chunk fps gpu free tail_ srcb outb pct ep n repep
+  local tty=0; [ -t 1 ] && tty=1
+  while :; do
+    phase=''; total=''; done_=''; chunk=''; fps=''; gpu=''; free=''; tail_=''; srcb=''; outb=''
+    while IFS='=' read -r k v; do
+      case "$k" in
+        phase) phase=$v ;; total) total=$v ;; done) done_=$v ;; chunk) chunk=$v ;;
+        fps) fps=$v ;; gpu) gpu=$v ;; free) free=$v ;; tail) tail_=$v ;;
+        srcbytes) srcb=$v ;; outbytes) outb=$v ;; extracted) done_=$v ;;
+        ep) repep=$v ;;
+      esac
+    done < <(collect_read)
+
+    # which episode: the collector knows the real name, the box does not
+    # `|| ep=` and `|| n=0` are both load-bearing under set -e: on the box there
+    # is no collector log and no library to discover, and a bare var=$(cmd) that
+    # fails takes the whole script down with exit 2 and no output.
+    repep=''
+    ep=$(sed -nE 's/^.*=== (.*) ===$/\1/p' "$QLOG" 2>/dev/null | tail -1) || ep=''
+    n=$(discover 2>/dev/null | select_todo 2>/dev/null | wc -l) || n=0
+
+    [ "$tty" = 1 ] && printf '\033[H\033[J'
+    printf '%s\n' "${ep:-${repep:-(no episode)}}"
+    if [ "$phase" = done ]; then
+      printf '%s 100%%   upscaled on the box, waiting to be pulled\n' "$(bar 100)"
+    elif [ -n "$total" ] && [ "${total:-0}" -gt 0 ]; then
+      pct=$(( ${done_:-0} * 100 / total ))
+      printf '%s %3d%%   %s/%s frames\n' "$(bar "$pct")" "$pct" "${done_:-0}" "$total"
+    elif [ "$phase" = idle ]; then
+      printf 'box idle - nothing pushed to it yet\n'
+    else
+      printf 'starting up...\n'
+    fi
+    printf 'remote  %-9s %-12s %s\n' "${phase:-?}" "${chunk:+chunk $chunk}" "${fps:+$fps fps}"
+    [ -n "$srcb" ] && printf 'source  %s MB on the box%s\n' "$((srcb/1048576))" \
+      "${outb:+   result $((outb/1048576)) MB}"
+    # On the box itself there is no library to count, and "0 outstanding" would
+    # read as "all done" rather than "not my job to know".
+    [ "${n:-0}" -gt 0 ] && printf 'queue   %s outstanding (this collector)\n' "$n"
+    printf 'box     gpu %s%%   free %s\n' "${gpu:--}" "${free:--}"
+    [ -n "$tail_" ] && printf 'log     %s\n' "$tail_"
+    [ "$tty" = 1 ] || break
+    sleep "${STATUS_EVERY:-10}"
+  done
+}
 
 cmd_collect(){
   [ -n "$GPUHOST" ] || cdie "set GPUHOST, e.g. GPUHOST='-p 48726 root@1.2.3.4'"
@@ -777,6 +883,8 @@ cmd_collect(){
       rsz=$(rsh "stat -c%s $RWORK/src.avi" 2>/dev/null | tr -d '\r') || rsz=0
       if [ "$rsz" != "$lsz" ]; then say "size mismatch after push"; sleep "$POLL"; continue; fi
     fi
+
+    rsh "printf '%s' $(printf '%q' "$base") > $RWORK/episode" >/dev/null 2>&1 || true
 
     # Adopt a job that is already running rather than starting a second one on
     # top of it. The collector is a service: it restarts after a crash, a reboot
@@ -868,7 +976,12 @@ case "${1:-}" in
   # --list, like --status, describes the queue that is running: same config,
   # same selection rules, same order the run loop will take them in
   list|--list)     load_config; discover | select_todo | nl; exit 0 ;;
-  status|--status) cmd_status; exit 0 ;;
+  # A collector has no local worker: cmd_status would describe the SERVER, which
+  # is idle by definition, and say nothing about the box doing the work.
+  status|--status) load_config
+                   if [ -n "${GPUHOST:-}" ] || [ -d "${RWORK:-/nonexistent}" ]
+                     then cmd_collect_status; else cmd_status; fi
+                   exit 0 ;;
   # write BOTH: the worker polls its own state dir, so a flag written only
   # here would silently never reach the running episode
   pause|--pause)   load_config; touch "$PAUSE" "$EPSTATE/pause"; echo "paused - will hold after the current chunk"; exit 0 ;;

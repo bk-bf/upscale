@@ -146,6 +146,12 @@ capped at 9.6 CPUs by its cgroup quota while `nproc` reported 20 (measured there
 4 → 43.7 fps, 5 → 42.6, 6 → 21.9, 8 → 14.0 — past 5 workers CFS throttling collapses
 throughput). Copy it to the box once; `collect` invokes it per episode.
 
+`upscale --status` shows the collector's view — which episode is on the box, its chunk
+and frame progress, its GPU, and the push/pull transfer. The same command works **on the
+box itself**: install `upscale` there and record `RWORK` in `~/.upscale-queue/config`.
+Both views come from one probe function, shipped to the box over ssh when the server is
+the one asking, so they cannot drift apart.
+
 It uses the same `discover | select_todo` selection as `run`, so a collector and a local
 queue can share one library. The remote job is started detached, so a dropped ssh session
 cannot kill a 15-minute episode, and the result is frame-counted and checked for an audio

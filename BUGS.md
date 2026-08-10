@@ -69,10 +69,10 @@ keyframe's PTS lands on the *previous* one. Cutting at `83.416666` when the keyf
 at `83.417000` silently took 42 extra frames.
 → Cut by verified frame count, not computed timestamp, and assert the total afterwards.
 
-## `set -e` and exit status — five separate outages
+## `set -e` and exit status — six separate outages
 
 `var=$(cmd)` **adopts cmd's exit status**. Under `set -euo pipefail` that kills the
-script, with no message. This caused five different failures before the pattern was
+script, with no message. This caused six different failures before the pattern was
 recognised:
 
 - the profiler died the moment nothing matched a `pgrep`
@@ -82,6 +82,9 @@ recognised:
 - `GPUBUSY=$(ls /sys/class/drm/card*/...)` killed the entire script, before it
   printed a single character, on any machine with no GPU. Which is exactly the
   machine `collect` mode is meant to run on: the server.
+- `ep=$(sed ... "$QLOG" | tail -1)` did the same thing on the GPU box, where
+  there is no collector log to read. Exit 2, no output, nothing in any log.
+  `2>/dev/null` hides the message but not the status.
 
 Related: **`grep -c` and `pgrep -c` print `0` *and* exit non-zero.** So
 `n=$(grep -c x f || echo 0)` yields the string `"0\n0"`, which then blows up any
