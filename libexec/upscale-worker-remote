@@ -40,6 +40,15 @@ vframes(){ ffprobe -v error -count_frames -select_streams v \
 
 FRAMES="$W/frames"; UP="$W/up"; SEGDIR="$W/seg"
 
+# The job file the STATUS VIEW reads. Same names, same meanings, same directory
+# convention as the local worker - because `upscale --status` on this box then
+# runs the ordinary renderer, the one that already knows the difference between
+# counting frames, extracting, upscaling and encoding. Writing a second
+# phase-detector for the remote case produced a display that showed 0% and
+# "starting" through an entire extraction.
+EPSTATE=${EPSTATE:-$HOME/.upscale-ep}
+mkdir -p "$EPSTATE"
+
 # ffmpeg 8.1.2 silently mis-decodes MPEG-4 ASP: byte-identical input, visibly
 # corrupt output, CORRECT frame count. Counts never catch it; only content does.
 verify_decoder(){
@@ -68,6 +77,19 @@ mkdir -p "$FRAMES" "$UP" "$SEGDIR"
 FPS=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$IN")
 TOTAL=$(vframes "$IN")
 say "$(basename "$IN"): $TOTAL frames @ $FPS, $MODEL x$SCALE, $WORKERS workers, x264 crf$CRF $PRESET"
+
+# SRC is what the viewer shows as the title. This box only ever sees "src.avi",
+# so the collector leaves the real name in $RWORK/episode when it pushes.
+_epname=$(cat "$(dirname "$IN")/episode" 2>/dev/null) || _epname=''
+cat > "$EPSTATE/job" <<JOBEOF
+SRC="${_epname:-$(basename "${IN%.*}")}"
+TOTAL=$TOTAL
+CHUNK=$CHUNK
+SEGDIR="$SEGDIR"
+UPDIR="$UP"
+PID=$$
+JOBEOF
+date +%s > "$EPSTATE/started"
 verify_decoder
 
 t0=$(date +%s)
@@ -145,5 +167,6 @@ final=$(vframes "$OUT.part")
 [ "$final" = "$TOTAL" ] || die "FINAL MISMATCH: $final frames, source had $TOTAL"
 mv "$OUT.part" "$OUT"
 t2=$(date +%s)
+rm -f "$EPSTATE/job"
 say "done: $OUT  $(du -h "$OUT" | cut -f1)  $final frames  wall $((t2-t0))s ($(echo "scale=1;($t2-$t0)/60"|bc) min)"
 rm -rf "$FRAMES" "$UP" "$W/shard" "$SEGDIR"

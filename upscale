@@ -175,6 +175,9 @@ NETIF=${NETIF:-$(ip route show default 2>/dev/null | awk '{print $5; exit}')}
 # so the whole script exited 2 here, before printing anything at all. That is
 # precisely the machine `collect` is meant to run on: the server.
 GPUBUSY=$(ls /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | head -1) || GPUBUSY=""
+# AMD exposes utilisation through sysfs; NVIDIA does not, and the rented boxes
+# are NVIDIA - so the status showed "gpu -%" on the machine doing the work.
+NVSMI=$(command -v nvidia-smi 2>/dev/null) || NVSMI=""
 GPUDIR=${GPUBUSY%/gpu_busy_percent}
 
 resources(){
@@ -188,7 +191,11 @@ resources(){
   _p_tot=$tot; _p_idle=$idle
 
   ram=$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{printf "%.1f/%.1fG", (t-a)/1048576, t/1048576}' /proc/meminfo)
-  [ -n "$GPUBUSY" ] && [ -r "$GPUBUSY" ] && gpu=$(cat "$GPUBUSY" 2>/dev/null)
+  if [ -n "$GPUBUSY" ] && [ -r "$GPUBUSY" ]; then
+    gpu=$(cat "$GPUBUSY" 2>/dev/null) || gpu='-'
+  elif [ -n "$NVSMI" ]; then
+    gpu=$("$NVSMI" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1) || gpu='-'
+  fi
   if [ -r "$GPUDIR/mem_info_vram_used" ]; then
     vram=$(awk -v u="$(cat "$GPUDIR/mem_info_vram_used")" -v t="$(cat "$GPUDIR/mem_info_vram_total")" \
       'BEGIN{printf "  vram %.1f/%.1fG", u/1073741824, t/1073741824}')
@@ -776,204 +783,85 @@ dframes(){ ffprobe -v error -count_frames -select_streams v \
              -show_entries stream=nb_read_frames -of csv=p=0 "$1" 2>/dev/null; }
 
 # ------------------------------------------------- collect: status ----------
-# The rented box holds all the state, so ONE function reads it, and the same
-# function text is shipped to the box over ssh (declare -f | bash -s) when the
-# server is the one asking. Two readers - one local, one remote - would drift,
-# which is how the local queue and its status view disagreed for a whole day.
+# There is ONE status renderer, and it lives where the work is. Rather than
+# reimplement phase detection for the remote case - which produced a view stuck
+# at 0% and "starting" for an entire extraction - the collector runs the box's
+# own `upscale --status` and prints what it says, then adds the two things only
+# this side knows: the transfer in flight and the queue behind it.
 #
-# Output is key=value lines: anything it cannot determine it simply omits.
-collect_probe(){
-  local rw=${1:?} work=${2:-/root/work} log src out w done_ total line fps up
-  log="$rw/current.log"; src="$rw/src.avi"; out="$rw/out.mkv"
-  [ -f "$src" ] || { echo "phase=idle"; return 0; }
-  # written by the collector when it pushes, so `upscale --status` ON the box
-  # names the episode instead of showing "(no episode)"
-  [ -f "$rw/episode" ] && printf 'ep=%s\n' "$(cat "$rw/episode" 2>/dev/null)"
-  [ -f "$rw/started" ] && printf 'started=%s\n' "$(cat "$rw/started" 2>/dev/null)"
-  w="$work/$(basename "${src%.*}")"
-  # the episode's real name is not on the box - it works on "src.avi" - so the
-  # caller supplies it; here we report only what the box can actually know
-  printf 'srcbytes=%s\n' "$(stat -c%s "$src" 2>/dev/null || echo 0)"
-  if [ -f "$out" ]; then
-    printf 'phase=done\noutbytes=%s\n' "$(stat -c%s "$out" 2>/dev/null || echo 0)"
-    # still report the frame count: "100%  0/0 frames" reads like a failure
-    # A finished episode leaves its log behind, and the next source is pushed
-  # before the next job truncates it - so a log older than src.avi describes the
-  # PREVIOUS episode. Reporting it showed "chunk 18/18, done" for an episode that
-  # had not started, which is exactly backwards from the truth.
-  if [ "$log" -ot "$src" ]; then
-    printf 'phase=starting\n'
-    return 0
-  fi
-  total=$(sed -nE 's/.* ([0-9]+) frames @ .*/\1/p' "$log" 2>/dev/null | tail -1)
-    [ -n "${total:-}" ] && printf 'total=%s\ndone=%s\n' "$total" "$total"
-    return 0
-  fi
-  total=$(sed -nE 's/.* ([0-9]+) frames @ .*/\1/p' "$log" 2>/dev/null | tail -1)
-  [ -n "${total:-}" ] && printf 'total=%s\n' "$total"
-  line=$(grep -E 'chunk [0-9]+/[0-9]+ upscaled' "$log" 2>/dev/null | tail -1)
-  if [ -n "$line" ]; then
-    done_=$(printf '%s' "$line" | sed -nE 's#.* ([0-9]+)/[0-9]+ +free.*#\1#p')
-    fps=$(printf '%s' "$line" | sed -nE 's/.*\(([0-9.]+) fps\).*/\1/p')
-    printf 'chunk=%s\n' "$(printf '%s' "$line" | sed -nE 's/.*chunk ([0-9]+\/[0-9]+).*/\1/p')"
-    [ -n "${fps:-}" ] && printf 'fps=%s\n' "$fps"
-  fi
-  # frames finished in the CHUNK now on the GPU, so the bar moves continuously
-  # instead of jumping once every 2000 frames
-  up=$(find "$w/up" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l)
-  printf 'done=%s\n' "$(( ${done_:-0} + up ))"
-  if [ -d "$w/frames" ] && [ ! -d "$w/up" ]; then
-    printf 'phase=extract\nextracted=%s\n' "$(find "$w/frames" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l)"
-  elif [ -z "$line" ] && [ "${up:-0}" -eq 0 ]; then
-    printf 'phase=extract\nextracted=%s\n' "$(find "$w/frames" -maxdepth 1 -name '*.png' 2>/dev/null | wc -l)"
-  else
-    printf 'phase=upscale\n'
-  fi
-  printf 'gpu=%s\n' "$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)"
-  printf 'free=%s\n' "$(df -h / 2>/dev/null | awk 'NR==2{print $4}')"
-  printf 'tail=%s\n' "$(tail -1 "$log" 2>/dev/null | cut -c1-72)"
-}
-
-# Ask whoever holds the work. Local when RWORK is on this machine (running this
-# on the box itself), over ssh when we are the collector driving it.
-#
-# STATUS_MUX is a shared ssh connection used ONLY by the status loop. A fresh
-# connection to a rented box measured 4.3 s, which is what set the refresh
-# interval - not the data, which takes 6 ms to read. Multiplexed, each probe is
-# a round trip on an already-open channel. The rest of the collector keeps
-# ControlPath=none deliberately: a long-running episode must not depend on a
-# socket a status viewer opened and closed.
-STATUS_MUX=''
-collect_reads_locally(){ [ -z "${GPUHOST:-}" ] || [ -d "$RWORK" ]; }
-
-status_mux_open(){
-  collect_reads_locally && return 0
-  STATUS_MUX="$STATE/.statusmux.$$"
-  ssh -o BatchMode=yes -o ConnectTimeout=20 -o ControlMaster=yes \
-      -o ControlPath="$STATUS_MUX" -o ControlPersist=60 -N -f $GPUHOST 2>/dev/null || STATUS_MUX=''
-}
-status_mux_close(){ [ -n "$STATUS_MUX" ] && { ssh -O exit -o ControlPath="$STATUS_MUX" $GPUHOST 2>/dev/null; rm -f "$STATUS_MUX"; }; return 0; }
-
-collect_read(){
-  if collect_reads_locally; then
-    collect_probe "$RWORK" "${RGPUWORK:-/root/work}"
-  else
-    { declare -f collect_probe; printf 'collect_probe %q %q\n' "$RWORK" "${RGPUWORK:-/root/work}"; } |
-      timeout "${SSHTMO:-90}" ssh -o BatchMode=yes -o ConnectTimeout=20 \
-        ${STATUS_MUX:+-o ControlPath="$STATUS_MUX"} ${STATUS_MUX:--o ControlPath=none} \
-        $GPUHOST "bash -s" 2>/dev/null
-  fi
+# The box can answer because its worker writes the same job file the local
+# worker does, so `upscale --status` there takes the ordinary code path.
+box_status(){
+  timeout "${SSHTMO:-45}" ssh -o BatchMode=yes -o ConnectTimeout=20 \
+    ${STATUS_MUX:+-o ControlPath="$STATUS_MUX"} ${STATUS_MUX:--o ControlPath=none} \
+    $GPUHOST "EPSTATE=/root/.upscale-ep WORK=/root/work REMOTE=local upscale --status" 2>/dev/null
 }
 
 cmd_collect_status(){
-  # Same layout as the local view (line_title/line_prog/line_note/line_kv), same
-  # bar, same ms(), same xfer_eta - only the machine being described differs.
-  local k v phase total done_ chunk fps gpu free tail_ srcb outb ep n repep
-  local pct el eta cur nchunk started nxt part psz repstart
   local tty=0; [ -t 1 ] && tty=1
-  [ "$tty" = 1 ] && printf '\033[?12l\033[?25l\033[2J'
-  # Only a live loop amortises the ~4 s of opening a shared connection; a
-  # one-shot (piped) frame would pay it for a single read.
+  [ "$tty" = 1 ] && printf '\033[?25l\033[2J'
   [ "$tty" = 1 ] && status_mux_open
   trap 'status_mux_close; printf "\033[?25h\033[J\n"; exit 0' INT TERM
-  # A local read costs 6 ms, so refresh like the local view does; a multiplexed
-  # remote read costs a round trip, so refresh often but not every second. The
-  # old flat 10 s applied a remote-connection cost to the local case, where
-  # there is no connection at all.
-  local every=${STATUS_EVERY:-}
-  if [ -z "$every" ]; then
-    if collect_reads_locally; then every=1; else every=3; fi
-  fi
+  local out ep n nxt part psz outb pct
   while :; do
-    phase=''; total=''; done_=''; chunk=''; fps=''; gpu=''; free=''; tail_=''
-    srcb=''; outb=''; repep=''; repstart=''
-    while IFS='=' read -r k v; do
-      case "$k" in
-        phase) phase=$v ;; total) total=$v ;; done) done_=$v ;; chunk) chunk=$v ;;
-        fps) fps=$v ;; gpu) gpu=$v ;; free) free=$v ;; tail) tail_=$v ;;
-        srcbytes) srcb=$v ;; outbytes) outb=$v ;; extracted) done_=$v ;; ep) repep=$v ;;
-        started) repstart=$v ;;
-      esac
-    done < <(collect_read)
-
+    out=$(box_status) || out=''
     ep=$(sed -nE 's/^.*=== (.*) ===$/\1/p' "$QLOG" 2>/dev/null | tail -1) || ep=''
-    # discover walks the whole library; at a 1 s refresh that is the slowest
-    # thing in the frame by three orders of magnitude, and the answer changes
-    # once an episode - so it is sampled on its own slow schedule.
+    # discover walks the whole library and changes once an episode
     if [ "$(( ${_dsc_at:-0} + 60 ))" -lt "$(date +%s)" ]; then
       _dsc_at=$(date +%s)
-      _dsc_n=$(discover 2>/dev/null | select_todo 2>/dev/null | wc -l) || _dsc_n=0
-      _dsc_nxt=$(discover 2>/dev/null | select_todo 2>/dev/null | sed -n 2p) || _dsc_nxt=''
+      _dsc_n=$(discover 2>/dev/null | select_todo 2>/dev/null | runnable 2>/dev/null | wc -l) || _dsc_n=0
+      _dsc_nxt=$(discover 2>/dev/null | select_todo 2>/dev/null | runnable 2>/dev/null | sed -n 2p) || _dsc_nxt=''
     fi
     n=${_dsc_n:-0}; nxt=${_dsc_nxt:-}
 
     [ "$tty" = 1 ] && printf '\033[H'
-    line_title "${ep:-${repep:-(no episode)}}"
-
-    # --- the episode on the box ---------------------------------------------
-    if [ "$phase" = done ]; then
-      line_prog upscale 100 "${total:-0}" "${total:-0}"
-      line_note "finished on the box - waiting to be pulled"
-    elif [ "$phase" = idle ]; then
-      line_note "box idle - nothing pushed to it yet"
-    elif [ -n "$total" ] && [ "${total:-0}" -gt 0 ]; then
-      pct=$(( ${done_:-0} * 100 / total ))
-      line_prog "${phase:-upscale}" "$pct" "${done_:-0}" "$total"
-      # elapsed comes from when the collector announced this episode; eta from
-      # the box's own measured rate, which is the only honest source for it
-      # No stamp means we are not the collector (this is the box looking at its
-      # own work), and "elapsed 29773176m" is worse than saying nothing.
-      started=$(stat -c%Y "$STATE/collect-started" 2>/dev/null) || started=0
-      # on the box there is no local stamp, so use the one the collector left
-      [ "${started:-0}" -gt 0 ] || started=${repstart:-0}
-      if [ "${started:-0}" -gt 0 ]; then
-        el=$(( $(date +%s) - started )); [ "$el" -lt 0 ] && el=0
-        el="elapsed $(ms "$el")"
-      else
-        el=''
-      fi
-      eta=$(awk -v r="$(( total - ${done_:-0} ))" -v v="${fps:-0}" \
-            'BEGIN{printf "%d", (v>0)?r/v:0}') || eta=0
-      line_note "$(printf '%s   %s   %s   eta %s' \
-        "${chunk:+chunk $chunk}" "${fps:+$fps fps}" "$el" "$(ms "$eta")")"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | sed '/^(live/d;/^$/d;/queue ? outstanding/d;/next    (queue not running)/d'
     else
-      line_note "starting up ..."
+      line_title "${ep:-(no episode)}"
+      line_note "box unreachable"
     fi
 
-    # --- the transfer this end is doing -------------------------------------
-    # Same two-sided percentage as the local view: bytes here over bytes there.
-    # Match the partial for THIS episode by name. Taking the newest partial
-    # anywhere in the library picks up the other machine's upload - the local
-    # view had exactly this bug, and it reported one episode's bytes against
-    # another's total ("106%  487/457 MB").
+    # the pull, matched by episode so it cannot show the other machine's upload
     part=''
-    if [ -n "${ep:-}" ]; then
-      part=$(find "$LIB" -name ".$ep.mkv.part*" -type f -printf '%T@ %p\n' 2>/dev/null |
-               sort -n | tail -1 | cut -d' ' -f2-) || part=''
-    fi
-    if [ -n "$part" ] && [ "${outb:-0}" -gt 0 ]; then
+    [ -n "$ep" ] && part=$(find "$LIB" -name ".$ep.mkv.part*" -type f -printf '%T@ %p\n' 2>/dev/null |
+                             sort -n | tail -1 | cut -d' ' -f2-)
+    if [ -n "$part" ]; then
       psz=$(stat -c%s "$part" 2>/dev/null) || psz=0
-      [ "$psz" -gt "${outb:-0}" ] && psz=$outb
-      pct=$(( psz*100/outb ))
-      xfer_eta dl "$part" "$psz" "$outb"
-      line_prog pull "$pct" "$((psz/1048576))" "$((outb/1048576))" "MB$XFER"
-    elif [ "${srcb:-0}" -gt 0 ] && [ "$phase" = idle ]; then
-      line_kv push "$((srcb/1048576)) MB on the box"
+      outb=$(timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=15 \
+               ${STATUS_MUX:+-o ControlPath="$STATUS_MUX"} ${STATUS_MUX:--o ControlPath=none} \
+               $GPUHOST "stat -c%s ${RWORK}/out.mkv 2>/dev/null || echo 0" 2>/dev/null) || outb=0
+      if [ "${outb:-0}" -gt 0 ]; then
+        [ "$psz" -gt "$outb" ] && psz=$outb
+        pct=$(( psz*100/outb ))
+        xfer_eta dl "$part" "$psz" "$outb"
+        line_prog pull "$pct" "$((psz/1048576))" "$((outb/1048576))" "MB$XFER"
+      fi
     fi
-
-    line_kv state "$(printf '%s%s' \
-      "$([ "$phase" = done ] && echo 'pulling result' || echo "remote ${phase:-starting}")" \
-      "$([ "${n:-0}" -gt 0 ] && printf '   |   queue %s outstanding' "$n")")"
+    [ "${n:-0}" -gt 0 ] && line_kv queue "$n outstanding for this collector"
     [ -n "$nxt" ] && line_kv next "$(basename "${nxt%.*}" | cut -c1-58)"
-    line_kv box "$(printf 'gpu %s%%   free %s' "${gpu:--}" "${free:--}")"
-    [ -n "$tail_" ] && line_kv log "$tail_"
     if [ "$tty" = 1 ]; then
       printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
-      sleep "$every"
+      sleep "${STATUS_EVERY:-3}"
     else
       break
     fi
   done
+}
+
+# An episode that fails is retried, but not for ever. Without this the collector
+# re-selects the SAME episode every cycle - it is still outstanding, so it is
+# still the best candidate - and one bad episode holds the whole night, ending
+# with nothing delivered. Same file and same limit as the local queue, so
+# `--list` and `--status` already know about it.
+col_fail(){            # $1 = source path, $2 = basename, $3 = reason
+  local n
+  printf '%s\n' "$1" >> "$FAILED"
+  n=$(grep -cFx "$1" "$FAILED" 2>/dev/null) || n=0
+  say "FAILED ($n/$MAX_FAILS): $2 - $3"
+  if [ "$n" -ge "$MAX_FAILS" ]; then
+    say "giving up on $2 for this run; moving to the next episode"
+  fi
 }
 
 cmd_collect(){
@@ -986,7 +874,9 @@ cmd_collect(){
     if [ -f "$STOP" ]; then say "collect stopped"; break; fi
     while [ -f "$PAUSE" ]; do sleep 10; done
 
-    src=$(discover 2>/dev/null | select_todo | head -1) || src=""
+    # runnable() drops episodes that have already failed MAX_FAILS times, so a
+    # bad one cannot be picked again and again for the rest of the night.
+    src=$(discover 2>/dev/null | select_todo | runnable | head -1) || src=""
     if [ -z "$src" ]; then
       if [ "$MODE" = once ]; then say "nothing outstanding"; break; fi
       sleep "$IDLE"; continue
@@ -1036,7 +926,7 @@ cmd_collect(){
       if rworking; then
         say "started remotely"
       else
-        say "remote job failed to start; retrying next cycle"; sleep "$POLL"; continue
+        col_fail "$src" "$base" "remote job would not start"; sleep "$POLL"; continue
       fi
     fi
 
@@ -1052,12 +942,14 @@ cmd_collect(){
       fi
       say "  $(rsh "tail -1 $RWORK/current.log 2>/dev/null" 2>/dev/null | tr -d '\r' | cut -c1-70)"
     done
-    if ! rsh "test -f $RWORK/out.mkv" 2>/dev/null; then say "no output for $base"; continue; fi
+    if ! rsh "test -f $RWORK/out.mkv" 2>/dev/null; then
+      col_fail "$src" "$base" "remote produced no output"; sleep 20; continue
+    fi
 
     say "pulling result"
     if ! rsync -q --partial -e "ssh -o BatchMode=yes -o ControlPath=none $GPUHOST" \
          ":$RWORK/out.mkv" "$dest/.$base.mkv.part"; then
-      say "pull failed"; continue
+      col_fail "$src" "$base" "pull failed"; sleep 20; continue
     fi
     got=$(dframes "$dest/.$base.mkv.part") || got=0
     want=$(dframes "$src") || want=0
@@ -1074,8 +966,11 @@ cmd_collect(){
       esac
       rsh "rm -f $RWORK/out.mkv $RWORK/src.avi" >/dev/null 2>&1 || true
     else
-      say "REJECTED $base: frames $got vs $want, streams: $streams"
+      col_fail "$src" "$base" "frames $got vs $want, streams: $streams"
       mv -f "$dest/.$base.mkv.part" "$STATE/rejected-$base.mkv" 2>/dev/null || true
+      # the remote result is wrong, so do not let the next attempt adopt it
+      rsh "rm -f $RWORK/out.mkv" >/dev/null 2>&1 || true
+      sleep 20
     fi
     if [ "$MODE" = once ]; then break; fi
   done
