@@ -974,9 +974,49 @@ cmd_collect(){
 
     # Push the source, size-verified. A truncated upload would otherwise be
     # upscaled into a short episode, with nothing anywhere reporting an error.
+    # ---------------------------------------------------------------------
+    # WHAT IS THE BOX ALREADY DOING?  This must come BEFORE the push.
+    #
+    # A restarted collector re-runs discover|select_todo from scratch and can
+    # legitimately pick a DIFFERENT episode than the one in flight. It then
+    # pushed its source over $RWORK/src.avi - the running job's input - and
+    # afterwards "adopted" that job because rworking() only asks whether the
+    # worker is running, never WHICH episode it is running.
+    #
+    # The worker had already extracted its frames, so the video stayed the old
+    # episode while the final mux took audio from the new src.avi. The result
+    # was S01E02's video with S02E19's audio, presented as S02E19. It was caught
+    # only because the two happen to differ by 2 frames; S01E18, S02E02, S02E05
+    # and S02E15 all count exactly 33435, so the near miss was luck.
+    remote_ep=$(rsh "cat $RWORK/episode 2>/dev/null" 2>/dev/null | tr -d '\r') || remote_ep=''
+    remote_busy=0
+    if rsh "test -f $RWORK/out.mkv" 2>/dev/null || rworking; then remote_busy=1; fi
+    if [ "$remote_busy" = 1 ] && [ -n "$remote_ep" ] && [ "$remote_ep" != "$base" ]; then
+      # The box is mid-episode on something else. Its work belongs to IT, not to
+      # whatever this instance picked. Collect that instead of clobbering it.
+      say "box is on '$remote_ep', not '$base' - switching to it"
+      rsrc=$(discover 2>/dev/null | select_todo | grep -F "$remote_ep" | head -1) || rsrc=''
+      if [ -n "$rsrc" ]; then
+        src="$rsrc"; base=$(basename "${src%.*}")
+        case "$src" in
+          "$ARCHIVE"/*) dest="$LIB/$(dirname "${src#"$ARCHIVE"/}")" ;;
+          *)            dest=$(dirname "$src") ;;
+        esac
+      else
+        # It is finishing something already delivered or not in our set; let it
+        # finish rather than destroying it, and re-select next cycle.
+        say "cannot map '$remote_ep' to a source - waiting rather than clobbering"
+        sleep "$POLL"; continue
+      fi
+    fi
+
     lsz=$(stat -c%s "$src")
     rsz=$(rsh "stat -c%s $RWORK/src.avi 2>/dev/null || echo 0" 2>/dev/null | tr -d '\r') || rsz=0
-    if [ "${rsz:-0}" != "$lsz" ]; then
+    if [ "${rsz:-0}" != "$lsz" ] && [ "$remote_busy" = 1 ] && [ "$remote_ep" = "$base" ]; then
+      # Same episode, but the box is already working on it: its src.avi is in
+      # use. Pushing again would swap the file under a running decoder.
+      say "box already has this episode in flight - not re-pushing"
+    elif [ "${rsz:-0}" != "$lsz" ]; then
       say "pushing source ($((lsz/1048576)) MB)"
       # tell the box how big it will be, so its own status can show a real
       # percentage while the push is in flight instead of a bare byte count
@@ -998,7 +1038,11 @@ cmd_collect(){
     # A finished result is adopted too, not just a running job. The launch command
     # begins `rm -f out.mkv`, so reaching it with a completed episode on the box
     # would delete twenty-three minutes of GPU work and start again.
-    if rsh "test -f $RWORK/out.mkv" 2>/dev/null; then
+    # Adoption requires the box to agree on WHICH episode. An out.mkv belongs to
+    # $RWORK/episode, never to whatever this instance happened to select.
+    if [ "$remote_busy" = 1 ] && [ -n "$remote_ep" ] && [ "$remote_ep" != "$base" ]; then
+      say "refusing to adopt '$remote_ep' as '$base'"; sleep "$POLL"; continue
+    elif rsh "test -f $RWORK/out.mkv" 2>/dev/null; then
       say "result already on the box - collecting it"
     elif rworking; then
       say "remote job already running - adopting it"

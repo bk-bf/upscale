@@ -168,6 +168,42 @@ Every one of these made the pipeline *look* broken or fine when it wasn't:
   throttled — and made 8 workers **three times slower** than 4 on that box. Read
   `cpu.cfs_quota_us`, not `nproc`.
 
+## The one that nearly shipped: the wrong episode, correctly counted
+
+A delivered file was rejected for having 33435 frames against a source with 33437. It
+was not a short encode. The file was **episode S01E02's video muxed with S02E19's
+audio**, presented as S02E19.
+
+The watchdog restarted the collector mid-episode — which its own comment calls safe,
+"because it adopts a job already running on the box". The fresh instance re-ran
+`discover | select_todo` from scratch and legitimately picked a *different* episode than
+the one in flight. Then, in order:
+
+1. it pushed its source over `$RWORK/src.avi` — **the running job's input** — because the
+   push came before any check of what the box was doing;
+2. it "adopted" that job, because `rworking()` only asked *is a worker running*, never
+   *which episode*.
+
+The worker had already extracted its frames, so the video stayed the old episode while
+the final mux drew audio from the new `src.avi`. Every count-based assertion passed: the
+worker compared against the total it computed at its own job start.
+
+It was caught by two frames. S01E18, S02E02, S02E05 and S02E15 all decode to exactly
+33435 — had the collision been with any of those, a wrong episode would have been
+verified, published, and archived over its own original.
+
+**Fixes**
+- Ask the box what it is working on (`$RWORK/episode`) **before** pushing anything.
+- Never overwrite the source of a running job.
+- Adoption requires identity: an `out.mkv` belongs to `$RWORK/episode`, never to whatever
+  the current instance happened to select. On a mismatch, switch to the box's episode or
+  wait — never clobber.
+
+**The general lesson.** Counting is not identity. Frame counts, byte sizes and durations
+all answer "is this the right shape", never "is this the right thing" — and a pipeline
+that only ever asks the first question will eventually ship something that is the right
+shape. The check that saved this was a coincidence, not a design.
+
 ## Advertised but not implemented
 
 `collect` mode reached the header comment and the argument dispatch — `collect)
