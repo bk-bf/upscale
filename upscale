@@ -940,6 +940,41 @@ col_fail(){            # $1 = source path, $2 = basename, $3 = reason
   fi
 }
 
+# Is the delivered file actually THIS episode? Counting cannot answer that.
+#
+# A frame count, a byte size and a duration all say "is this the right shape",
+# never "is this the right thing". A wrong episode of the same series has the
+# same shape - S01E18, S02E02, S02E05 and S02E15 all decode to exactly 33435
+# frames - and one was published-but-for-a-two-frame coincidence.
+#
+# Five single frames, decoded from each file, downscaled to the source's size and
+# compared. Measured on real pairs here:
+#     wrong episode          13.6 dB
+#     correct episodes       29.4  31.9  32.6  35.9  38.1 dB
+# so 20 dB sits with ~9 dB of margin under the worst correct pair and ~6 dB over
+# the worst wrong one. Best-of-five, because a single sample can land on motion
+# where an upscale legitimately differs from its source.
+#
+# Cost is a couple of seconds per episode against a 25-minute render.
+IDENT_MIN_DB=${IDENT_MIN_DB:-20}
+ident_psnr(){          # $1 delivered  $2 source -> best-of-N dB
+  local t best=0 p w h tmp; tmp=$(mktemp -d) || { printf '0'; return 0; }
+  read -r w h < <(ffprobe -v error -select_streams v -show_entries stream=width,height \
+                    -of csv=p=0 "$2" 2>/dev/null | tr ',' ' ') || true
+  [ -n "${w:-}" ] || { rm -rf "$tmp"; printf '0'; return 0; }
+  for t in 120 400 700 1000 1300; do
+    ffmpeg -v error -ss "$t" -i "$1" -frames:v 1 "$tmp/a.png" -y 2>/dev/null || continue
+    ffmpeg -v error -ss "$t" -i "$2" -frames:v 1 "$tmp/b.png" -y 2>/dev/null || continue
+    # NOT -v error here: the psnr filter reports at info level, and -v error
+    # hides the very line being parsed - which silently scored everything 0.
+    p=$(ffmpeg -hide_banner -i "$tmp/a.png" -i "$tmp/b.png" \
+         -lavfi "[0:v]scale=$w:$h,format=gray[a];[1:v]format=gray[b];[a][b]psnr" \
+         -f null - 2>&1 | grep -oE 'average:[0-9.]+' | head -1 | cut -d: -f2) || p=0
+    awk -v a="${p:-0}" -v b="$best" 'BEGIN{exit !(a>b)}' && best=$p
+  done
+  rm -rf "$tmp"; printf '%s' "${best:-0}"
+}
+
 cmd_collect(){
   [ -n "$GPUHOST" ] || cdie "set GPUHOST, e.g. GPUHOST='-p 48726 root@1.2.3.4'"
   rsh "mkdir -p $RWORK" >/dev/null 2>&1 || cdie "cannot reach the worker at $GPUHOST"
@@ -1087,9 +1122,19 @@ cmd_collect(){
     got=$(dframes "$dest/.$base.mkv.part") || got=0
     want=$(dframes "$src") || want=0
     streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$dest/.$base.mkv.part" 2>/dev/null | tr '\n' ' ')
+    # identity, not just shape - see ident_psnr above
+    ident=$(ident_psnr "$dest/.$base.mkv.part" "$src") || ident=0
+    identok=0
+    awk -v x="${ident:-0}" -v m="$IDENT_MIN_DB" 'BEGIN{exit !(x>=m)}' && identok=1
+    if [ "$identok" = 0 ]; then
+      col_fail "$src" "$base" "content does not match the source (${ident} dB < ${IDENT_MIN_DB} dB) - wrong episode?"
+      mv -f "$dest/.$base.mkv.part" "$STATE/rejected-$base.mkv" 2>/dev/null || true
+      rsh "rm -f $RWORK/out.mkv" >/dev/null 2>&1 || true
+      sleep 20; continue
+    fi
     if [ "$got" = "$want" ] && printf '%s' "$streams" | grep -q audio; then
       mv -f "$dest/.$base.mkv.part" "$dest/$base.mkv"
-      say "delivered $base.mkv ($got frames, $(du -h "$dest/$base.mkv" | cut -f1))"
+      say "delivered $base.mkv ($got frames, ${ident} dB, $(du -h "$dest/$base.mkv" | cut -f1))"
       # Give the new episode a real thumbnail. Jellyfin extracts one from the
       # video at ~10% of runtime, which on a 350-episode show is the opening
       # titles over and over; upscale-artwork replaces it with the provider's
