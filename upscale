@@ -128,14 +128,25 @@ set -euo pipefail
 lib=$(printf '%q' "$LIB"); arc=$(printf '%q' "$ARCHIVE")
 emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in
   base=\$(basename "\${1%.*}")
-  # A .part means someone is delivering this episode RIGHT NOW. Two queues
-  # converging from opposite ends will meet, and without this the second one
-  # starts a fifteen-minute upscale of an episode already arriving. Only a FRESH
-  # partial counts: one left behind by a dead transfer must not hide an episode
-  # for ever, so anything untouched for 30 minutes is ignored.
-  if [ -f "\$2/\$base.mkv" ]; then return 0; fi
-  if find "\$2" -maxdepth 1 -name ".\$base.mkv.part*" -newermt '30 minutes ago' 2>/dev/null | grep -q .; then
-    return 0
+  # Match on EPISODE IDENTITY (SxxEyy), not on the exact filename.
+  #
+  # The delivered file does not keep the source's name. Sonarr re-detects the
+  # quality of the upscaled result and renames "... SDTV.mkv" to
+  # "... HDTV-720p.mkv", so an exact-name test says the episode is still missing
+  # and the queue upscales it again - for ever, every episode, silently.
+  se=\$(printf '%s' "\$base" | grep -oiE 'S[0-9]+E[0-9]+' | head -1)
+  if [ -n "\$se" ]; then
+    if find "\$2" -maxdepth 1 -iname "*\$se*.mkv" 2>/dev/null | grep -q .; then return 0; fi
+    # a delivery in flight for this episode, by identity, for the same reason
+    if find "\$2" -maxdepth 1 -iname ".*\$se*.mkv.part*" -newermt '30 minutes ago' 2>/dev/null | grep -q .; then
+      return 0
+    fi
+  else
+    # no SxxEyy (specials): fall back to the exact name
+    if [ -f "\$2/\$base.mkv" ]; then return 0; fi
+    if find "\$2" -maxdepth 1 -name ".\$base.mkv.part*" -newermt '30 minutes ago' 2>/dev/null | grep -q .; then
+      return 0
+    fi
   fi
   printf '%s\n' "\$1"
 }
@@ -939,9 +950,17 @@ cmd_collect(){
     if [ -f "$STOP" ]; then say "collect stopped"; break; fi
     while [ -f "$PAUSE" ]; do sleep 10; done
 
+    # NO `head -1` here. head closes the pipe as soon as it has its line, discover
+    # takes SIGPIPE mid-write, and under `set -o pipefail` the whole pipeline
+    # reports failure - so src came back empty, the collector concluded there was
+    # nothing outstanding, and slept 300s in a loop while a finished 518 MB
+    # result sat on the box uncollected. Read the list, then take the first of it.
+    #
     # runnable() drops episodes that have already failed MAX_FAILS times, so a
     # bad one cannot be picked again and again for the rest of the night.
-    src=$(discover 2>/dev/null | select_todo | runnable | head -1) || src=""
+    local _cand=()
+    mapfile -t _cand < <(discover 2>/dev/null | select_todo | runnable) || true
+    src="${_cand[0]:-}"
     if [ -z "$src" ]; then
       if [ "$MODE" = once ]; then say "nothing outstanding"; break; fi
       sleep "$IDLE"; continue
@@ -976,10 +995,12 @@ cmd_collect(){
          date +%s > $RWORK/started" >/dev/null 2>&1 || true
     : > "$STATE/collect-started"
 
-    # Adopt a job that is already running rather than starting a second one on
-    # top of it. The collector is a service: it restarts after a crash, a reboot
-    # or a redeploy, and the box keeps working through all three.
-    if rworking; then
+    # A finished result is adopted too, not just a running job. The launch command
+    # begins `rm -f out.mkv`, so reaching it with a completed episode on the box
+    # would delete twenty-three minutes of GPU work and start again.
+    if rsh "test -f $RWORK/out.mkv" 2>/dev/null; then
+      say "result already on the box - collecting it"
+    elif rworking; then
       say "remote job already running - adopting it"
     else
       # setsid+nohup so a dropped ssh session cannot kill a 15-minute episode.
