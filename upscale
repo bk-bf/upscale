@@ -1046,6 +1046,16 @@ cmd_collect(){
     if [ "$got" = "$want" ] && printf '%s' "$streams" | grep -q audio; then
       mv -f "$dest/.$base.mkv.part" "$dest/$base.mkv"
       say "delivered $base.mkv ($got frames, $(du -h "$dest/$base.mkv" | cut -f1))"
+      # Give the new episode a real thumbnail. Jellyfin extracts one from the
+      # video at ~10% of runtime, which on a 350-episode show is the opening
+      # titles over and over; upscale-artwork replaces it with the provider's
+      # still. Backgrounded and best-effort: Jellyfin may not have scanned the
+      # file yet, and the timer picks up anything this misses. It must never be
+      # able to delay or fail a delivery.
+      if command -v upscale-artwork >/dev/null 2>&1; then
+        ( upscale-artwork "$(printf '%s' "$base" | grep -oiE 'S[0-9]+E[0-9]+' | head -1)" \
+            >/dev/null 2>&1 & ) || true
+      fi
       # A source still in the library was never archived, so it is the only copy;
       # it is archived only now that its replacement is verified in place.
       case "$src" in

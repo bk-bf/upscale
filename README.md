@@ -157,6 +157,38 @@ queue can share one library. The remote job is started detached, so a dropped ss
 cannot kill a 15-minute episode, and the result is frame-counted and checked for an audio
 stream before it is published.
 
+## Thumbnails
+
+Jellyfin extracts an episode thumbnail from the video itself, at a position hardcoded to
+roughly 10% of the runtime — there is no setting for it in 10.11. On a 350-episode show
+that lands on the opening titles again and again, and half the library ends up with the
+same dark, indistinguishable frame.
+
+`upscale-artwork` replaces the thumbnail of each delivered episode with the provider's
+still:
+
+```bash
+upscale-artwork                # every episode that does not yet have ours
+upscale-artwork S02E19         # just this one
+upscale-artwork --adopt        # record what is already correct as ours, download nothing
+upscale-artwork --dry-run
+systemctl --user enable --now upscale-artwork.timer
+```
+
+It works **per episode on one series**, deliberately. Doing it library-wide means
+disabling the local extractor for every show, and screen grabs are genuinely better for
+short series where every frame is distinctive — Jellyfin has no per-series override, so
+the choice is per-item or all-or-nothing.
+
+It records the image tag it set, and redoes an episode only if that tag changes — so a
+Jellyfin refresh that re-extracts a screenshot is repaired on the next sweep, and a
+steady state costs one API call per episode. TheTVDB, not TMDB: TMDB's top-voted still
+for these episodes is the black "BLEACH" title card, which is the problem, not the fix.
+
+The collector nudges it on publish, and the timer sweeps every 15 minutes — the sweep is
+what makes it reliable, because Jellyfin may not have scanned a new file yet, and
+episodes delivered by the *other* machine never pass through the collector at all.
+
 ## Watchdog
 
 `upscale-watch` answers one question: **has a number changed since last time?**

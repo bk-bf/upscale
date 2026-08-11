@@ -1,0 +1,13 @@
+[Unit]
+Description=Thumbnail sweep for newly delivered episodes
+
+[Timer]
+# The collector also nudges this the moment it publishes, but Jellyfin may not
+# have scanned the new file yet - and episodes delivered by the OTHER machine
+# are never seen by the collector at all. This sweep is what makes it reliable.
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
