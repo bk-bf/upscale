@@ -141,10 +141,15 @@ print(imgs[0]['Url'] if imgs else '')" 2>/dev/null) || url=''
           -H "X-Emby-Token: $JF_KEY" \
           "$JF_URL/Items/$id/RemoteImages/Download?Type=Primary&ImageUrl=$enc") || code=000
   if [ "$code" = 204 ] || [ "$code" = 200 ]; then
-    newtag=$(jf "$JF_URL/Items/$id?fields=ImageTags" |
+    # /Items/{id} (UserLibraryController) 400s without a userId on this Jellyfin
+    # version; /Items?Ids= (ItemsController) returns the same fields and needs
+    # only the API key.
+    newtag=$(jf "$JF_URL/Items?Ids=$id&fields=ImageTags" |
       python3 -c "
 import json,sys
-try: print((json.load(sys.stdin).get('ImageTags') or {}).get('Primary',''))
+try:
+    items=json.load(sys.stdin).get('Items') or []
+    print((items[0].get('ImageTags') or {}).get('Primary','') if items else '')
 except Exception: print('')" 2>/dev/null) || newtag=''
     # record by replacing any prior line for this item
     grep -vF "$id"$'\t' "$DONE" > "$DONE.t" 2>/dev/null || true
