@@ -76,6 +76,28 @@ These are not hypothetical. Each one shipped, silently, at least once.
 - The `psnr` filter reports at info level. `-v error` hides the very line you are
   parsing, and everything silently scores 0.
 
+## Notifications — there is exactly one way to send
+
+**Do not write `curl ... $NTFY_PUBLISH_URL` anywhere.** `~/.local/bin/notify` is the only
+thing on the machine that publishes, and nothing in this repo knows the topic or the
+credentials any more.
+
+```bash
+notify --list                                  # every sender, its owner and state
+notify --register <id> <owner-path> <purpose>  # before a new thing can send
+notify --retire <id> <reason>                  # a finished job cannot alarm about itself
+notify <id> <title> <body> [priority] [tags]
+```
+
+An unregistered id is refused (non-zero exit). A retired sender is refused (zero exit —
+refusing is the correct outcome, not an error). Cooldown is enforced centrally, so two
+senders cannot each dedupe "correctly" and still spam together. Every attempt is logged
+to `~/.config/ntfy/sent.log` with its sender id, so the audit trail names the culprit.
+
+This exists because a completed run produced a "finished" banner and then two "it's
+broken" alarms about the same event, an hour apart, from a second notifier that had no
+idea the first had declared success.
+
 ## Before adding a monitor, timer or notifier
 
 Enumerate what already runs — `systemctl --user list-timers --all`, `crontab -l` on
