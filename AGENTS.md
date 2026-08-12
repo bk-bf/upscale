@@ -93,6 +93,14 @@ otherwise it pages about success.
 - `check-what-already-runs` (universal memory) — the monitoring lesson this project
   produced: enumerate existing timers before adding one.
 
+## Performance data
+
+`PERFORMANCE-DATA.md` holds the raw measurements from the completed run — hardware of
+each machine used, per-component utilisation, throughput distributions, phase costs,
+transfer rates, and the measured results of every configuration that was tried and
+rejected. It is deliberately data-only: no analysis, no recommendations, and every row
+carries how it was obtained. Add to it rather than restating numbers elsewhere.
+
 ## Testing
 
 There is no test suite; the pipeline is verified against real files. When changing
