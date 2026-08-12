@@ -492,6 +492,11 @@ select_todo(){         # stdin: discovered sources -> this machine's half, in th
     if [ "${#early[@]}" -gt 0 ]; then printf '%s\n' "${early[@]}"; fi
     if [ "${#late[@]}" -gt 0 ];  then printf '%s\n' "${late[@]}"; fi
   fi
+  # A function's status is its LAST command, and that last `if` test is false
+  # whenever nothing is deferred - so this returned 1 on a perfectly good run,
+  # `upscale --list` exited 1 under set -e, and anything checking that exit code
+  # concluded the queue was broken.
+  return 0
 }
 
 runnable(){            # stdin: candidates -> the ones the run loop would start
@@ -507,6 +512,7 @@ runnable(){            # stdin: candidates -> the ones the run loop would start
     if [ "${fc:-0}" -ge "$MAX_FAILS" ]; then continue; fi
     printf '%s\n' "$c"
   done
+  return 0          # same trap: the loop's last test must not become the status
 }
 
 # --- one place decides what a status line looks like -------------------------
@@ -1030,7 +1036,25 @@ cmd_collect(){
       # The box is mid-episode on something else. Its work belongs to IT, not to
       # whatever this instance picked. Collect that instead of clobbering it.
       say "box is on '$remote_ep', not '$base' - switching to it"
-      rsrc=$(discover 2>/dev/null | select_todo | grep -F "$remote_ep" | head -1) || rsrc=''
+      # NO `head -1`: it closes the pipe, discover takes SIGPIPE, and pipefail
+      # then fails the whole pipeline - so the lookup came back empty and the
+      # collector waited for ever next to a finished result. Same trap as the
+      # selection path; second time in this file.
+      local _m=()
+      mapfile -t _m < <(discover 2>/dev/null | select_todo | grep -F "$remote_ep") || true
+      rsrc="${_m[0]:-}"
+      # ...but not for ever. Switching to the box's episode bypassed runnable(),
+      # which is what applies MAX_FAILS - so a permanently failing episode was
+      # re-selected every cycle and the counter climbed to 12/3 while the queue
+      # made no progress at all. Past the limit, discard the remote result and
+      # let normal selection move on.
+      local _rfails=0
+      _rfails=$(grep -cFx "$rsrc" "$FAILED" 2>/dev/null) || _rfails=0
+      if [ -n "$rsrc" ] && [ "${_rfails:-0}" -ge "$MAX_FAILS" ]; then
+        say "$remote_ep has failed ${_rfails}x - discarding its remote result and moving on"
+        rsh "rm -f $RWORK/out.mkv $RWORK/src.avi $RWORK/episode" >/dev/null 2>&1 || true
+        sleep 5; continue
+      fi
       if [ -n "$rsrc" ]; then
         src="$rsrc"; base=$(basename "${src%.*}")
         case "$src" in
@@ -1114,6 +1138,10 @@ cmd_collect(){
       col_fail "$src" "$base" "remote produced no output"; sleep 20; continue
     fi
 
+    # The first episode of a season has no destination directory yet - nothing
+    # has ever been delivered there - and rsync cannot create the parent, so the
+    # pull failed instantly and looped. Twelve times, on Season 3.
+    mkdir -p "$dest" 2>/dev/null || true
     say "pulling result"
     if ! rsync -q --partial -e "ssh -o BatchMode=yes -o ControlPath=none $GPUHOST" \
          ":$RWORK/out.mkv" "$dest/.$base.mkv.part"; then

@@ -185,6 +185,7 @@ fi
 # episodes delivered is the metric that matters most: it moves only when an
 # episode actually lands, and it is the one number the user cares about
 delivered=$(find "$LIB" -name '*.mkv' -not -name '.*' 2>/dev/null | wc -l)
+sources=$(find "$LIB" -name '*.avi' -type f 2>/dev/null | wc -l)
 
 # --- has anything moved? ------------------------------------------------------
 sample="d=$delivered | col[$col_state] $col_metric | loc[$loc_state] $loc_metric"
@@ -269,6 +270,16 @@ fi
 # Deliberately narrow. The collector restarting itself, an episode failing once,
 # a slow transfer - none of those need a person, and a banner for them teaches
 # you to ignore banners.
+# A box that has gone away when there is NOTHING LEFT TO DO is the expected end
+# of the job, not an emergency. Without this the watchdog paged "the rental needs
+# a new instance" minutes after the queue finished and the instance was correctly
+# destroyed - an urgent banner for a success.
+if [ "$col_verdict" != OK ] && [ "${sources:-0}" -gt 0 ] && [ "${sources:-0}" -eq "${delivered:-0}" ]; then
+  say_done=1
+  printf 'queue     COMPLETE - %s/%s delivered; box absence is expected\n' "$delivered" "$sources" >> "$HEALTH"
+  case "$col_verdict" in *) col_verdict=DONE ;; esac
+fi
+
 case "$col_verdict" in
   UNREACHABLE)
     notify_once "col-unreachable" "Bleach upscale: rental unreachable" \
