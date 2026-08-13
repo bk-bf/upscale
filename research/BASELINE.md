@@ -26,8 +26,29 @@ Same CPU quota, far weaker GPU, and a 2016 CPU. So the CPU:GPU balance here is t
 GPU is the slow part. That is exactly why a second regime exists (§5) — an optimisation
 tuned to this balance would be worthless, or wrong, in production.
 
-**What transfers:** structural findings and ratios. **What does not:** any absolute fps,
-and any tuned constant.
+**The deliverable of this loop is a set of percentages, not a set of fps numbers.**
+
+The baseline in §3 is measured on *this* rental, and every result is expressed as a
+percentage change against it. That percentage is the thing assumed to carry to the other
+rentals and to the desktop — a change that removes a serialisation or stops doing
+redundant work removes roughly the same *proportion* of wall clock wherever it runs, even
+though the absolute fps will be completely different on a 5070 Ti.
+
+Three qualifications on that assumption, in decreasing order of how much they matter:
+
+1. It holds for **structural** changes and not for tuned constants. Regime B (§5) exists
+   to tell those apart before a percentage is believed.
+2. The proportion shifts if a change targets a phase whose *share* of wall clock differs
+   on the target machine. Cutting extraction time by half is worth more on a box where
+   the GPU is fast and extraction dominates than on this one, where the GPU is the slow
+   part. So report which phase moved, not just the total — a reader on other hardware can
+   then re-weight it.
+3. **A percentage measured here is a prediction, not a result, until it is re-measured on
+   the machine that will actually run it.** Say so in the report; do not present a number
+   from this box as a production figure.
+
+**What transfers:** structural findings and percentage deltas, with the caveats above.
+**What does not:** any absolute fps, and any tuned constant.
 
 ## 2. Fixed constants — changing one invalidates every comparison
 

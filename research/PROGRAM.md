@@ -276,8 +276,16 @@ write `research/RESULTS.md`:
 
 - the baseline and the box it was measured on, restated so the report stands alone;
 - every trial, grouped by tier, with its gate verdict;
-- the winning configuration, its fps in **both regimes**, and the telemetry showing *why*
-  it won — which phase shrank, and what the GPU idle fraction did;
+- the winning configuration reported as a **percentage change in both regimes** — the
+  percentage is the deliverable, the fps is supporting detail. State the baseline's noise
+  floor next to it so a reader can see the gain clears it;
+- for each win, **which phase shrank** and what the GPU idle fraction did. A total is not
+  enough: a reader on a faster GPU needs to know *where* the time came from, because that
+  phase's share of wall clock is different on their machine and they can re-weight the
+  percentage themselves;
+- an explicit line that these percentages are **predictions for other hardware, not
+  production figures**, and must be re-measured on the desktop or a real rental before
+  anything is deployed on the strength of them;
 - what was tried and rejected, with numbers — a negative result with a measurement is a
   result, an unrecorded one is waste;
 - **a portability verdict for every kept change**, split into three lists: `structural`
