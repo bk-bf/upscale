@@ -43,7 +43,7 @@ hours**, interleaved with the experiments, to check the box itself was not drift
 | regime | pooled n | mean fps | spread | drift vs the opening baseline |
 |---|---|---|---|---|
 | A | 6 | 13.702 | 1.30% | +0.2% |
-| B | 4 | 9.240 | 0.37% | −0.1% |
+| B | 5 | 9.244 | 0.37% | −0.1% |
 
 The box did not drift, so every comparison below is against a stable reference rather than
 against the weather.
@@ -55,7 +55,7 @@ against the weather.
 | regime | baseline (n) | final (n) | final spread | **change** | conservative bound |
 |---|---|---|---|---|---|
 | **A** | 13.702 fps (6) | **20.577 fps** (16) | 2.87% | **+50.2%** | +46.8% |
-| **B** | 9.240 fps (4) | **11.075 fps** (9) | 0.55% | **+19.9%** | +19.3% |
+| **B** | 9.244 fps (5) | **11.074 fps** (10) | 0.55% | **+19.8%** | +19.3% |
 
 Both clear their noise floor by a wide margin. The percentage is the deliverable; the fps
 numbers are supporting detail and belong to this box alone.
@@ -98,12 +98,12 @@ was re-measured under the same conditions so each population has a control:
 |---|---|---|---|---|
 | A | quiet, `cpu_util` 20–24% | 13.702 (n=6) | 20.577 (n=16) | **+50.2%** |
 | A | contended, `cpu_util` 43–46% | 12.188 (n=6) | 18.643 (n=6) | **+53.0%** |
-| B | quiet, `cpu_util` 9–11% | 9.240 (n=4) | 11.075 (n=9) | **+19.9%** |
+| B | quiet, `cpu_util` 9–11% | 9.244 (n=5) | 11.074 (n=10) | **+19.8%** |
 | B | contended, `cpu_util` 29–34% | 8.046 (n=4) | 9.189 (n=6) | **+14.2%** |
 
 **The gain does not depend on a quiet box.** Contention cost the regime-A baseline 10.9%
 of its throughput and the optimised worker only 9.4%, so the ratio widened slightly rather
-than collapsing. Regime B moved the other way and by more, narrowing from +19.9% to
+than collapsing. Regime B moved the other way and by more, narrowing from +19.8% to
 +14.2% — nearly a third of the gain gone.
 
 Read this as a robustness check, not a precise measurement. The runs are sequential rather than
@@ -287,7 +287,7 @@ The slope was then checked at a **second CPU count**, in regime B where `CPUS=4`
 
 | save threads | 3 | **4 (= CPUS)** | 6 |
 |---|---|---|---|
-| regime B | **+2.4%** | **+19.9%** | +18.3% |
+| regime B | **+2.4%** | **+19.8%** | +18.3% |
 
 Both regimes peak exactly at `save = CPUS`, four CPUs apart. The curve is also sharply
 asymmetric: three threads instead of four cost **17 points** and left `cpu_util` at 8.5%,
@@ -426,7 +426,7 @@ hardware balances. None can change a pixel.
 
 ### Every trial, by tier
 
-101 trials. Full table with per-trial telemetry in `research/results.tsv`.
+103 trials. Full table with per-trial telemetry in `research/results.tsv`.
 
 | tier | attacked | kept | rejected on fps | rejected by the gate |
 |---|---|---|---|---|
@@ -448,13 +448,13 @@ processes start, how many times a model is loaded, how many times a byte is comp
 and how many processes are forked — none of which depend on this GPU.
 
 **Does not transfer:** every absolute fps figure, and the specific balance between the
-percentages. **+50.2% and +19.9% are predictions for other hardware, not production
+percentages. **+50.2% and +19.8% are predictions for other hardware, not production
 figures, and must be re-measured on the desktop or a real rental before anything is
 deployed on the strength of them.**
 
 The two regimes bracket the expectation rather than predicting it. Production boxes look
 more like regime B than regime A — a fast GPU outrunning the CPU that feeds it — so
-**+19.9% is the more honest expectation for `rental-B`-class hardware, and +50.2% is the
+**+19.8% is the more honest expectation for `rental-B`-class hardware, and +50.2% is the
 ceiling for a machine whose GPU is as weak as this one.** But the mechanism argues the
 other way for the largest change: a faster GPU makes the fixed 1.83 s startup and the PNG
 compression a *larger* share of the upscale phase, not a smaller one. Which effect wins is

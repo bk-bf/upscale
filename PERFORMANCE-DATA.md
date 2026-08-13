@@ -289,10 +289,10 @@ All clean measurements of each configuration, pooled across the 2026-08-13 sessi
 |---|---|---|---|---|---|---|---|
 | A | baseline (production worker shape) | 6 | 13.702 | 13.615 | 13.793 | 1.30% | TRIAL |
 | A | optimised | 16 | 20.577 | 20.243 | 20.833 | 2.87% | TRIAL |
-| B | baseline (production worker shape) | 4 | 9.240 | 9.225 | 9.259 | 0.37% | TRIAL |
-| B | optimised | 9 | 11.075 | 11.050 | 11.111 | 0.55% | TRIAL |
+| B | baseline (production worker shape) | 5 | 9.244 | 9.225 | 9.259 | 0.37% | TRIAL |
+| B | optimised | 10 | 11.074 | 11.050 | 11.111 | 0.55% | TRIAL |
 
-Change: regime A **+50.2%**, regime B **+19.9%**.
+Change: regime A **+50.2%**, regime B **+19.8%**.
 
 Under host contention, baseline and optimised measured back to back so the pair shares
 conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
@@ -301,7 +301,7 @@ conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
 |---|---|---|---|---|---|
 | A | quiet | 20–24% | 13.702 (n=6) | 20.577 (n=16) | +50.2% |
 | A | contended | 43–46% | 12.188 (n=6) | 18.643 (n=6) | +53.0% |
-| B | quiet | 9–11% | 9.240 (n=4) | 11.075 (n=9) | +19.9% |
+| B | quiet | 9–11% | 9.244 (n=5) | 11.074 (n=10) | +19.8% |
 | B | contended | 29–34% | 8.046 (n=4) | 9.189 (n=6) | +14.2% |
 
 Individual regime-A contended pairings span +48.8% to +60.1% depending on which runs are
@@ -367,7 +367,7 @@ measurable effect. Percentages are against that regime's baseline. TRIAL.
 | A | 9 | 12 | 19.550 | −6.1 pt vs peak |
 | A | 9 | 16 | 16.892 | −9.1 pt vs peak |
 | B | 4 | 3 | 9.474 | +2.4% |
-| B | 4 | **4** | 11.075 | +19.9% |
+| B | 4 | **4** | 11.074 | +19.8% |
 | B | 4 | 6 | 10.941 | −1.3 pt vs peak |
 
 Rows at differing base commits are marked in `research/results.tsv`; the A rows at
