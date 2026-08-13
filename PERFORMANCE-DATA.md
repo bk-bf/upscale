@@ -287,19 +287,19 @@ All clean measurements of each configuration, pooled across the 2026-08-13 sessi
 
 | regime | config | n | mean fps | min | max | spread | provenance |
 |---|---|---|---|---|---|---|---|
-| A | baseline (production worker shape) | 5 | 13.684 | 13.615 | 13.717 | 0.75% | TRIAL |
-| A | optimised | 14 | 20.586 | 20.243 | 20.833 | 2.87% | TRIAL |
+| A | baseline (production worker shape) | 6 | 13.702 | 13.615 | 13.793 | 1.30% | TRIAL |
+| A | optimised | 16 | 20.577 | 20.243 | 20.833 | 2.87% | TRIAL |
 | B | baseline (production worker shape) | 4 | 9.240 | 9.225 | 9.259 | 0.37% | TRIAL |
 | B | optimised | 9 | 11.075 | 11.050 | 11.111 | 0.55% | TRIAL |
 
-Change: regime A **+50.4%**, regime B **+19.9%**.
+Change: regime A **+50.2%**, regime B **+19.9%**.
 
 Under host contention, baseline and optimised measured back to back so the pair shares
 conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
 
 | regime | condition | cpu_util_mean | baseline fps | optimised fps | change |
 |---|---|---|---|---|---|
-| A | quiet | 20–24% | 13.684 (n=5) | 20.586 (n=14) | +50.4% |
+| A | quiet | 20–24% | 13.702 (n=6) | 20.577 (n=16) | +50.2% |
 | A | contended | 43–46% | 12.188 (n=6) | 18.643 (n=6) | +53.0% |
 | B | quiet | 9–11% | 9.240 (n=4) | 11.075 (n=9) | +19.9% |
 | B | contended | 29–34% | 8.046 (n=4) | 9.189 (n=6) | +14.2% |
@@ -307,7 +307,7 @@ conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
 Individual regime-A contended pairings span +48.8% to +60.1% depending on which runs are
 matched; runs are sequential, not simultaneous. The contended regime-A baseline is
 bimodal — 12.837/12.821 and 11.474/11.455 — at cpu_util 43.0–43.5 throughout. TRIAL.
-Worst optimised run against best baseline run: A **+47.6%**, B **+19.3%**.
+Worst optimised run against best baseline run: A **+46.8%**, B **+19.3%**.
 
 Scaling probe at 4000 frames, regime A, both configs at the same frame count (outside the
 gate by design — G1 hashes a 2000-frame set): baseline 13.774 fps, optimised 20.833 fps,
@@ -383,7 +383,7 @@ CPUs. TRIAL.
 ## 19a. Leave-one-out ablation of the final configuration, `rental-C` regime A
 
 Each row removes one change from the finished configuration; all other changes stay in.
-Final configuration mean for comparison: 20.586 fps (n=14). TRIAL.
+Final configuration mean for comparison: 20.577 fps (n=16). TRIAL.
 
 | change removed | fps | delta attributable to that change |
 |---|---|---|

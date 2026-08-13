@@ -1,13 +1,13 @@
 # RESULTS.md — overnight optimisation loop, 2026-08-13
 
-**Headline: +50.4% in regime A, +19.9% in regime B, every pixel bit-identical to the
+**Headline: +50.2% in regime A, +19.9% in regime B, every pixel bit-identical to the
 baseline.** Five changes kept, all of them removing work rather than rearranging it —
 and, at double the frame count, the gain holds at +51.2%.
 
 Both figures are pooled over every clean measurement taken across the night (regime A:
-n=14 optimised against n=5 baseline; regime B: n=9 against n=4), not over one favourable
+n=16 optimised against n=6 baseline; regime B: n=9 against n=4), not over one favourable
 run of three. The conservative bound — *worst* optimised run against *best* baseline run —
-is **+47.6%** and **+19.3%**. It survives double the frame count (+51.2%) and a badly
+is **+46.8%** and **+19.3%**. It survives double the frame count (+51.2%) and a badly
 contended host (+53.0% / +14.2%).
 
 ---
@@ -42,7 +42,7 @@ hours**, interleaved with the experiments, to check the box itself was not drift
 
 | regime | pooled n | mean fps | spread | drift vs the opening baseline |
 |---|---|---|---|---|
-| A | 5 | 13.684 | 0.75% | +0.1% |
+| A | 6 | 13.702 | 1.30% | +0.2% |
 | B | 4 | 9.240 | 0.37% | −0.1% |
 
 The box did not drift, so every comparison below is against a stable reference rather than
@@ -54,7 +54,7 @@ against the weather.
 
 | regime | baseline (n) | final (n) | final spread | **change** | conservative bound |
 |---|---|---|---|---|---|
-| **A** | 13.684 fps (5) | **20.586 fps** (14) | 2.87% | **+50.4%** | +47.6% |
+| **A** | 13.702 fps (6) | **20.577 fps** (16) | 2.87% | **+50.2%** | +46.8% |
 | **B** | 9.240 fps (4) | **11.075 fps** (9) | 0.55% | **+19.9%** | +19.3% |
 
 Both clear their noise floor by a wide margin. The percentage is the deliverable; the fps
@@ -78,7 +78,7 @@ whole result was re-measured at **4000 frames**, baseline against optimised:
 
 | frames | baseline | optimised | change |
 |---|---|---|---|
-| 2000 | 13.684 fps | 20.586 fps | **+50.4%** |
+| 2000 | 13.702 fps | 20.577 fps | **+50.2%** |
 | 4000 | 13.774 fps | 20.833 fps | **+51.2%** |
 
 The gain does not shrink when the work doubles. Startup amortisation was the smaller part
@@ -96,7 +96,7 @@ was re-measured under the same conditions so each population has a control:
 
 | regime | condition | baseline | optimised | change |
 |---|---|---|---|---|
-| A | quiet, `cpu_util` 20–24% | 13.684 (n=5) | 20.586 (n=14) | **+50.4%** |
+| A | quiet, `cpu_util` 20–24% | 13.702 (n=6) | 20.577 (n=16) | **+50.2%** |
 | A | contended, `cpu_util` 43–46% | 12.188 (n=6) | 18.643 (n=6) | **+53.0%** |
 | B | quiet, `cpu_util` 9–11% | 9.240 (n=4) | 11.075 (n=9) | **+19.9%** |
 | B | contended, `cpu_util` 29–34% | 8.046 (n=4) | 9.189 (n=6) | **+14.2%** |
@@ -426,7 +426,7 @@ hardware balances. None can change a pixel.
 
 ### Every trial, by tier
 
-96 trials. Full table with per-trial telemetry in `research/results.tsv`.
+101 trials. Full table with per-trial telemetry in `research/results.tsv`.
 
 | tier | attacked | kept | rejected on fps | rejected by the gate |
 |---|---|---|---|---|
@@ -448,13 +448,13 @@ processes start, how many times a model is loaded, how many times a byte is comp
 and how many processes are forked — none of which depend on this GPU.
 
 **Does not transfer:** every absolute fps figure, and the specific balance between the
-percentages. **+50.4% and +19.9% are predictions for other hardware, not production
+percentages. **+50.2% and +19.9% are predictions for other hardware, not production
 figures, and must be re-measured on the desktop or a real rental before anything is
 deployed on the strength of them.**
 
 The two regimes bracket the expectation rather than predicting it. Production boxes look
 more like regime B than regime A — a fast GPU outrunning the CPU that feeds it — so
-**+19.9% is the more honest expectation for `rental-B`-class hardware, and +50.4% is the
+**+19.9% is the more honest expectation for `rental-B`-class hardware, and +50.2% is the
 ceiling for a machine whose GPU is as weak as this one.** But the mechanism argues the
 other way for the largest change: a faster GPU makes the fixed 1.83 s startup and the PNG
 compression a *larger* share of the upscale phase, not a smaller one. Which effect wins is
@@ -466,7 +466,7 @@ not knowable from this box, and this report does not claim to know it.
 
 - The regime-A optimised figure pools nine runs spanning four hours precisely because its
   spread is wide (2.35%); reporting any single three-run window would have been able to
-  produce anything from +47.6% to +51.6%. The pooled +50.4% is the defensible number.
+  produce anything from +47.6% to +51.6%. The pooled +50.2% is the defensible number.
 - Every figure is 2000 frames of **one** source file. Content affects PNG size and encode
   cost, and no second source was tried.
 - The baseline is n=3 (A) and n=2 (B); the final config is n=3 in both. Everything between
