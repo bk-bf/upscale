@@ -136,8 +136,20 @@ the kind of number PROGRAM warns about. Swept in regime A:
 | result | **−7.9%** | +32.6% | **peak** | −6.1% vs peak | −9.1% vs peak |
 
 Four save threads left the quota idle (`cpu_util` 13.8% vs 22.1% at the peak); sixteen
-gave the gain back to oversubscription. Load threads were swept too and **do not matter** —
-`2:4:8` and `4:8:8` are indistinguishable.
+gave the gain back to oversubscription. Load threads were swept twice and **do not
+matter** — `2:4:8` and `4:8:8` are indistinguishable, and `CPUS/4` re-tested against the
+final tree came back flat.
+
+The slope was then checked at a **second CPU count**, in regime B where `CPUS=4`:
+
+| save threads | 3 | **4 (= CPUS)** | 6 |
+|---|---|---|---|
+| regime B | **+2.4%** | **+19.6%** | +18.3% |
+
+Both regimes peak exactly at `save = CPUS`, four CPUs apart. The curve is also sharply
+asymmetric: three threads instead of four cost **17 points** and left `cpu_util` at 8.5%,
+while two threads *too many* cost 1.3. **Round the rule up, never down** — an idle quota is
+far more expensive than an oversubscribed one.
 
 So the thing that tracks the hardware is the **save** count, at roughly one per usable CPU:
 
@@ -162,6 +174,7 @@ Negative results, all gate-PASS unless stated. Six of nine rejections are the sa
 
 | idea | A | B | verdict |
 |---|---|---|---|
+| **`-t 640` — one tile per frame instead of ~12** | **+58.1%** | not spent | **GATE FAIL — pixels differ** |
 | overlap extraction with the first chunk's upscale | +0.9% | +0.2% | **discard** — inside the noise floor in both |
 | parallel tail encode, `PARTS = max(2, CPUS/ENC_THREADS)` | +0.0% | not spent | **discard** — flat |
 | `CHUNK=250` encoder blocks | −1.5% | not spent | **discard** |
@@ -171,7 +184,23 @@ Negative results, all gate-PASS unless stated. Six of nine rejections are the sa
 | `-j` save threads = 12 | −6.1% | not spent | discard (sweep point) |
 | `-j` save threads = 16 | −9.1% | not spent | discard (sweep point) |
 | `-j` save threads = 4 | −7.9% | not spent | discard (sweep point) |
+| encode direct from `$UP`, no per-block staging dir | +0.0% | not spent | discard — flat, and +3 net lines |
 | tmpfs mounted over `$WORK` | n/a | n/a | **impossible** — `mount` rc=32, no `CAP_SYS_ADMIN` in this container |
+
+### The gate earned its keep
+
+The upscaler's tile size is set by a VRAM heuristic; on a 6 GB card with a 640×480 source
+it picks roughly a dozen padded tiles per frame. Forcing a single tile ran at **+58.1%** —
+comfortably the largest number of the night, 7 points clear of everything kept.
+
+It failed G1. The decoded frames differ from the baseline, so tile size is a **quality**
+parameter wearing a performance parameter's clothes, and the trial was discarded without
+its fps being weighed against anything. An fps-maximising loop without a pixel gate would
+have shipped it, reported +58%, and quietly changed the output of every episode.
+
+Worth recording against `PERFORMANCE-DATA.md` §13, which lists "tile size tuning — no
+measurable change at any setting" from the RTX 5070 Ti and RX 5700 XT. Both stand: the
+machines and VRAM budgets differ, so they pick different tile counts.
 
 ### The finding hiding in the rejections
 
@@ -275,5 +304,8 @@ not knowable from this box, and this report does not claim to know it.
   peak shorter than the sample interval.
 - GPU idle is the share of samples reading exactly 0% utilisation, not integrated idle time.
 - No power draw was measured.
-- The `-j` sweep points at save = 4, 12 and 16 were run in regime A only. Their regime-B
-  behaviour is inferred from the rule's win, not measured directly.
+- The `-j` sweep points at save = 12 and 16 were run in regime A only; save = 3, 4 and 6
+  were measured directly in regime B, so the rule's slope is confirmed at two CPU counts
+  rather than extrapolated from one.
+- The regime-A sweep points at save = 4 and save = 8 were taken at earlier base commits
+  than save = 9, 12 and 16, so they are comparable in shape but not to the decimal.
