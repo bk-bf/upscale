@@ -288,11 +288,21 @@ All clean measurements of each configuration, pooled across the 2026-08-13 sessi
 | regime | config | n | mean fps | min | max | spread | provenance |
 |---|---|---|---|---|---|---|---|
 | A | baseline (production worker shape) | 5 | 13.684 | 13.615 | 13.717 | 0.75% | TRIAL |
-| A | optimised | 9 | 20.528 | 20.243 | 20.725 | 2.35% | TRIAL |
+| A | optimised | 14 | 20.586 | 20.243 | 20.833 | 2.87% | TRIAL |
 | B | baseline (production worker shape) | 4 | 9.240 | 9.225 | 9.259 | 0.37% | TRIAL |
-| B | optimised | 6 | 11.077 | 11.050 | 11.105 | 0.50% | TRIAL |
+| B | optimised | 9 | 11.075 | 11.050 | 11.111 | 0.55% | TRIAL |
 
-Change: regime A **+50.0%**, regime B **+19.9%**.
+Change: regime A **+50.4%**, regime B **+19.9%**.
+
+Under host contention, baseline and optimised measured back to back so the pair shares
+conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
+
+| regime | condition | cpu_util_mean | baseline fps | optimised fps | change |
+|---|---|---|---|---|---|
+| A | quiet | 20–24% | 13.684 | 20.586 | +50.4% |
+| A | contended | 43–45% | 12.837 | 19.102 | +48.8% |
+| B | quiet | 9–11% | 9.240 | 11.075 | +19.9% |
+| B | contended | 33% | 7.868 | 9.196 | +16.9% |
 Worst optimised run against best baseline run: A **+47.6%**, B **+19.3%**.
 
 Scaling probe at 4000 frames, regime A, both configs at the same frame count (outside the

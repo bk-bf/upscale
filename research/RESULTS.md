@@ -1,13 +1,14 @@
 # RESULTS.md — overnight optimisation loop, 2026-08-13
 
-**Headline: +50.0% in regime A, +19.9% in regime B, every pixel bit-identical to the
+**Headline: +50.4% in regime A, +19.9% in regime B, every pixel bit-identical to the
 baseline.** Five changes kept, all of them removing work rather than rearranging it —
 and, at double the frame count, the gain holds at +51.2%.
 
 Both figures are pooled over every clean measurement taken across the night (regime A:
-n=9 optimised against n=5 baseline; regime B: n=6 against n=4), not over one favourable
+n=14 optimised against n=5 baseline; regime B: n=9 against n=4), not over one favourable
 run of three. The conservative bound — *worst* optimised run against *best* baseline run —
-is **+47.6%** and **+19.3%**.
+is **+47.6%** and **+19.3%**. It survives double the frame count (+51.2%) and a badly
+contended host (+48.8% / +16.9%).
 
 ---
 
@@ -53,8 +54,8 @@ against the weather.
 
 | regime | baseline (n) | final (n) | final spread | **change** | conservative bound |
 |---|---|---|---|---|---|
-| **A** | 13.684 fps (5) | **20.528 fps** (9) | 2.35% | **+50.0%** | +47.6% |
-| **B** | 9.240 fps (4) | **11.077 fps** (6) | 0.50% | **+19.9%** | +19.3% |
+| **A** | 13.684 fps (5) | **20.586 fps** (14) | 2.87% | **+50.4%** | +47.6% |
+| **B** | 9.240 fps (4) | **11.075 fps** (9) | 0.55% | **+19.9%** | +19.3% |
 
 Both clear their noise floor by a wide margin. The percentage is the deliverable; the fps
 numbers are supporting detail and belong to this box alone.
@@ -85,6 +86,26 @@ of it; the PNG compression, the fork removal and the single-process change all s
 frame count. (These two rows sit **outside the gate by design** — G1 compares a hash of
 2000 frames and cannot match a 4000-frame run — so their control is each other, at
 identical frame counts, not the gate.)
+
+### Does it survive a noisy neighbour?
+
+Two thirds of the way through the night the host acquired other tenants —
+`cpu_util_mean`, which counts all 40 host cores rather than this container's 9.6-CPU
+quota, went from ~10% to 33%, and later 45%. Rather than discard those runs, the baseline
+was re-measured **back to back with the optimised worker** in both regimes, so the pair
+shares its weather:
+
+| regime | condition | baseline | optimised | change |
+|---|---|---|---|---|
+| A | quiet | 13.684 (n=5) | 20.586 (n=14) | **+50.4%** |
+| A | contended, `cpu_util` 43–45% | 12.837 | 19.102 | **+48.8%** |
+| B | quiet | 9.240 (n=4) | 11.075 (n=9) | **+19.9%** |
+| B | contended, `cpu_util` 33% | 7.868 | 9.196 (n=2) | **+16.9%** |
+
+Contention costs the baseline 6–15% of its throughput and takes 1.6 points off the regime-A
+gain and 3.0 off regime B. The ratio is not fragile, but it is not free either: the
+optimised worker converts spare quota into throughput, so it has more to lose when the
+quota stops being spare. **On a shared rental, expect the lower figure.**
 
 ### Where the time came from
 
