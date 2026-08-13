@@ -250,3 +250,127 @@ Recorded as observations, not judgements.
 - No per-phase GPU utilisation breakdown exists for `rental-B`; only the whole-run
   snapshots in §8.
 - `rental-A` has no throughput figures; it was decommissioned before the main run.
+- §15–§19 come from a different box (`rental-C`) and a different source file than §1–§14,
+  and are 2000-frame trials rather than whole episodes. They are not comparable to the
+  Bleach-run figures in absolute terms; only the ratios within §16 and §18 are.
+- §16 intermediate steps between baseline and optimised are n=1 per regime; only the
+  baseline and final rows are repeated. `research/results.tsv` marks three trials that ran
+  against a tree still carrying a previously discarded commit.
+- §18 A rows at save=4 and save=8 were taken at earlier base commits than save=9/12/16.
+
+---
+
+## 15. Research box `rental-C` — optimisation loop, 2026-08-13
+
+All rows in §15–§19 come from the overnight optimisation loop
+(`research/PROGRAM.md`), a separate exercise from the Bleach run above. New
+provenance code:
+
+- `TRIAL` — one run of `research/harness/trial.sh`: fixed 2000-frame slice of a pinned
+  source, one variable changed, three pass/fail quality gates evaluated before the fps is
+  recorded. Full per-trial table in `research/results.tsv`.
+
+| id | role | GPU | CPU | RAM | disk (work) | provenance |
+|---|---|---|---|---|---|---|
+| `rental-C` | optimisation-loop box only; never ran production work | 1× NVIDIA GTX 1660 SUPER, 6 GB | `nproc`=40, **cgroup quota 9.6 CPU** (`cpu.max 960000 100000`) | 62.7 GB | 32 GB total, overlay, 27 GB free | OBS/CFG |
+
+Notes recorded as fact, not inference:
+- `rental-C` is a container **without `CAP_SYS_ADMIN`**: `mount(8)` returns rc=32. A tmpfs
+  cannot be mounted over the work directory. `/dev/shm` exists, 7168 MB. OBS.
+- Regime `A` = the whole box. Regime `B` = the same box under `taskset -c 0-3`. CFG.
+- Source for all trials: 640×480 mpeg4, 2000 frames, `animejanai-suc` ×2, x264 CRF 18
+  preset veryfast, `-threads 4`, yuv420p. CFG.
+
+## 16. Optimisation-loop baseline and result, `rental-C`
+
+| regime | config | n | mean fps | min | max | spread | provenance |
+|---|---|---|---|---|---|---|---|
+| A | baseline (production worker shape) | 3 | 13.674 | 13.615 | 13.717 | 0.70% | TRIAL |
+| A | optimised | 3 | 20.626 | 20.555 | 20.725 | 0.82% | TRIAL |
+| B | baseline (production worker shape) | 2 | 9.251 | 9.242 | 9.259 | 0.20% | TRIAL |
+| B | optimised | 3 | 11.066 | 11.050 | 11.080 | 0.27% | TRIAL |
+
+Change: regime A **+50.8%**, regime B **+19.6%**.
+
+Control: the unmodified baseline worker was re-run after 4 h of trials and returned
+13.689 fps in regime A, +0.1% against its own 3-run mean. TRIAL.
+
+Quality gates across all 30 trials: decoded-frame hash `76ca8f60…` and x264 option-line
+hash `623c768d…` identical in every trial that passed, including every kept change. TRIAL.
+
+## 17. Phase costs, `rental-C`, baseline vs optimised
+
+Wall-clock seconds per 2000-frame trial, from the worker's own phase log. TRIAL.
+
+| regime | phase | baseline | optimised |
+|---|---|---|---|
+| A | extract (decode + write 2000 PNGs) | 10 | 3 |
+| A | upscale, incl. per-chunk startup and inter-chunk barriers | 128 | 86 |
+| A | tail encode (final block) | 8 | 7 |
+| A | concat | 0 | 0 |
+| A | **total** | **146** | **97** |
+| B | extract | 15 | 3 |
+| B | upscale + barriers | 190 | 168 |
+| B | tail encode | 10 | 10 |
+| B | **total** | **216** | **181** |
+
+GPU idle (share of 2 s telemetry samples reading 0% GPU utilisation):
+
+| regime | baseline | optimised |
+|---|---|---|
+| A | 31.3% (35.8% on the end-of-night repeat) | 10.9–13.0% |
+| B | 20.4% | 6.9% |
+
+`cpu_util_mean` during optimised regime-A trials: 22.4% of 40 processors = 8.96 of the
+9.6-CPU quota. GPU utilisation mean over the same trials: 31.5%. TRIAL.
+
+Fixed startup cost of one `realesrgan-ncnn-vulkan` invocation, measured directly by
+timing 1, 20 and 100 frames through it on an idle box: **1.83 s**, plus 0.044 s/frame at
+`-j 4:8:8`. BENCH.
+
+## 18. `-j load:proc:save` sweep, `rental-C`
+
+`save` is the thread count that tracks the hardware; `load` was swept and showed no
+measurable effect. Percentages are against that regime's baseline. TRIAL.
+
+| regime | usable CPUs | save threads | fps | vs regime baseline |
+|---|---|---|---|---|
+| A | 9 | 4 | 12.587 | −7.9% |
+| A | 9 | 8 | 18.132 | +32.6% |
+| A | 9 | **9** | 18.332 | +34.1% |
+| A | 9 | 12 | 19.550 | −6.1 pt vs peak |
+| A | 9 | 16 | 16.892 | −9.1 pt vs peak |
+| B | 4 | 3 | 9.474 | +2.4% |
+| B | 4 | **4** | 11.066 | +19.6% |
+| B | 4 | 6 | 10.941 | −1.3 pt vs peak |
+
+Rows at differing base commits are marked in `research/results.tsv`; the A rows at
+save=8/9/12/16 and the B rows are each internally comparable.
+
+Usable CPUs measured as `min(nproc, cgroup cpu quota)`: 9 in regime A (nproc 40, quota
+9.6), 4 in regime B (`taskset -c 0-3`). CFG.
+
+Hardcoded `-j 4:8:8`, the regime-A optimum, measured in regime B: 10.204 fps (+10.3%),
+against 10.428 fps (+12.7%) for the same code with the thread mix derived from usable
+CPUs. TRIAL.
+
+## 19. Rejected configurations from the optimisation loop — measured reasons
+
+Recorded as observations, not judgements. All regime A unless stated. TRIAL.
+
+| configuration | measurement |
+|---|---|
+| `-t 640` (one tile per frame instead of the VRAM auto-heuristic's ~12) | **+58.1% fps, FAILED the pixel gate** — decoded frames differ from baseline |
+| background extraction overlapped with first chunk | +0.9% A, +0.2% B — inside both noise floors |
+| parallel tail encode, 2 concurrent x264 | +0.0% |
+| encoder block size 250 instead of 500 | −1.5% |
+| final block capped at CHUNK/4 | −1.2% |
+| final block sized to the handoff slack | +0.2% |
+| 1× frames staged in `/dev/shm` | +1.6% A, **+0.0% B** |
+| tmpfs mounted over the work directory | not possible; `mount` rc=32, no `CAP_SYS_ADMIN` |
+| encode direct from the upscaler output dir, no per-block staging | +0.0%, ~4000 fewer filesystem ops per trial |
+
+Contradiction with §13 recorded rather than resolved: §13 lists "tile size tuning — no
+measurable change at any setting" (RTX 5070 Ti / RX 5700 XT). On `rental-C` (GTX 1660
+SUPER, 6 GB) forcing a single tile changed throughput by +58.1% **and changed the output
+pixels**. Both measurements stand; the machines and VRAM budgets differ.
