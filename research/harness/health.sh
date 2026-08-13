@@ -41,6 +41,21 @@ fi
 
 LEFT=$("$R/harness/guard.sh" 2>/dev/null) || LEFT="unknown"
 
+# ---------------------------------------------------------------- supervised?
+# Progress alone is too slow a signal for THIS failure. When the session died at
+# 00:48 the trial files were still minutes old, so a progress-only check called
+# it healthy for another twenty-five minutes while nothing at all was running.
+# The supervisor is what makes a dead session self-healing, so its absence is
+# the thing that turns a normal session ending into an outage.
+SUP=$(systemctl --user is-active upscale-research-supervisor.service 2>/dev/null) || SUP=unknown
+if [ "$SUP" != active ]; then
+  echo "DIED: the supervisor is '$SUP', so nothing is chaining sessions, and $LEFT"
+  echo "trials logged so far: $(( $(wc -l < "$R/results.tsv" 2>/dev/null || echo 1) - 1 ))"
+  echo "A session ending is normal — mon caps every session's wall clock. The"
+  echo "supervisor starting the next one is what makes that survivable."
+  exit 1
+fi
+
 # ---------------------------------------------------------------- progressing?
 # Newest of: any trial output, the results log, the baseline. mapfile rather
 # than `head -1` on a live pipeline, which SIGPIPEs the producer.

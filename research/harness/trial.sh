@@ -27,6 +27,17 @@ SSH="ssh $CM $BOX_SSH"
 mkdir -p "$R/runs"
 LOG="$R/runs/$TAG.$REGIME.txt"
 
+# One GPU, so one trial. This is a correctness lock, not a convenience: the
+# night runs as a chain of sessions and mon cuts each one off at a fixed wall
+# clock, so a session can be killed with a trial still running on the box while
+# the next session starts. Two trials sharing the card would not fail — they
+# would quietly produce two wrong fps numbers, which is worse.
+exec 9>"$R/runs/.trial.lock"
+if ! flock -w "${LOCK_WAIT:-1800}" 9; then
+  echo "tag=$TAG regime=$REGIME gate=FAIL(another-trial-holds-the-gpu)"
+  exit 1
+fi
+
 # Push the two files that can change. Everything else on the box is fixed.
 scp -q $CM -P "${BOX_PORT}" "$R/worker.sh" "$R/harness/trial-run.sh" \
     "${BOX_USER}@${BOX_HOST}:/root/research/" || { echo "tag=$TAG gate=FAIL(push)"; exit 1; }
