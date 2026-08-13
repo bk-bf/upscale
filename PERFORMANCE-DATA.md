@@ -288,7 +288,7 @@ All clean measurements of each configuration, pooled across the 2026-08-13 sessi
 | regime | config | n | mean fps | min | max | spread | provenance |
 |---|---|---|---|---|---|---|---|
 | A | baseline (production worker shape) | 6 | 13.702 | 13.615 | 13.793 | 1.30% | TRIAL |
-| A | optimised | 16 | 20.577 | 20.243 | 20.833 | 2.87% | TRIAL |
+| A | optimised | 18 | 20.574 | 20.243 | 20.833 | 2.87% | TRIAL |
 | B | baseline (production worker shape) | 5 | 9.244 | 9.225 | 9.259 | 0.37% | TRIAL |
 | B | optimised | 10 | 11.074 | 11.050 | 11.111 | 0.55% | TRIAL |
 
@@ -299,7 +299,7 @@ conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
 
 | regime | condition | cpu_util_mean | baseline fps | optimised fps | change |
 |---|---|---|---|---|---|
-| A | quiet | 20–24% | 13.702 (n=6) | 20.577 (n=16) | +50.2% |
+| A | quiet | 20–24% | 13.702 (n=6) | 20.574 (n=18) | +50.2% |
 | A | contended | 43–46% | 12.188 (n=6) | 18.643 (n=6) | +53.0% |
 | B | quiet | 9–11% | 9.244 (n=5) | 11.074 (n=10) | +19.8% |
 | B | contended | 29–34% | 8.046 (n=4) | 9.189 (n=6) | +14.2% |
@@ -383,7 +383,7 @@ CPUs. TRIAL.
 ## 19a. Leave-one-out ablation of the final configuration, `rental-C` regime A
 
 Each row removes one change from the finished configuration; all other changes stay in.
-Final configuration mean for comparison: 20.577 fps (n=16). TRIAL.
+Final configuration mean for comparison: 20.574 fps (n=18). TRIAL.
 
 | change removed | fps | delta attributable to that change |
 |---|---|---|

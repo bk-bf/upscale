@@ -5,7 +5,7 @@ baseline.** Five changes kept, all of them removing work rather than rearranging
 and, at double the frame count, the gain holds at +51.2%.
 
 Both figures are pooled over every clean measurement taken across the night (regime A:
-n=16 optimised against n=6 baseline; regime B: n=9 against n=4), not over one favourable
+n=18 optimised against n=6 baseline; regime B: n=9 against n=4), not over one favourable
 run of three. The conservative bound — *worst* optimised run against *best* baseline run —
 is **+46.8%** and **+19.3%**. It survives double the frame count (+51.2%) and a badly
 contended host (+53.0% / +14.2%).
@@ -54,7 +54,7 @@ against the weather.
 
 | regime | baseline (n) | final (n) | final spread | **change** | conservative bound |
 |---|---|---|---|---|---|
-| **A** | 13.702 fps (6) | **20.577 fps** (16) | 2.87% | **+50.2%** | +46.8% |
+| **A** | 13.702 fps (6) | **20.574 fps** (18) | 2.87% | **+50.2%** | +46.8% |
 | **B** | 9.244 fps (5) | **11.074 fps** (10) | 0.55% | **+19.8%** | +19.3% |
 
 Both clear their noise floor by a wide margin. The percentage is the deliverable; the fps
@@ -78,7 +78,7 @@ whole result was re-measured at **4000 frames**, baseline against optimised:
 
 | frames | baseline | optimised | change |
 |---|---|---|---|
-| 2000 | 13.702 fps | 20.577 fps | **+50.2%** |
+| 2000 | 13.702 fps | 20.574 fps | **+50.2%** |
 | 4000 | 13.774 fps | 20.833 fps | **+51.2%** |
 
 The gain does not shrink when the work doubles. Startup amortisation was the smaller part
@@ -96,7 +96,7 @@ was re-measured under the same conditions so each population has a control:
 
 | regime | condition | baseline | optimised | change |
 |---|---|---|---|---|
-| A | quiet, `cpu_util` 20–24% | 13.702 (n=6) | 20.577 (n=16) | **+50.2%** |
+| A | quiet, `cpu_util` 20–24% | 13.702 (n=6) | 20.574 (n=18) | **+50.2%** |
 | A | contended, `cpu_util` 43–46% | 12.188 (n=6) | 18.643 (n=6) | **+53.0%** |
 | B | quiet, `cpu_util` 9–11% | 9.244 (n=5) | 11.074 (n=10) | **+19.8%** |
 | B | contended, `cpu_util` 29–34% | 8.046 (n=4) | 9.189 (n=6) | **+14.2%** |
@@ -426,7 +426,7 @@ hardware balances. None can change a pixel.
 
 ### Every trial, by tier
 
-103 trials. Full table with per-trial telemetry in `research/results.tsv`.
+105 trials. Full table with per-trial telemetry in `research/results.tsv`.
 
 | tier | attacked | kept | rejected on fps | rejected by the gate |
 |---|---|---|---|---|
