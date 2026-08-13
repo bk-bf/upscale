@@ -147,8 +147,10 @@ is a *larger* fraction of the whole, not a smaller one.
 
 ## 3. What was kept
 
-Four changes, in the order they landed. Percentages are cumulative against the baseline,
-so each row's own contribution is its delta from the row above.
+Seven rows in the order they landed: five that moved the number, one simplification, one
+correctness fix. Percentages are **cumulative** against the baseline, so a row's own
+contribution is its delta from the row above — and because they are cumulative they are
+order-dependent. The leave-one-out ablation below is the honest per-change accounting.
 
 | # | change | A | B | class |
 |---|---|---|---|---|
@@ -158,13 +160,15 @@ so each row's own contribution is its delta from the row above.
 | 3b | `-j` derived from the machine, not hardcoded | +34.1% | +12.7% | **autotuned** |
 | 4 | extraction `-compression_level 0` (store, don't deflate) | +42.4% | +18.2% | structural |
 | 5 | one upscaler invocation per trial, not per chunk | +50.3% | +19.6% | structural |
-| 6 | drop the dead frame list (`find \| sort` over 2000 files, unread) | +50.8%* | +19.6% | simplicity |
+| 6 | drop the dead frame list (`find \| sort` over 2000 files, unread) | neutral* | neutral* | simplicity |
 | 7 | prove a block landed instead of inferring it from a count | neutral | neutral | **correctness** |
 
-\* Change 6 is a no-op for throughput and was kept on PROGRAM's simplicity tiebreaker —
-equal fps from less code. Two regime-A repeats averaged 20.598 against the keeper's
-20.626, and regime B returned 11.062 against 11.066. **The n=3 headline repeats in §2 were
-taken at the commit before it**, so the measured result does not depend on it.
+\* Changes 6 and 7 are no-ops for throughput. 6 was kept on PROGRAM's simplicity
+tiebreaker — equal fps from less code — after two regime-A repeats averaged 20.598 against
+20.626 and regime B returned 11.062 against 11.066. 7 was kept because it is a correctness
+fix, and measured 20.833 (A) and 11.050 (B), both inside the pooled range. The §2 figures
+pool runs from before and after both, which is only legitimate *because* they are no-ops;
+the two populations are statistically indistinguishable.
 
 **1 and 4 — stop compressing frames nobody keeps.** The 1x frames are written once by
 ffmpeg, read once by the upscaler, and deleted. ffmpeg's PNG encoder defaults to a slow
