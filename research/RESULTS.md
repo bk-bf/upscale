@@ -1,7 +1,8 @@
 # RESULTS.md — overnight optimisation loop, 2026-08-13
 
 **Headline: +50.8% in regime A, +19.6% in regime B, every pixel bit-identical to the
-baseline.** Four changes kept, all of them removing work rather than rearranging it.
+baseline.** Five changes kept, all of them removing work rather than rearranging it —
+and, at double the frame count, the gain holds at +51.2%.
 
 ---
 
@@ -44,6 +45,23 @@ a stable reference rather than against the weather.
 
 Both clear their noise floor by roughly seventy-fold. The percentage is the deliverable;
 the fps numbers are supporting detail and belong to this box alone.
+
+### Does it survive more work?
+
+The single largest saving is a fixed cost — 1.83 s of startup, paid four times instead of
+once — and a fixed cost is a bigger share of a short trial than of a real episode. So the
+whole result was re-measured at **4000 frames**, baseline against optimised:
+
+| frames | baseline | optimised | change |
+|---|---|---|---|
+| 2000 | 13.674 fps | 20.626 fps | **+50.8%** |
+| 4000 | 13.774 fps | 20.833 fps | **+51.2%** |
+
+The gain does not shrink when the work doubles. Startup amortisation was the smaller part
+of it; the PNG compression, the fork removal and the single-process change all scale with
+frame count. (These two rows sit **outside the gate by design** — G1 compares a hash of
+2000 frames and cannot match a 4000-frame run — so their control is each other, at
+identical frame counts, not the gate.)
 
 ### Where the time came from
 
@@ -91,6 +109,12 @@ so each row's own contribution is its delta from the row above.
 | 3b | `-j` derived from the machine, not hardcoded | +34.1% | +12.7% | **autotuned** |
 | 4 | extraction `-compression_level 0` (store, don't deflate) | +42.4% | +18.2% | structural |
 | 5 | one upscaler invocation per trial, not per chunk | +50.3% | +19.6% | structural |
+| 6 | drop the dead frame list (`find \| sort` over 2000 files, unread) | +50.8%* | +19.6% | simplicity |
+
+\* Change 6 is a no-op for throughput and was kept on PROGRAM's simplicity tiebreaker —
+equal fps from less code. Two regime-A repeats averaged 20.598 against the keeper's
+20.626, and regime B returned 11.062 against 11.066. **The n=3 headline repeats in §2 were
+taken at the commit before it**, so the measured result does not depend on it.
 
 **1 and 4 — stop compressing frames nobody keeps.** The 1x frames are written once by
 ffmpeg, read once by the upscaler, and deleted. ffmpeg's PNG encoder defaults to a slow
@@ -185,6 +209,10 @@ Negative results, all gate-PASS unless stated. Six of nine rejections are the sa
 | `-j` save threads = 16 | −9.1% | not spent | discard (sweep point) |
 | `-j` save threads = 4 | −7.9% | not spent | discard (sweep point) |
 | encode direct from `$UP`, no per-block staging dir | +0.0% | not spent | discard — flat, and +3 net lines |
+| **parallel decode into ranges via input `-ss`** | **+55.9%** | not spent | **GATE FAIL — pixels differ** |
+| pin the worker to its quota's worth of cores | −1.4% | not spent | discard — *hurt* |
+| `nice -n 10` on the encoder | +0.3% (n=2) | not spent | discard — flat |
+| `proc` threads = 2×CPUS | +0.0% | not spent | discard — flat |
 | tmpfs mounted over `$WORK` | n/a | n/a | **impossible** — `mount` rc=32, no `CAP_SYS_ADMIN` in this container |
 
 ### The gate earned its keep
@@ -204,8 +232,9 @@ machines and VRAM budgets differ, so they pick different tile counts.
 
 ### The finding hiding in the rejections
 
-Five separate attempts to fill GPU idle time or shorten the exposed tail moved the wall
-clock by nothing, *while visibly doing what they were designed to do*. Background
+Six separate attempts to fill GPU idle time, shorten the exposed tail, or re-prioritise
+the competing processes moved the wall clock by nothing, *while visibly doing what they
+were designed to do*. Background
 extraction dropped GPU idle from 17.3% to 13.7% in A and 10.6% to 7.4% in B — and fps did
 not move. The tail-block work dropped it further, to 8.7% — and fps did not move.
 
@@ -220,6 +249,12 @@ This also retires the tmpfs idea on its merits rather than on the missing capabi
 working set is written once and read once within seconds, against 39 GB of page cache, so
 the physical I/O is already off the critical path — which is exactly why `/dev/shm`
 staging bought +1.6% on the whole box and *precisely zero* on four cores.
+
+CPU **pinning** is the sharpest version of the same lesson, because it came out negative
+rather than flat. Confining the worker to exactly its quota's worth of cores cost 1.4% and
+dropped `cpu_util` from 22.7% to 21.0%: a wide affinity mask lets threads absorb the quota
+while others are blocked on I/O, and taking that away leaves quota unspent. The mask being
+four times wider than the quota is not the pathology it looks like.
 
 ---
 
