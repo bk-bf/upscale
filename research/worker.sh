@@ -65,28 +65,22 @@ while [ "$i" -lt "$FRAMES" ]; do
   seg=$(printf '%s/seg_%04d.mkv' "$SEGDIR" "$idx")
   n=$CHUNK; [ $((i+n)) -gt "$FRAMES" ] && n=$((FRAMES-i))
 
-  # Shard the chunk across workers by hardlink — no copy, no extra bytes.
-  #
-  # One `ln` per worker, not one per frame. `ln` and `mkdir` are external
-  # binaries, so the obvious per-frame loop forks CHUNK times per chunk and does
-  # it in the gap between two upscale phases — with the GPU sitting idle waiting
-  # for it. Batching turns ~1000 forks per chunk into WORKERS.
-  rm -rf "$W/shard"
-  for ((p=0; p<WORKERS; p++)); do mkdir -p "$W/shard/$p"; done
-  for ((p=0; p<WORKERS; p++)); do
-    batch=()
-    for ((k=i+p; k<i+n; k+=WORKERS)); do batch+=("${ALL[$k]}"); done
-    [ "${#batch[@]}" -gt 0 ] && ln -f -t "$W/shard/$p" "${batch[@]}"
-  done
+  # Select the chunk's frames by hardlink — no copy, no extra bytes. One `ln`
+  # call: `ln` is an external binary, so the obvious per-frame loop forks CHUNK
+  # times per chunk, in the gap between two upscale phases, with the GPU idle
+  # waiting for it.
+  rm -rf "$W/shard"; mkdir -p "$W/shard"
+  ln -f -t "$W/shard" "${ALL[@]:i:n}"
 
+  # ONE upscaler process carrying WORKERS' worth of threads, not WORKERS
+  # processes. `-j load:proc:save` defaults to 1:2:2, so N processes ran N load,
+  # 2N proc and 2N save threads — the same arithmetic this asks one process for.
+  # What the split cost was N model loads and N Vulkan inits per chunk, and N
+  # private queues, so the chunk could not end until its slowest shard did.
   a=$(date +%s)
-  wpids=()
-  for ((p=0; p<WORKERS; p++)); do
-    "$BIN" -i "$W/shard/$p" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png \
-      >/dev/null 2>>"$W/upscale.err" &
-    wpids+=($!)
-  done
-  for wp in "${wpids[@]}"; do wait "$wp" || die "an upscale worker failed"; done
+  "$BIN" -i "$W/shard" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png \
+    -j "$WORKERS:$((WORKERS*2)):$((WORKERS*2))" \
+    >/dev/null 2>>"$W/upscale.err" || die "the upscaler failed"
   b=$(date +%s)
   got=$(pngs "$UP") || got=0
   [ "$got" = "$n" ] || die "chunk $idx upscaled $got of $n"
