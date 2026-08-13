@@ -33,11 +33,39 @@ IN="${1:?need source}"; OUT="${2:?need output}"
 WORKERS=${WORKERS:-4}      # measured optimum on the old box under a 9.6 CPU quota
 CHUNK=${CHUNK:-500}        # 4 chunks per trial, so overlap between them is visible
 
-# -j load:proc:save for the upscaler. The three do very different work: `load`
-# inflates a 1x PNG, `save` deflates a 2x one (four times the pixels), and
-# `proc` mostly waits on the GPU. Sweeping this is sweeping the mix on the
-# resource that is actually scarce here.
-JOBS=${JOBS:-2:4:4}
+# -j load:proc:save for the upscaler, derived from the machine, never hardcoded.
+#
+# The three threads do very different work: `load` inflates a 1x PNG, `save`
+# deflates a 2x one (four times the pixels), and `proc` mostly waits on the GPU.
+# Swept on a box with a 9.6-CPU quota: save=4 gave -7.9% and left the quota
+# idle, save=8 was the peak, save=16 gave back nine points to oversubscription.
+# So what tracks the hardware is the SAVE count, at roughly one per usable CPU.
+# The number 8 would be wrong on any other machine; the rule should not be.
+#
+# Usable CPUs is neither `nproc` nor the cgroup quota alone: this box reports 40
+# processors, is capped at 9.6 by cpu.max, and regime B pins affinity to 4.
+# Whichever is smallest is what the process actually gets.
+cpus(){
+  local aff quota p n
+  aff=$(nproc)                       # nproc honours sched_getaffinity
+  quota=$aff
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r p n < /sys/fs/cgroup/cpu.max
+    [ "$p" != max ] && [ "${n:-0}" -gt 0 ] && quota=$((p / n))
+  elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+    p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    n=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    [ "${p:-0}" -gt 0 ] && [ "${n:-0}" -gt 0 ] && quota=$((p / n))
+  fi
+  [ "$quota" -lt "$aff" ] && aff=$quota
+  [ "$aff" -lt 2 ] && aff=2
+  echo "$aff"
+}
+CPUS=$(cpus)
+SAVE=$CPUS                 # deflating 2x PNGs is the scarce work
+PROC=$CPUS                 # cheap: these block on the GPU, not the CPU
+LOAD=$(( CPUS / 2 )); [ "$LOAD" -lt 1 ] && LOAD=1
+JOBS=${JOBS:-$LOAD:$PROC:$SAVE}
 
 W=$WORK
 FDIR="$W/frames"; UP="$W/up"; SEGDIR="$W/seg"
@@ -122,4 +150,5 @@ ffmpeg -v error -nostdin -f concat -safe 0 -i "$SEGDIR/list" \
 mv "$OUT.part" "$OUT"
 b=$(date +%s)
 say "phase concat ${a} ${b} $((b-a))s"
+say "cpus=$CPUS jobs=$JOBS"
 say "done"
