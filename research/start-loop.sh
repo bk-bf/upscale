@@ -11,6 +11,11 @@ R=$(cd "$(dirname "$0")" && pwd)
 cd "$R/.."
 
 HOURS=${1:-8}
+
+# mon is not on PATH in a non-login shell, which is exactly where this gets run
+# from. Resolve it rather than failing after the guard is already armed.
+MON=$(command -v mon) || MON=$HOME/Documents/Projects/mon/mon
+[ -x "$MON" ] || { echo "cannot find mon" >&2; exit 1; }
 TAG=${TAG:-$(date +%b%d | tr 'A-Z' 'a-z')}
 BRANCH="autoresearch/$TAG"
 
@@ -78,7 +83,7 @@ If you die early or cannot proceed, send that same notification saying so
 instead of failing silently.
 EOF
 
-mon run "$PROMPT" \
+"$MON" run "$PROMPT" \
   --project "$(pwd)" \
   --title "overnight upscale optimisation loop (${HOURS}h)" \
   --mode acceptEdits \
