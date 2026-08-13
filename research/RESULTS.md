@@ -404,20 +404,40 @@ the loop started, which is what makes G1 an equality test rather than a toleranc
 3. One upscaler process instead of N.
 4. One upscaler invocation per job instead of one per chunk, with a produced-frame
    safety slack before any block is handed to the encoder.
+5. **Take a block only once every frame in it exists** — the correctness fix from §3. It
+   costs nothing and closes a real latent bug. Deploy it *with* change 4, never after.
+6. Delete the dead frame list. A simplification, not a speedup.
 
-All four remove work rather than rebalance it, which is why each won under both hardware
-balances. None can change a pixel.
+Changes 1–4 remove work rather than rebalance it, which is why each won under both
+hardware balances. None can change a pixel.
 
 ### `autotuned` — deploy as a rule, never as a number
 
-5. `-j load:proc:save` from `CPUS = min(nproc, cgroup quota)`. **Shipping `4:9:9`, or any
-   other literal, would be the exact mistake this loop was built to avoid.**
+7. `-j load:proc:save` from `CPUS = min(nproc, floor(cgroup quota))`, with
+   `save = proc = CPUS` and `load = CPUS/2`. **Shipping `4:9:9`, or any other literal,
+   would be the exact mistake this loop was built to avoid** — and shipping change 3
+   *without* this one is worse than shipping nothing at all (§3 ablation: −43.6%).
 
 ### `hw-tuned` — this box only, do not deploy
 
-6. Staging 1x frames in `/dev/shm`. +1.6% on the whole box, exactly 0.0% on four cores.
+8. Staging 1x frames in `/dev/shm`. +1.6% on the whole box, exactly 0.0% on four cores.
    It is the largest number in the night that is not being recommended, and it is being
    named here rather than buried.
+
+### Every trial, by tier
+
+96 trials. Full table with per-trial telemetry in `research/results.tsv`.
+
+| tier | attacked | kept | rejected on fps | rejected by the gate |
+|---|---|---|---|---|
+| **1** — free wins, no restructuring | PNG compression, RAM staging, extract overlap, one-process `-j`, worker/chunk sweeps | 3 (+ the `-j` rule) | 9 | 0 |
+| **2** — real restructuring, pixel-safe | parallel decode, CPU affinity, concurrent encodes, kill the shard pass, `nice`/`ionice` | 2 | 6 | 1 |
+| **3** — hardest | persistent upscaler process, deeper pipelining | 2 | 0 | 1 |
+
+Every item on PROGRAM's attack list was attempted. The two gate failures are the two
+largest fps numbers of the night (§5). Tier 3's "persistent upscaler process" was reached
+as far as this binary allows — one invocation per job rather than a resident daemon, since
+`realesrgan-ncnn-vulkan` is one-shot by construction.
 
 ---
 
