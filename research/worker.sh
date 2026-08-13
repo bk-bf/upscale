@@ -92,42 +92,58 @@ say "phase extract ${a} ${b} $((b-a))s"
 mapfile -t ALL < <(find "$FDIR" -maxdepth 1 -name '*.png' -type f | sort)
 [ "${#ALL[@]}" = "$FRAMES" ] || die "listed ${#ALL[@]}, expected $FRAMES"
 
-# ---------------------------------------------------------------- 2. chunks
-i=0; idx=0; enc_pid=""
+# ---------------------------------------------------------------- 2. upscale
+# ONE invocation for the whole trial, not one per chunk. Startup here is ~1.8s
+# of Vulkan init and model load, measured on this box, and a chunk loop that
+# spawned the upscaler paid it once per chunk for nothing. The chunking that
+# remains is the ENCODER's, which is where it was always earning its keep: it
+# lets a finished block encode while the GPU works on the next one.
+#
+# The upscaler reads $FDIR directly, so the per-chunk hardlink shard is gone too.
+a=$(date +%s)
+"$BIN" -i "$FDIR" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png \
+  -j "$JOBS" >/dev/null 2>>"$W/upscale.err" &
+up_pid=$!
+up_done=0
+
+# How far AHEAD of a block the upscaler must be before that block is taken.
+# The save threads write PNGs in place and non-atomically, so a file that has
+# just appeared may still be open. SLACK is ~20x the save-thread count, which
+# keeps the write frontier a long way from anything handed to the encoder — the
+# gate cannot catch a half-written frame that still decodes, so this is the one
+# place in the loop that has to be conservative rather than clever.
+SLACK=${SLACK:-200}
+
+i=0; idx=0; enc_pid=""; consumed=0
 NCHUNK=$(( (FRAMES + CHUNK - 1) / CHUNK ))
 while [ "$i" -lt "$FRAMES" ]; do
   idx=$((idx+1))
   seg=$(printf '%s/seg_%04d.mkv' "$SEGDIR" "$idx")
   n=$CHUNK; [ $((i+n)) -gt "$FRAMES" ] && n=$((FRAMES-i))
 
-  # Select the chunk's frames by hardlink — no copy, no extra bytes. One `ln`
-  # call: `ln` is an external binary, so the obvious per-frame loop forks CHUNK
-  # times per chunk, in the gap between two upscale phases, with the GPU idle
-  # waiting for it.
-  rm -rf "$W/shard"; mkdir -p "$W/shard"
-  ln -f -t "$W/shard" "${ALL[@]:i:n}"
+  # $UP shrinks as blocks are consumed, so progress is counted, not measured.
+  while [ "$up_done" = 0 ]; do
+    produced=$(( $(pngs "$UP") + consumed ))
+    [ "$produced" -ge $(( i + n + SLACK )) ] && break
+    kill -0 "$up_pid" 2>/dev/null || { wait "$up_pid" || die "the upscaler failed"; up_done=1; break; }
+    sleep 0.5
+  done
 
-  # ONE upscaler process carrying all the threads, not one process per shard.
-  # `-j load:proc:save` defaults to 1:2:2, so N processes ran N load, 2N proc
-  # and 2N save threads — the same arithmetic this asks one process for. What
-  # the split cost was N model loads and N Vulkan inits per chunk, and N private
-  # queues, so a chunk could not end until its slowest shard did.
-  a=$(date +%s)
-  "$BIN" -i "$W/shard" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png \
-    -j "$JOBS" \
-    >/dev/null 2>>"$W/upscale.err" || die "the upscaler failed"
-  b=$(date +%s)
-  got=$(pngs "$UP") || got=0
-  [ "$got" = "$n" ] || die "chunk $idx upscaled $got of $n"
+  batch=()
+  for ((k=i+1; k<=i+n; k++)); do printf -v f '%s/%06d.png' "$UP" "$k"; batch+=("$f"); done
 
+  encdir="$W/enc_$idx"; rm -rf "$encdir"; mkdir -p "$encdir"
+  # Named, not globbed: if the upscaler is somehow behind, this fails loudly
+  # here rather than quietly encoding a short block.
+  ln -f -t "$encdir" "${batch[@]}" || die "block $idx is incomplete"
   # The pixel gate. Hardlinks, so this costs no bytes and no copy time.
-  # `-exec … +` batches the arguments; `\;` spawned one `ln` per frame.
-  find "$UP" -maxdepth 1 -name '*.png' -type f -exec ln -f -t "$HASHDIR" {} +
+  ln -f -t "$HASHDIR" "${batch[@]}"
+  rm -f "${batch[@]}"
+  consumed=$((consumed+n))
+  b=$(date +%s)
 
-  # Hand the chunk to a background encoder by rename, so the GPU starts the next
-  # chunk immediately. Wait on the PREVIOUS encode specifically — a bare `wait`
-  # would reap it and break this one.
-  encdir="$W/enc_$idx"; rm -rf "$encdir"; mv "$UP" "$encdir"; mkdir -p "$UP"
+  # Hand the block to a background encoder, so the GPU keeps going. Wait on the
+  # PREVIOUS encode specifically — a bare `wait` would reap the upscaler.
   [ -n "$enc_pid" ] && { wait "$enc_pid" || die "background encode failed"; }
   (
     ffmpeg -v error -nostdin -framerate "$FPS_R" -pattern_type glob -i "$encdir/*.png" \
@@ -137,9 +153,10 @@ while [ "$i" -lt "$FRAMES" ]; do
   ) &
   enc_pid=$!
 
-  say "phase chunk$idx ${a} ${b} $((b-a))s  $((i+n))/$FRAMES"
+  say "phase block$idx ${a} ${b} $((b-a))s  $((i+n))/$FRAMES"
   i=$((i+n))
 done
+[ "$up_done" = 0 ] && { wait "$up_pid" || die "the upscaler failed"; }
 [ -n "$enc_pid" ] && { wait "$enc_pid" || die "final background encode failed"; }
 
 # ---------------------------------------------------------------- 3. concat
