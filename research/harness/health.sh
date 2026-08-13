@@ -30,6 +30,16 @@ NOW=$(date +%s)
 "$R/harness/prune-links.sh" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------- finished?
+# Asked BEFORE the clock, because finishing early is a success and the clock
+# cannot tell it from an outage. This fired a false alarm the first night: the
+# loop finished at 08:23 and its unit exited, the deadline was 08:33, so the
+# "finished" test below was skipped, the supervisor test found no unit, and it
+# paged about a job that had completed perfectly ten minutes earlier.
+if [ -s "$R/RESULTS.md" ]; then
+  echo "finished: RESULTS.md is written ($(( $(wc -l < "$R/results.tsv" 2>/dev/null || echo 1) - 1 )) trials logged)"
+  exit 0
+fi
+
 if ! "$R/harness/guard.sh" >/dev/null 2>&1; then
   if [ -s "$R/RESULTS.md" ]; then
     echo "finished: guard expired and RESULTS.md is written"

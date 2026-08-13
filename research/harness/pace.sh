@@ -32,6 +32,11 @@ R=$(cd "$(dirname "$0")/.." && pwd)
 
 J=$(curl -sk --max-time 20 "$API" 2>/dev/null) || J=""
 if [ -z "$J" ]; then
+  # Recorded too. A gap in the log has to be visible as a gap, otherwise a night
+  # where the dashboard was unreachable reads afterwards as a night where
+  # nothing was spent.
+  mkdir -p "$R/runs"
+  printf '%s\tunknown\t-\t-\t-\t-\tUNREACHABLE\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$R/runs/budget.log"
   # The governor must never be the reason the loop stops. Unknown budget is
   # treated as "proceed, but do not expand".
   echo "mode:            NOMINAL"
@@ -85,6 +90,16 @@ elif awk -v d="$DRIFT" 'BEGIN{exit !(d<-8)}'; then
 else
   NOTE="on pace"
 fi
+
+# Write every reading down. The governor read Anthropic's real utilisation all
+# night and then threw each number away, so afterwards there was no way to
+# answer the only question anyone asked about it — did it actually hold near
+# 90%, or did it idle? A live gauge nobody records is not a measurement.
+BLOG="$R/runs/budget.log"
+mkdir -p "$R/runs"
+[ -s "$BLOG" ] || printf 'ts\tfive_hour_pct\ttarget_pct\tdrift\twindow_left_min\tseven_day_pct\tmode\n' > "$BLOG"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$P" "$TGT" "$DRIFT" "$((LEFT / 60))" "$P7" "$MODE" >> "$BLOG"
 
 printf 'mode:            %s\n' "$MODE"
 printf 'five_hour_pct:   %s\n' "$P"

@@ -295,6 +295,11 @@ write `research/RESULTS.md`:
 - **what transfers to production and what does not.** This box is not `rental-B`. Report
   ratios and structural findings, and say plainly where an absolute number is specific to
   a GTX 1660 SUPER behind a slow Xeon;
+- **the budget the night actually used**, from `research/harness/budget-report.sh` —
+  peak and mean utilisation per 5-hour window, and whether it held near 90%. This is not
+  optional: the first run of this loop paced against Anthropic's live figure all night,
+  recorded none of it, and by morning the window had reset and the number was gone. A
+  governor whose readings are not written down cannot be audited or improved;
 - the honest caveats, in the style of PERFORMANCE-DATA §14.
 
 Then append the durable measurements to `PERFORMANCE-DATA.md` in its existing data-only
