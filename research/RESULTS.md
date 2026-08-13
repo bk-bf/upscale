@@ -78,7 +78,7 @@ whole result was re-measured at **4000 frames**, baseline against optimised:
 
 | frames | baseline | optimised | change |
 |---|---|---|---|
-| 2000 | 13.674 fps | 20.626 fps | **+50.8%** |
+| 2000 | 13.684 fps | 20.586 fps | **+50.4%** |
 | 4000 | 13.774 fps | 20.833 fps | **+51.2%** |
 
 The gain does not shrink when the work doubles. Startup amortisation was the smaller part
@@ -287,7 +287,7 @@ The slope was then checked at a **second CPU count**, in regime B where `CPUS=4`
 
 | save threads | 3 | **4 (= CPUS)** | 6 |
 |---|---|---|---|
-| regime B | **+2.4%** | **+19.6%** | +18.3% |
+| regime B | **+2.4%** | **+19.9%** | +18.3% |
 
 Both regimes peak exactly at `save = CPUS`, four CPUs apart. The curve is also sharply
 asymmetric: three threads instead of four cost **17 points** and left `cpu_util` at 8.5%,
@@ -428,13 +428,13 @@ processes start, how many times a model is loaded, how many times a byte is comp
 and how many processes are forked — none of which depend on this GPU.
 
 **Does not transfer:** every absolute fps figure, and the specific balance between the
-percentages. **+50.8% and +19.6% are predictions for other hardware, not production
+percentages. **+50.4% and +19.9% are predictions for other hardware, not production
 figures, and must be re-measured on the desktop or a real rental before anything is
 deployed on the strength of them.**
 
 The two regimes bracket the expectation rather than predicting it. Production boxes look
 more like regime B than regime A — a fast GPU outrunning the CPU that feeds it — so
-**+19.6% is the more honest expectation for `rental-B`-class hardware, and +50.8% is the
+**+19.9% is the more honest expectation for `rental-B`-class hardware, and +50.4% is the
 ceiling for a machine whose GPU is as weak as this one.** But the mechanism argues the
 other way for the largest change: a faster GPU makes the fixed 1.83 s startup and the PNG
 compression a *larger* share of the upscale phase, not a smaller one. Which effect wins is
@@ -446,7 +446,7 @@ not knowable from this box, and this report does not claim to know it.
 
 - The regime-A optimised figure pools nine runs spanning four hours precisely because its
   spread is wide (2.35%); reporting any single three-run window would have been able to
-  produce anything from +47.6% to +51.6%. The pooled +50.0% is the defensible number.
+  produce anything from +47.6% to +51.6%. The pooled +50.4% is the defensible number.
 - Every figure is 2000 frames of **one** source file. Content affects PNG size and encode
   cost, and no second source was tried.
 - The baseline is n=3 (A) and n=2 (B); the final config is n=3 in both. Everything between

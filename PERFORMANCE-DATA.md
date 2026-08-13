@@ -367,7 +367,7 @@ measurable effect. Percentages are against that regime's baseline. TRIAL.
 | A | 9 | 12 | 19.550 | −6.1 pt vs peak |
 | A | 9 | 16 | 16.892 | −9.1 pt vs peak |
 | B | 4 | 3 | 9.474 | +2.4% |
-| B | 4 | **4** | 11.066 | +19.6% |
+| B | 4 | **4** | 11.075 | +19.9% |
 | B | 4 | 6 | 10.941 | −1.3 pt vs peak |
 
 Rows at differing base commits are marked in `research/results.tsv`; the A rows at
@@ -383,7 +383,7 @@ CPUs. TRIAL.
 ## 19a. Leave-one-out ablation of the final configuration, `rental-C` regime A
 
 Each row removes one change from the finished configuration; all other changes stay in.
-Final configuration mean for comparison: 20.528 fps (n=9). TRIAL.
+Final configuration mean for comparison: 20.586 fps (n=14). TRIAL.
 
 | change removed | fps | delta attributable to that change |
 |---|---|---|
