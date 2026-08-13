@@ -111,6 +111,20 @@ up_done=0
 # place in the loop that has to be conservative rather than clever.
 SLACK=${SLACK:-200}
 
+# A produced COUNT is necessary but not sufficient. The loader runs LOAD files
+# concurrently, so the completed set is ragged at its frontier: a count past the
+# end of a block does not prove every frame *inside* that block has landed. Seen
+# for real — at LOAD=5 the upscaler was 200 frames past block 2 while four of its
+# frames, exactly five apart, were still missing. Check the frames themselves;
+# `[ -e ]` is a shell builtin, so several hundred of these cost no forks.
+block_ready(){
+  local k probe
+  for ((k=i+1; k<=i+n; k++)); do
+    printf -v probe '%s/%06d.png' "$UP" "$k"
+    [ -e "$probe" ] || return 1
+  done
+}
+
 i=0; idx=0; enc_pid=""; consumed=0
 while [ "$i" -lt "$FRAMES" ]; do
   idx=$((idx+1))
@@ -120,7 +134,7 @@ while [ "$i" -lt "$FRAMES" ]; do
   # $UP shrinks as blocks are consumed, so progress is counted, not measured.
   while [ "$up_done" = 0 ]; do
     produced=$(( $(pngs "$UP") + consumed ))
-    [ "$produced" -ge $(( i + n + SLACK )) ] && break
+    [ "$produced" -ge $(( i + n + SLACK )) ] && block_ready && break
     kill -0 "$up_pid" 2>/dev/null || { wait "$up_pid" || die "the upscaler failed"; up_done=1; break; }
     sleep 0.5
   done
