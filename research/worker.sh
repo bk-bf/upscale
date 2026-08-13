@@ -33,6 +33,12 @@ IN="${1:?need source}"; OUT="${2:?need output}"
 WORKERS=${WORKERS:-4}      # measured optimum on the old box under a 9.6 CPU quota
 CHUNK=${CHUNK:-500}        # 4 chunks per trial, so overlap between them is visible
 
+# -j load:proc:save for the upscaler. The three do very different work: `load`
+# inflates a 1x PNG, `save` deflates a 2x one (four times the pixels), and
+# `proc` mostly waits on the GPU. Sweeping this is sweeping the mix on the
+# resource that is actually scarce here.
+JOBS=${JOBS:-2:4:4}
+
 W=$WORK
 FDIR="$W/frames"; UP="$W/up"; SEGDIR="$W/seg"
 mkdir -p "$FDIR" "$UP" "$SEGDIR" "$HASHDIR"
@@ -79,7 +85,7 @@ while [ "$i" -lt "$FRAMES" ]; do
   # private queues, so the chunk could not end until its slowest shard did.
   a=$(date +%s)
   "$BIN" -i "$W/shard" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png \
-    -j "$WORKERS:$((WORKERS*2)):$((WORKERS*2))" \
+    -j "$JOBS" \
     >/dev/null 2>>"$W/upscale.err" || die "the upscaler failed"
   b=$(date +%s)
   got=$(pngs "$UP") || got=0
