@@ -89,9 +89,6 @@ got=$(pngs "$FDIR") || got=0
 b=$(date +%s)
 say "phase extract ${a} ${b} $((b-a))s"
 
-mapfile -t ALL < <(find "$FDIR" -maxdepth 1 -name '*.png' -type f | sort)
-[ "${#ALL[@]}" = "$FRAMES" ] || die "listed ${#ALL[@]}, expected $FRAMES"
-
 # ---------------------------------------------------------------- 2. upscale
 # ONE invocation for the whole trial, not one per chunk. Startup here is ~1.8s
 # of Vulkan init and model load, measured on this box, and a chunk loop that
