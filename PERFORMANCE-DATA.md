@@ -300,7 +300,7 @@ conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
 | regime | condition | cpu_util_mean | baseline fps | optimised fps | change |
 |---|---|---|---|---|---|
 | A | quiet | 20–24% | 13.702 (n=6) | 20.574 (n=18) | +50.2% |
-| A | contended | 43–46% | 12.188 (n=6) | 18.643 (n=6) | +53.0% |
+| A | contended | 43–46% | 12.188 (n=6) | 18.598 (n=7) | +52.6% |
 | B | quiet | 9–11% | 9.244 (n=5) | 11.074 (n=10) | +19.8% |
 | B | contended | 29–34% | 8.046 (n=4) | 9.189 (n=6) | +14.2% |
 

@@ -8,7 +8,7 @@ Both figures are pooled over every clean measurement taken across the night (reg
 n=18 optimised against n=6 baseline; regime B: n=9 against n=4), not over one favourable
 run of three. The conservative bound — *worst* optimised run against *best* baseline run —
 is **+46.8%** and **+19.3%**. It survives double the frame count (+51.2%) and a badly
-contended host (+53.0% / +14.2%).
+contended host (+52.6% / +14.2%).
 
 ---
 
@@ -97,12 +97,12 @@ was re-measured under the same conditions so each population has a control:
 | regime | condition | baseline | optimised | change |
 |---|---|---|---|---|
 | A | quiet, `cpu_util` 20–24% | 13.702 (n=6) | 20.574 (n=18) | **+50.2%** |
-| A | contended, `cpu_util` 43–46% | 12.188 (n=6) | 18.643 (n=6) | **+53.0%** |
+| A | contended, `cpu_util` 43–46% | 12.188 (n=6) | 18.598 (n=7) | **+52.6%** |
 | B | quiet, `cpu_util` 9–11% | 9.244 (n=5) | 11.074 (n=10) | **+19.8%** |
 | B | contended, `cpu_util` 29–34% | 8.046 (n=4) | 9.189 (n=6) | **+14.2%** |
 
-**The gain does not depend on a quiet box.** Contention cost the regime-A baseline 10.9%
-of its throughput and the optimised worker only 9.4%, so the ratio widened slightly rather
+**The gain does not depend on a quiet box.** Contention cost the regime-A baseline 11.0%
+of its throughput and the optimised worker only 9.6%, so the ratio widened slightly rather
 than collapsing. Regime B moved the other way and by more, narrowing from +19.8% to
 +14.2% — nearly a third of the gain gone.
 
@@ -426,7 +426,7 @@ hardware balances. None can change a pixel.
 
 ### Every trial, by tier
 
-105 trials. Full table with per-trial telemetry in `research/results.tsv`.
+108 trials. Full table with per-trial telemetry in `research/results.tsv`.
 
 | tier | attacked | kept | rejected on fps | rejected by the gate |
 |---|---|---|---|---|
