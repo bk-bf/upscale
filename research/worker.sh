@@ -43,8 +43,12 @@ pngs(){ find "$1" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l; }
 
 # ---------------------------------------------------------------- 1. extract
 a=$(date +%s)
+# -compression_level 1: ffmpeg's PNG encoder defaults to a slow zlib level, and
+# these frames are read back once by the upscaler and then deleted. Cheap zlib
+# pays twice — less work to write them, less to inflate them again. The gate
+# hashes decoded content, not file bytes, so this cannot move a pixel.
 "$FFDEC" -v error -nostdin -i "$IN" -frames:v "$FRAMES" -fps_mode passthrough \
-         "$FDIR/%06d.png" -y
+         -compression_level 1 "$FDIR/%06d.png" -y
 got=$(pngs "$FDIR") || got=0
 [ "$got" = "$FRAMES" ] || die "extracted $got of $FRAMES"
 b=$(date +%s)
