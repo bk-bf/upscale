@@ -66,9 +66,17 @@ while [ "$i" -lt "$FRAMES" ]; do
   n=$CHUNK; [ $((i+n)) -gt "$FRAMES" ] && n=$((FRAMES-i))
 
   # Shard the chunk across workers by hardlink — no copy, no extra bytes.
-  rm -rf "$W/shard"; mkdir -p "$W/shard"
-  for ((k=i; k<i+n; k++)); do
-    d="$W/shard/$(( (k-i) % WORKERS ))"; mkdir -p "$d"; ln -f "${ALL[$k]}" "$d/"
+  #
+  # One `ln` per worker, not one per frame. `ln` and `mkdir` are external
+  # binaries, so the obvious per-frame loop forks CHUNK times per chunk and does
+  # it in the gap between two upscale phases — with the GPU sitting idle waiting
+  # for it. Batching turns ~1000 forks per chunk into WORKERS.
+  rm -rf "$W/shard"
+  for ((p=0; p<WORKERS; p++)); do mkdir -p "$W/shard/$p"; done
+  for ((p=0; p<WORKERS; p++)); do
+    batch=()
+    for ((k=i+p; k<i+n; k+=WORKERS)); do batch+=("${ALL[$k]}"); done
+    [ "${#batch[@]}" -gt 0 ] && ln -f -t "$W/shard/$p" "${batch[@]}"
   done
 
   a=$(date +%s)
@@ -84,7 +92,8 @@ while [ "$i" -lt "$FRAMES" ]; do
   [ "$got" = "$n" ] || die "chunk $idx upscaled $got of $n"
 
   # The pixel gate. Hardlinks, so this costs no bytes and no copy time.
-  find "$UP" -maxdepth 1 -name '*.png' -type f -exec ln -f {} "$HASHDIR/" \;
+  # `-exec … +` batches the arguments; `\;` spawned one `ln` per frame.
+  find "$UP" -maxdepth 1 -name '*.png' -type f -exec ln -f -t "$HASHDIR" {} +
 
   # Hand the chunk to a background encoder by rename, so the GPU starts the next
   # chunk immediately. Wait on the PREVIOUS encode specifically — a bare `wait`
