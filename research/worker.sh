@@ -30,7 +30,6 @@ set -euo pipefail
 
 IN="${1:?need source}"; OUT="${2:?need output}"
 
-WORKERS=${WORKERS:-4}      # measured optimum on the old box under a 9.6 CPU quota
 CHUNK=${CHUNK:-500}        # 4 chunks per trial, so overlap between them is visible
 
 # -j load:proc:save for the upscaler, derived from the machine, never hardcoded.
@@ -77,12 +76,14 @@ pngs(){ find "$1" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l; }
 
 # ---------------------------------------------------------------- 1. extract
 a=$(date +%s)
-# -compression_level 1: ffmpeg's PNG encoder defaults to a slow zlib level, and
-# these frames are read back once by the upscaler and then deleted. Cheap zlib
-# pays twice — less work to write them, less to inflate them again. The gate
-# hashes decoded content, not file bytes, so this cannot move a pixel.
+# -compression_level 0: store, do not deflate. These frames are read back once
+# by the upscaler and then deleted, and on a box whose CPU quota is the binding
+# constraint their compression is pure cost — paid twice, once to deflate them
+# and once to inflate them again. Uncompressed they are ~3x the bytes, on a disk
+# with 27 GB free that nothing else is competing for. The gate hashes decoded
+# content, not file bytes, so this cannot move a pixel.
 "$FFDEC" -v error -nostdin -i "$IN" -frames:v "$FRAMES" -fps_mode passthrough \
-         -compression_level 1 "$FDIR/%06d.png" -y
+         -compression_level 0 "$FDIR/%06d.png" -y
 got=$(pngs "$FDIR") || got=0
 [ "$got" = "$FRAMES" ] || die "extracted $got of $FRAMES"
 b=$(date +%s)
@@ -106,11 +107,11 @@ while [ "$i" -lt "$FRAMES" ]; do
   rm -rf "$W/shard"; mkdir -p "$W/shard"
   ln -f -t "$W/shard" "${ALL[@]:i:n}"
 
-  # ONE upscaler process carrying WORKERS' worth of threads, not WORKERS
-  # processes. `-j load:proc:save` defaults to 1:2:2, so N processes ran N load,
-  # 2N proc and 2N save threads — the same arithmetic this asks one process for.
-  # What the split cost was N model loads and N Vulkan inits per chunk, and N
-  # private queues, so the chunk could not end until its slowest shard did.
+  # ONE upscaler process carrying all the threads, not one process per shard.
+  # `-j load:proc:save` defaults to 1:2:2, so N processes ran N load, 2N proc
+  # and 2N save threads — the same arithmetic this asks one process for. What
+  # the split cost was N model loads and N Vulkan inits per chunk, and N private
+  # queues, so a chunk could not end until its slowest shard did.
   a=$(date +%s)
   "$BIN" -i "$W/shard" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png \
     -j "$JOBS" \
