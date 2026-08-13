@@ -4,3 +4,13 @@ venv/
 *.ncnn.*
 *.bin
 *.param
+research/box.env
+research/harness/box.env
+research/runs/
+research/.deadline
+research/results.tsv
+*.onnx
+*.zip
+__pycache__/
+tools/suc_pnnx.py
+tools/suc_ncnn.py
