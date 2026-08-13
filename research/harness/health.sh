@@ -47,7 +47,7 @@ LEFT=$("$R/harness/guard.sh" 2>/dev/null) || LEFT="unknown"
 # it healthy for another twenty-five minutes while nothing at all was running.
 # The supervisor is what makes a dead session self-healing, so its absence is
 # the thing that turns a normal session ending into an outage.
-SUP=$(systemctl --user is-active upscale-research-supervisor.service 2>/dev/null) || SUP=unknown
+SUP=$(systemctl --user is-active upscale-research-loop.service 2>/dev/null) || SUP=unknown
 if [ "$SUP" != active ]; then
   echo "DIED: the supervisor is '$SUP', so nothing is chaining sessions, and $LEFT"
   echo "trials logged so far: $(( $(wc -l < "$R/results.tsv" 2>/dev/null || echo 1) - 1 ))"
@@ -74,6 +74,6 @@ TRIALS=$(( $(wc -l < "$R/results.tsv" 2>/dev/null || echo 1) - 1 ))
 echo "STALLED: no trial output for over ${STALL_MIN}m, and $LEFT"
 echo "trials logged so far: $TRIALS"
 echo "last artefact: ${LASTFILE:-none at all — it never started}"
-printf 'supervisor: %s\n' "$(systemctl --user is-active upscale-research-supervisor.service 2>/dev/null || echo absent)"
+printf 'supervisor: %s\n' "$(systemctl --user is-active upscale-research-loop.service 2>/dev/null || echo absent)"
 printf 'mon session: %s\n' "$(${MON:-$HOME/Documents/Projects/mon/mon} sessions 2>/dev/null | grep -c running || echo 0) running"
 exit 1
