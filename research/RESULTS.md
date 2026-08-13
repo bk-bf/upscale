@@ -167,7 +167,7 @@ order-dependent. The leave-one-out ablation below is the honest per-change accou
 
 \* Changes 6 and 7 are no-ops for throughput. 6 was kept on PROGRAM's simplicity
 tiebreaker — equal fps from less code — after two regime-A repeats averaged 20.598 against
-20.626 and regime B returned 11.062 against 11.066. 7 was kept because it is a correctness
+the then-current keeper mean of 20.626, and regime B returned 11.062 against 11.066. 7 was kept because it is a correctness
 fix, and measured 20.833 (A) and 11.050 (B), both inside the pooled range. The §2 figures
 pool runs from before and after both, which is only legitimate *because* they are no-ops;
 the two populations are statistically indistinguishable.
