@@ -83,7 +83,7 @@ mon run "$PROMPT" \
   --title "overnight upscale optimisation loop (${HOURS}h)" \
   --mode acceptEdits \
   --by kirill \
-  --tag research
+  --tag loop
 
 echo
 echo "branch:   $BRANCH"
