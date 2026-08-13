@@ -22,14 +22,22 @@ BRANCH="autoresearch/$TAG"
 # No baseline.env check: establishing the baseline is the loop's own first job,
 # per PROGRAM.md "Setup". Handing it a baseline measured by someone else would
 # make experiment zero unreproducible by the thing that depends on it.
-git rev-parse --verify "$BRANCH" >/dev/null 2>&1 && {
-  echo "branch $BRANCH already exists — this must be a fresh run" >&2; exit 1; }
+# A branch that exists but carries no experiments is a launch that failed before
+# it started, not a run in progress — reuse it. Refuse only when there is real
+# work on it, which a fresh run would silently bury.
+if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+  AHEAD=$(git rev-list --count "main..$BRANCH") || AHEAD=1
+  [ "$AHEAD" = 0 ] || {
+    echo "branch $BRANCH already has $AHEAD commits — this must be a fresh run" >&2; exit 1; }
+  echo "reusing empty branch $BRANCH from a previous launch"
+  git checkout -q "$BRANCH"
+else
+  git checkout -q -b "$BRANCH"
+fi
 
 # The deadline goes on disk before anything else. A loop that tracks its own
 # deadline in its own head forgets, drifts, or talks itself out of stopping.
 "$R/harness/guard.sh" --arm "$HOURS"
-
-git checkout -b "$BRANCH"
 
 # One registered sender, so the morning report and a dead loop cannot each
 # invent their own way to reach the phone. Two notifiers on one topic already

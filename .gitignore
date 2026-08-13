@@ -14,3 +14,4 @@ research/results.tsv
 __pycache__/
 tools/suc_pnnx.py
 tools/suc_ncnn.py
+.claude/settings.local.json
