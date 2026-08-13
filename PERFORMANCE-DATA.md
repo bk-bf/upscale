@@ -302,7 +302,7 @@ conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
 | A | quiet | 20–24% | 13.684 (n=5) | 20.586 (n=14) | +50.4% |
 | A | contended | 43–46% | 11.922 (n=3) | 18.468 (n=3) | +54.9% |
 | B | quiet | 9–11% | 9.240 (n=4) | 11.075 (n=9) | +19.9% |
-| B | contended | 33% | 7.868 (n=1) | 9.196 (n=2) | +16.9% |
+| B | contended | 33–34% | 7.984 (n=2) | 9.159 (n=4) | +14.7% |
 
 Individual regime-A contended pairings span +48.8% to +58.3% depending on which runs are
 matched; runs are sequential, not simultaneous. TRIAL.
