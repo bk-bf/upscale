@@ -1,8 +1,13 @@
 # RESULTS.md — overnight optimisation loop, 2026-08-13
 
-**Headline: +50.8% in regime A, +19.6% in regime B, every pixel bit-identical to the
+**Headline: +50.0% in regime A, +19.9% in regime B, every pixel bit-identical to the
 baseline.** Five changes kept, all of them removing work rather than rearranging it —
 and, at double the frame count, the gain holds at +51.2%.
+
+Both figures are pooled over every clean measurement taken across the night (regime A:
+n=9 optimised against n=5 baseline; regime B: n=6 against n=4), not over one favourable
+run of three. The conservative bound — *worst* optimised run against *best* baseline run —
+is **+47.6%** and **+19.3%**.
 
 ---
 
@@ -29,22 +34,40 @@ seconds`, higher is better. Quality is not scored — it is a precondition (§6)
 | **A** | whole box: 9.6 CPU quota, weak GPU | 3 | 13.674 | **0.70%** |
 | **B** | `taskset -c 0-3`, CPU starved | 2 | 9.251 | **0.20%** |
 
-Spread is the noise floor and nothing smaller than it was ever kept. The baseline was
-re-run at the **end** of the night, after four hours of trials, and returned 13.689 fps —
-**+0.1% against its own mean**. The box did not drift, so every comparison below is against
-a stable reference rather than against the weather.
+Spread is the noise floor and nothing smaller than it was ever kept.
+
+The unmodified baseline was then re-measured **three more times across the following four
+hours**, interleaved with the experiments, to check the box itself was not drifting:
+
+| regime | pooled n | mean fps | spread | drift vs the opening baseline |
+|---|---|---|---|---|
+| A | 5 | 13.684 | 0.75% | +0.1% |
+| B | 4 | 9.240 | 0.37% | −0.1% |
+
+The box did not drift, so every comparison below is against a stable reference rather than
+against the weather.
 
 ---
 
 ## 2. The result
 
-| regime | baseline | final | n | final spread | **change** |
+| regime | baseline (n) | final (n) | final spread | **change** | conservative bound |
 |---|---|---|---|---|---|
-| **A** | 13.674 fps | **20.626 fps** | 3 | 0.82% | **+50.8%** |
-| **B** | 9.251 fps | **11.066 fps** | 3 | 0.27% | **+19.6%** |
+| **A** | 13.684 fps (5) | **20.528 fps** (9) | 2.35% | **+50.0%** | +47.6% |
+| **B** | 9.240 fps (4) | **11.077 fps** (6) | 0.50% | **+19.9%** | +19.3% |
 
-Both clear their noise floor by roughly seventy-fold. The percentage is the deliverable;
-the fps numbers are supporting detail and belong to this box alone.
+Both clear their noise floor by a wide margin. The percentage is the deliverable; the fps
+numbers are supporting detail and belong to this box alone.
+
+**Regime A's optimised spread (2.35%) is three times its baseline's (0.75%), and that is
+itself a finding.** The optimised worker holds the 9.6-CPU quota at 93% saturation where
+the baseline leaves it half idle, so it is far more exposed to whatever else the rented
+host is running. Its slowest three runs came consecutively, late, while `cpu_util_mean` —
+which counts all 40 host cores, not just this container's — rose from 22.5% to 24.6%. A
+baseline run taken in the same window came back at 13.708 fps, entirely normal. **The
+optimisation converts spare quota into throughput, so it also converts host contention
+into variance.** On a box you own, expect the top of the range; on a shared rental, the
+bottom.
 
 ### Does it survive more work?
 
@@ -322,6 +345,9 @@ not knowable from this box, and this report does not claim to know it.
 
 ## 9. Known measurement caveats
 
+- The regime-A optimised figure pools nine runs spanning four hours precisely because its
+  spread is wide (2.35%); reporting any single three-run window would have been able to
+  produce anything from +47.6% to +51.6%. The pooled +50.0% is the defensible number.
 - Every figure is 2000 frames of **one** source file. Content affects PNG size and encode
   cost, and no second source was tried.
 - The baseline is n=3 (A) and n=2 (B); the final config is n=3 in both. Everything between

@@ -283,17 +283,29 @@ Notes recorded as fact, not inference:
 
 ## 16. Optimisation-loop baseline and result, `rental-C`
 
+All clean measurements of each configuration, pooled across the 2026-08-13 session.
+
 | regime | config | n | mean fps | min | max | spread | provenance |
 |---|---|---|---|---|---|---|---|
-| A | baseline (production worker shape) | 3 | 13.674 | 13.615 | 13.717 | 0.70% | TRIAL |
-| A | optimised | 3 | 20.626 | 20.555 | 20.725 | 0.82% | TRIAL |
-| B | baseline (production worker shape) | 2 | 9.251 | 9.242 | 9.259 | 0.20% | TRIAL |
-| B | optimised | 3 | 11.066 | 11.050 | 11.080 | 0.27% | TRIAL |
+| A | baseline (production worker shape) | 5 | 13.684 | 13.615 | 13.717 | 0.75% | TRIAL |
+| A | optimised | 9 | 20.528 | 20.243 | 20.725 | 2.35% | TRIAL |
+| B | baseline (production worker shape) | 4 | 9.240 | 9.225 | 9.259 | 0.37% | TRIAL |
+| B | optimised | 6 | 11.077 | 11.050 | 11.105 | 0.50% | TRIAL |
 
-Change: regime A **+50.8%**, regime B **+19.6%**.
+Change: regime A **+50.0%**, regime B **+19.9%**.
+Worst optimised run against best baseline run: A **+47.6%**, B **+19.3%**.
 
-Control: the unmodified baseline worker was re-run after 4 h of trials and returned
-13.689 fps in regime A, +0.1% against its own 3-run mean. TRIAL.
+Scaling probe at 4000 frames, regime A, both configs at the same frame count (outside the
+gate by design — G1 hashes a 2000-frame set): baseline 13.774 fps, optimised 20.833 fps,
+**+51.2%**. TRIAL.
+
+Control: the unmodified baseline worker was re-measured three times over the four hours
+following the opening baseline, interleaved with experiments. Regime A +0.1%, regime B
+−0.1% against the opening means. TRIAL.
+
+`cpu_util_mean` (whole host, 40 cores) during optimised regime-A runs ranged 22.3–24.6%
+across the session; the three slowest optimised runs coincided with the high end. Baseline
+runs in the same window were unaffected at 20.1%. OBS.
 
 Quality gates across all 30 trials: decoded-frame hash `76ca8f60…` and x264 option-line
 hash `623c768d…` identical in every trial that passed, including every kept change. TRIAL.
