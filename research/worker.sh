@@ -112,7 +112,6 @@ up_done=0
 SLACK=${SLACK:-200}
 
 i=0; idx=0; enc_pid=""; consumed=0
-NCHUNK=$(( (FRAMES + CHUNK - 1) / CHUNK ))
 while [ "$i" -lt "$FRAMES" ]; do
   idx=$((idx+1))
   seg=$(printf '%s/seg_%04d.mkv' "$SEGDIR" "$idx")
