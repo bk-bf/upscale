@@ -300,12 +300,13 @@ conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
 | regime | condition | cpu_util_mean | baseline fps | optimised fps | change |
 |---|---|---|---|---|---|
 | A | quiet | 20–24% | 13.684 (n=5) | 20.586 (n=14) | +50.4% |
-| A | contended | 43–46% | 11.922 (n=3) | 18.468 (n=3) | +54.9% |
+| A | contended | 43–46% | 12.147 (n=4) | 18.631 (n=4) | +53.4% |
 | B | quiet | 9–11% | 9.240 (n=4) | 11.075 (n=9) | +19.9% |
-| B | contended | 33–34% | 7.984 (n=2) | 9.159 (n=4) | +14.7% |
+| B | contended | 33–34% | 7.985 (n=3) | 9.144 (n=5) | +14.5% |
 
-Individual regime-A contended pairings span +48.8% to +58.3% depending on which runs are
-matched; runs are sequential, not simultaneous. TRIAL.
+Individual regime-A contended pairings span +48.8% to +60.1% depending on which runs are
+matched; runs are sequential, not simultaneous. The contended regime-A baseline is
+bimodal — 12.837/12.821 and 11.474/11.455 — at cpu_util 43.0–43.5 throughout. TRIAL.
 Worst optimised run against best baseline run: A **+47.6%**, B **+19.3%**.
 
 Scaling probe at 4000 frames, regime A, both configs at the same frame count (outside the
