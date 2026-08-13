@@ -8,7 +8,7 @@ Both figures are pooled over every clean measurement taken across the night (reg
 n=14 optimised against n=5 baseline; regime B: n=9 against n=4), not over one favourable
 run of three. The conservative bound — *worst* optimised run against *best* baseline run —
 is **+47.6%** and **+19.3%**. It survives double the frame count (+51.2%) and a badly
-contended host (+48.8% / +16.9%).
+contended host (+54.9% / +16.9%).
 
 ---
 
@@ -91,21 +91,26 @@ identical frame counts, not the gate.)
 
 Two thirds of the way through the night the host acquired other tenants —
 `cpu_util_mean`, which counts all 40 host cores rather than this container's 9.6-CPU
-quota, went from ~10% to 33%, and later 45%. Rather than discard those runs, the baseline
-was re-measured **back to back with the optimised worker** in both regimes, so the pair
-shares its weather:
+quota, went from ~10% to 33% and later 45%. Rather than discard those runs, the baseline
+was re-measured under the same conditions so each population has a control:
 
 | regime | condition | baseline | optimised | change |
 |---|---|---|---|---|
-| A | quiet | 13.684 (n=5) | 20.586 (n=14) | **+50.4%** |
-| A | contended, `cpu_util` 43–45% | 12.837 | 19.102 | **+48.8%** |
-| B | quiet | 9.240 (n=4) | 11.075 (n=9) | **+19.9%** |
-| B | contended, `cpu_util` 33% | 7.868 | 9.196 (n=2) | **+16.9%** |
+| A | quiet, `cpu_util` 20–24% | 13.684 (n=5) | 20.586 (n=14) | **+50.4%** |
+| A | contended, `cpu_util` 43–46% | 11.922 (n=3) | 18.468 (n=3) | **+54.9%** |
+| B | quiet, `cpu_util` 9–11% | 9.240 (n=4) | 11.075 (n=9) | **+19.9%** |
+| B | contended, `cpu_util` 33% | 7.868 (n=1) | 9.196 (n=2) | **+16.9%** |
 
-Contention costs the baseline 6–15% of its throughput and takes 1.6 points off the regime-A
-gain and 3.0 off regime B. The ratio is not fragile, but it is not free either: the
-optimised worker converts spare quota into throughput, so it has more to lose when the
-quota stops being spare. **On a shared rental, expect the lower figure.**
+**The gain does not depend on a quiet box.** Contention cost the regime-A baseline 12.9%
+of its throughput and the optimised worker only 10.3%, so the ratio widened rather than
+collapsed. Regime B moved the other way, narrowing by 3 points.
+
+Read this as a robustness check, not a precise measurement. The contended samples are
+small (n=3 and n=2), the runs are sequential rather than simultaneous so no pair shares
+its weather exactly, and individual regime-A pairings span **+48.8% to +58.3%** depending
+on which runs are matched. The defensible claim is the weak one: across a threefold swing
+in host load, the change stayed worth roughly half again the baseline in regime A and
+roughly a fifth in regime B. It is not an artifact of an idle host.
 
 ### Where the time came from
 
