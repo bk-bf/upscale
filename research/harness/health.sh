@@ -22,6 +22,13 @@ R=$(cd "$(dirname "$0")/.." && pwd)
 STALL_MIN=${STALL_MIN:-25}          # a trial is ~4-5 min; 25 is five missed ones
 NOW=$(date +%s)
 
+# Housekeeping rides along with the check that already runs every ten minutes,
+# rather than arriving as a sixth timer nobody remembers enabling. Silent, and
+# best-effort: tidying the session list must never decide whether the loop is
+# reported healthy. Output is discarded because stdout here is the reason text
+# handed to whatever gets woken.
+"$R/harness/prune-links.sh" >/dev/null 2>&1 || true
+
 # ---------------------------------------------------------------- finished?
 if ! "$R/harness/guard.sh" >/dev/null 2>&1; then
   if [ -s "$R/RESULTS.md" ]; then
