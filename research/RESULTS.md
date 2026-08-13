@@ -133,6 +133,7 @@ so each row's own contribution is its delta from the row above.
 | 4 | extraction `-compression_level 0` (store, don't deflate) | +42.4% | +18.2% | structural |
 | 5 | one upscaler invocation per trial, not per chunk | +50.3% | +19.6% | structural |
 | 6 | drop the dead frame list (`find \| sort` over 2000 files, unread) | +50.8%* | +19.6% | simplicity |
+| 7 | prove a block landed instead of inferring it from a count | neutral | neutral | **correctness** |
 
 \* Change 6 is a no-op for throughput and was kept on PROGRAM's simplicity tiebreaker —
 equal fps from less code. Two regime-A repeats averaged 20.598 against the keeper's
@@ -204,6 +205,36 @@ changed. In the baseline those 6000 forks sat in gaps with the GPU idle; in the 
 configuration they overlap an upscaler that is still running. A change's value is a
 property of the pipeline it lands in, not of the change.
 
+### The bug the loop found in its own best idea
+
+Change 5 hands a block to the encoder once the upscaler is `SLACK` frames past it,
+counting produced frames. Roughly twenty trials passed that way. Then a trial that raised
+the load-thread count from 4 to 5 **crashed**, and the reason was not the change under
+test:
+
+```
+ln: failed to access '.../up/000984.png': No such file or directory
+ln: failed to access '.../up/000989.png': No such file or directory
+ln: failed to access '.../up/000994.png': No such file or directory
+```
+
+Frames exactly five apart — the load-thread count. The loader reads `LOAD` files
+concurrently, so the completed set is **ragged at its frontier**: the upscaler was 200
+frames beyond block 2 while four frames *inside* block 2 had not landed. A count past the
+end of a block never proved the block was full; it only proved enough frames existed
+somewhere. It held at four load threads by luck, not by construction.
+
+It surfaced as a crash rather than as corruption only because the hardlink is done by
+**name** rather than by glob — the deliberately paranoid choice made when change 5 landed.
+A globbed encode would have silently produced a 496-frame segment, and G3 counts frames on
+the *final* output, which the concat would have made short in a way no gate checks
+per-block.
+
+Fixed by proving rather than inferring: every frame of the block must exist before the
+block is taken. `[ -e ]` is a shell builtin, so several hundred checks cost no forks, and
+it measured neutral in both regimes. **This is a real latent bug in the pipeline this
+report recommends, found and closed inside the loop.**
+
 ---
 
 ## 4. The autotuned rule — deploy the rule, never the number
@@ -228,8 +259,11 @@ The slope was then checked at a **second CPU count**, in regime B where `CPUS=4`
 
 Both regimes peak exactly at `save = CPUS`, four CPUs apart. The curve is also sharply
 asymmetric: three threads instead of four cost **17 points** and left `cpu_util` at 8.5%,
-while two threads *too many* cost 1.3. **Round the rule up, never down** — an idle quota is
-far more expensive than an oversubscribed one.
+while two threads *too many* cost 1.3. **Never undershoot `CPUS`** — an idle quota is far
+more expensive than an oversubscribed one.
+
+`CPUS` itself takes the **floor** of a fractional quota, which was measured rather than
+assumed: this box's 9.6 becomes 9, and forcing 10 instead cost 2.4%.
 
 So the thing that tracks the hardware is the **save** count, at roughly one per usable CPU:
 
