@@ -77,7 +77,24 @@ chunks is visible inside a 2000-frame trial at all.
 
 ## 3. The baseline
 
-<!-- filled by harness/set-baseline.sh -->
+Measured 2026-08-13 01:10–01:36 UTC on the rented box, 2000 frames per trial,
+commit `4dd82f2`. Every repeat produced the same frame hash (`76ca8f60…`) and the
+same x264 option string, so the gate is armed and meaningful.
+
+| regime | n | mean fps | min | max | spread |
+|---|---|---|---|---|---|
+| **A** — whole box, 9.6 CPU quota | 3 | **13.674** | 13.615 | 13.717 | **0.7%** |
+| **B** — `taskset 0-3`, CPU-starved | 2 | **9.251** | 9.242 | 9.259 | **0.2%** |
+
+**Spread is the noise floor.** A change smaller than it is weather, not an
+improvement. Regime A's 0.7% is the binding one — treat anything under **+1.0%
+in regime A** as no change and revert it. Regime B's 0.2% comes from only two
+repeats and should not be read as the tighter instrument; it is the smaller
+sample, not the quieter one.
+
+Regime B is 32% slower than A on identical work, which is the point: starving
+the CPU moves the bottleneck off the GPU, and a keeper has to survive both
+balances.
 
 ## 4. Control: is the upscaler even deterministic?
 
