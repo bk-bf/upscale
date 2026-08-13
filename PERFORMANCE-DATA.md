@@ -300,9 +300,9 @@ conditions. `cpu_util_mean` is whole-host across 40 cores. TRIAL.
 | regime | condition | cpu_util_mean | baseline fps | optimised fps | change |
 |---|---|---|---|---|---|
 | A | quiet | 20–24% | 13.684 (n=5) | 20.586 (n=14) | +50.4% |
-| A | contended | 43–46% | 12.147 (n=4) | 18.631 (n=4) | +53.4% |
+| A | contended | 43–46% | 12.188 (n=6) | 18.643 (n=6) | +53.0% |
 | B | quiet | 9–11% | 9.240 (n=4) | 11.075 (n=9) | +19.9% |
-| B | contended | 33–34% | 7.985 (n=3) | 9.144 (n=5) | +14.5% |
+| B | contended | 29–34% | 8.046 (n=4) | 9.189 (n=6) | +14.2% |
 
 Individual regime-A contended pairings span +48.8% to +60.1% depending on which runs are
 matched; runs are sequential, not simultaneous. The contended regime-A baseline is
