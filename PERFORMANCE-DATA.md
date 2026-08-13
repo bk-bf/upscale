@@ -366,6 +366,22 @@ Hardcoded `-j 4:8:8`, the regime-A optimum, measured in regime B: 10.204 fps (+1
 against 10.428 fps (+12.7%) for the same code with the thread mix derived from usable
 CPUs. TRIAL.
 
+## 19a. Leave-one-out ablation of the final configuration, `rental-C` regime A
+
+Each row removes one change from the finished configuration; all other changes stay in.
+Final configuration mean for comparison: 20.528 fps (n=9). TRIAL.
+
+| change removed | fps | delta attributable to that change |
+|---|---|---|
+| `-j load:proc:save` rule (upscaler falls back to its `1:2:2` default) | 7.710 | +166% |
+| extraction `-compression_level 0` (ffmpeg default compression) | 18.832 | +9.0% |
+| single upscaler invocation (spawned once per encoder block instead) | 19.305 | +6.3% |
+| batched shard/hash hardlinks (one `ln` fork per frame instead) | 20.346 | +0.9% |
+
+At the default `-j 1:2:2` a single upscaler process runs 2 save threads; the four-process
+baseline ran 8. Measured `cpu_util_mean` in that row: 7.4%, against 22.5% for the final
+configuration. OBS.
+
 ## 19. Rejected configurations from the optimisation loop — measured reasons
 
 Recorded as observations, not judgements. All regime A unless stated. TRIAL.

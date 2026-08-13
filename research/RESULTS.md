@@ -171,6 +171,39 @@ A block is therefore taken only once the upscaler is **200 frames past it**, abo
 save-thread count. This is the one place in the loop that is deliberately conservative
 rather than clever.
 
+### Leave-one-out ablation — what to port first
+
+The percentages in the table above are cumulative and in discovery order, which flatters
+whatever happened to land first. So each kept change was removed **from the finished
+configuration** and re-measured. This is what a reader porting one thing at a time
+actually needs:
+
+| removed from the final config | fps | that change is worth, at the end |
+|---|---|---|
+| the `-j` thread rule | 7.710 | **+166%** |
+| extraction `-compression_level 0` | 18.832 | **+9.0%** |
+| one upscaler invocation per job | 19.305 | **+6.3%** |
+| batched hardlinks | 20.346 | +0.9% |
+
+(They do not multiply out to +50%: each row is a single removal from the full config, not
+an independent factor.)
+
+Two things fall out of this that the discovery order hid.
+
+**The thread rule is not a tuning refinement — it is load-bearing.** Removing it drops the
+pipeline to 7.710 fps, which is **43.6% below the original baseline**, with `cpu_util` at
+7.4%. The reason is arithmetic: `-j` defaults to `1:2:2`, so the four-process baseline was
+running **8** save threads and a single process at the default runs **2**. *"Use one
+upscaler process instead of four" and "derive the thread count from the machine" are one
+change, not two.* Porting the first without the second would be far worse than shipping
+nothing. This is the single most important line in this report for anyone deploying from
+it.
+
+**Batched hardlinks were worth +4.7% when found and +0.9% at the end.** Nothing about them
+changed. In the baseline those 6000 forks sat in gaps with the GPU idle; in the final
+configuration they overlap an upscaler that is still running. A change's value is a
+property of the pipeline it lands in, not of the change.
+
 ---
 
 ## 4. The autotuned rule — deploy the rule, never the number
