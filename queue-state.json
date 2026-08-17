@@ -1,5 +1,9 @@
 {
  "held": {
   "/mnt/media/tv/Gintama": []
- }
+ },
+ "imports": [
+  "/mnt/media/tv/Gintama"
+ ],
+ "removed": {}
 }

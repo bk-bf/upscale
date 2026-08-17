@@ -105,10 +105,24 @@ _state_lock = threading.Lock()
 
 
 def _state() -> dict:
+    """What the user has decided. Three things, none of them derivable:
+
+      imports  libraries pulled into the queue, in the order they were added
+      held     episodes to skip for now (pause)
+      removed  episodes taken out of the queue entirely (delete)
+
+    Episodes themselves are NOT stored. Sonarr renames delivered files, so a
+    stored episode list would rot; the numbers above survive a rename because
+    they are episode identities, not filenames.
+    """
     try:
-        return json.loads(STATE_FILE.read_text())
+        s = json.loads(STATE_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"held": {}}
+        s = {}
+    s.setdefault("imports", [])
+    s.setdefault("held", {})
+    s.setdefault("removed", {})
+    return s
 
 
 def _save_state(s: dict) -> None:
@@ -117,18 +131,82 @@ def _save_state(s: dict) -> None:
     tmp.replace(STATE_FILE)          # atomic: a torn state file would lose holds
 
 
+def _set_for(key: str, lib: str) -> set[int]:
+    return {int(n) for n in (_state().get(key, {}).get(lib) or [])}
+
+
 def held_for(lib: str) -> set[int]:
-    return {int(n) for n in (_state().get("held", {}).get(lib) or [])}
+    return _set_for("held", lib)
+
+
+def removed_for(lib: str) -> set[int]:
+    return _set_for("removed", lib)
+
+
+def mutate_set(key: str, lib: str, episodes: list[int], add: bool) -> set[int]:
+    with _state_lock:
+        s = _state()
+        cur = {int(n) for n in (s.setdefault(key, {}).get(lib) or [])}
+        cur = (cur | set(episodes)) if add else (cur - set(episodes))
+        s[key][lib] = sorted(cur)
+        _save_state(s)
+        return cur
 
 
 def set_held(lib: str, episodes: list[int], hold: bool) -> set[int]:
+    return mutate_set("held", lib, episodes, hold)
+
+
+def imports() -> list[str]:
+    return list(_state().get("imports") or [])
+
+
+def add_import(path: str) -> list[str]:
     with _state_lock:
         s = _state()
-        cur = {int(n) for n in (s.setdefault("held", {}).get(lib) or [])}
-        cur = (cur | set(episodes)) if hold else (cur - set(episodes))
-        s["held"][lib] = sorted(cur)
+        if path not in s["imports"]:
+            s["imports"].append(path)
         _save_state(s)
-        return cur
+        return list(s["imports"])
+
+
+def drop_import(path: str) -> list[str]:
+    """Remove a library and forget its holds and deletions with it.
+
+    Leaving them behind means re-importing a library silently reinstates
+    decisions made who-knows-when, which is worse than starting clean.
+    """
+    with _state_lock:
+        s = _state()
+        s["imports"] = [p for p in s["imports"] if p != path]
+        s["held"].pop(path, None)
+        s["removed"].pop(path, None)
+        _save_state(s)
+        return list(s["imports"])
+
+
+def browse(cfg: dict, q: str) -> list[dict]:
+    """Folders under media_root matching q, for the import autocomplete."""
+    root = Path(cfg.get("media_root", "/mnt/media/tv"))
+    q = (q or "").strip().lower()
+    already = set(imports())
+    out = []
+    if not root.is_dir():
+        return out
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        if q and q not in d.name.lower():
+            continue
+        n = sum(1 for p in d.rglob("*")
+                if p.suffix.lower() in VIDEO_EXT and ".upscale-originals" not in p.parts)
+        if not n:
+            continue
+        out.append({"name": d.name, "path": str(d), "files": n,
+                    "imported": str(d) in already})
+        if len(out) >= 40:
+            break
+    return out
 
 
 EP_RE = __import__("re").compile(r"[Ss](\d+)[Ee](\d+)")
@@ -148,7 +226,7 @@ def queue_rows(cfg: dict, lib: str, host_states: list[dict]) -> dict:
     out = outstanding(cfg, lib)
     if out.get("error"):
         return {"error": out["error"], "rows": []}
-    held = held_for(lib)
+    held, gone = held_for(lib), removed_for(lib)
     running = {}
     for h in host_states:
         epname = (h.get("episode") or "")
@@ -164,6 +242,10 @@ def queue_rows(cfg: dict, lib: str, host_states: list[dict]) -> dict:
     for e in out["episodes"]:
         n = ep_num(e["name"])
         h = running.get(e["name"])
+        # Deleted episodes leave the queue entirely - that is the difference
+        # between delete and hold, and why they are separate sets.
+        if n is not None and n in gone and not h:
+            continue
         if h:
             status = "paused" if h.get("state") == "paused" else "running"
         elif n is not None and n in held:
@@ -189,10 +271,40 @@ def range_expr(cfg: dict, lib: str) -> str:
     hold is honoured by the pipeline itself instead of being a UI-only fiction.
     """
     out = outstanding(cfg, lib)
-    held = held_for(lib)
+    skip = held_for(lib) | removed_for(lib)
     nums = sorted({n for e in out.get("episodes", [])
-                   if (n := ep_num(e["name"])) is not None and n not in held})
+                   if (n := ep_num(e["name"])) is not None and n not in skip})
     return ",".join(str(n) for n in nums)
+
+
+def abort_host(cfg: dict, host: str) -> dict:
+    """Stop NOW, not after the episode.
+
+    Order matters: kill the queue first, or it starts the next episode the
+    moment the worker dies. Then the worker, then the GPU processes it spawned,
+    which do not die with their parent.
+
+    The in-flight episode is discarded, not resumed - but nothing is lost that
+    was already earned: finished chunks stay in scratch and a later run skips
+    them. Delivery is atomic (upload to a hidden .part, rename only after the
+    size matches), so an abort mid-upload cannot leave a half-file in the
+    library.
+    """
+    h = (cfg.get("hosts") or {}).get(host)
+    if not h:
+        return {"ok": False, "error": f"unknown host {host!r}"}
+    remote = ("pkill -f '[u]pscale (ep|run|once)' ; "
+              "pkill -f '[u]pscale-worker' ; "
+              "pkill -f '[r]ealesrgan-ncnn-vulkan' ; "
+              "pkill -f '[r]sync .*upscale' ; "
+              "rm -f ~/.upscale-ep/pause ~/.upscale-ep/stop ~/.upscale-queue/pause ~/.upscale-queue/stop ; "
+              "echo aborted")
+    rc, out, err = ssh_to(h.get("ssh", host), remote, timeout=25)
+    # pkill exits 1 when it matched nothing, which is a normal abort of an idle
+    # host, not a failure.
+    if rc not in (0, 1) and not out.strip():
+        return {"ok": False, "error": (err or f"ssh exited {rc}").strip()[:300]}
+    return {"ok": True, "action": "abort", "host": host}
 
 
 def outstanding(cfg: dict, lib_path: str) -> dict:
@@ -351,10 +463,9 @@ class Handler(BaseHTTPRequestHandler):
                 st["default_scratch"] = h.get("default_scratch")
                 out.append(st)
             return self._json({"hosts": out, "ts": int(time.time())})
+        if path == "/api/browse":
+            return self._json({"results": browse(cfg, (q.get("q") or [""])[0])})
         if path == "/api/queue":
-            lib = (q.get("lib") or [""])[0]
-            if not lib:
-                return self._json({"error": "lib is required"}, 400)
             hosts = cfg.get("hosts") or {}
             states = []
             for name, h in hosts.items():
@@ -362,8 +473,21 @@ class Handler(BaseHTTPRequestHandler):
                 if st.get("reachable"):
                     st.update(host_running(h, name))
                 states.append(st)
-            return self._json({**queue_rows(cfg, lib, states), "hosts": states,
-                               "run_range": range_expr(cfg, lib), "ts": int(time.time())})
+            # One table across every imported library, so the queue is the queue
+            # rather than a per-library view you have to remember to switch.
+            libs, rows, counts = [], [], {}
+            for lib in imports():
+                qr = queue_rows(cfg, lib, states)
+                name = Path(lib).name
+                libs.append({"path": lib, "name": name, "error": qr.get("error"),
+                             "run_range": range_expr(cfg, lib) if not qr.get("error") else "",
+                             "counts": qr.get("counts", {})})
+                for r in qr.get("rows", []):
+                    rows.append({**r, "library": lib, "library_name": name})
+                for k, v in (qr.get("counts") or {}).items():
+                    counts[k] = counts.get(k, 0) + v
+            return self._json({"libraries": libs, "rows": rows, "counts": counts,
+                               "hosts": states, "ts": int(time.time())})
         if path == "/api/health":
             return self._json({"ok": True, "config": str(CONFIG_PATH), "error": cfg.get("_error")})
         return self._static(path)
@@ -396,6 +520,28 @@ class Handler(BaseHTTPRequestHandler):
                                "run_range": range_expr(cfg, lib)})
         if path in ("/api/pause", "/api/resume", "/api/stop"):
             return self._json(control(cfg, body.get("host", ""), path.rsplit("/", 1)[1]))
+        if path == "/api/abort":
+            return self._json(abort_host(cfg, body.get("host", "")))
+        if path == "/api/import":
+            p = (body.get("path") or "").rstrip("/")
+            root = str(Path(cfg.get("media_root", "/mnt/media/tv")))
+            # Only inside media_root, and only somewhere that exists: this value
+            # reaches `upscale --list` as LIB.
+            if not p or not p.startswith(root + "/") or not Path(p).is_dir():
+                return self._json({"ok": False, "error": f"not a library under {root}"}, 400)
+            return self._json({"ok": True, "imports": add_import(p)})
+        if path == "/api/unimport":
+            return self._json({"ok": True, "imports": drop_import((body.get("path") or "").rstrip("/"))})
+        if path == "/api/remove":
+            lib = body.get("library", "")
+            eps = [int(n) for n in (body.get("episodes") or []) if str(n).isdigit()]
+            if not lib or not eps:
+                return self._json({"ok": False, "error": "library and episodes are required"}, 400)
+            # Delete removes from the QUEUE, never from disk. Nothing here
+            # deletes media; the source stays exactly where it is.
+            gone = mutate_set("removed", lib, eps, bool(body.get("remove", True)))
+            return self._json({"ok": True, "removed": sorted(gone),
+                               "run_range": range_expr(cfg, lib)})
         return self._json({"error": "not found"}, 404)
 
 

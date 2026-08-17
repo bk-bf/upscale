@@ -10,12 +10,20 @@
   let notice = $state("");
   let busy = $state("");
 
-  let lib = $state("");
-  let selected = $state(new Set());
+  let libs = $state([]);              // imported libraries
+  let selected = $state(new Set());   // keys: "<library>#<episode number>"
   let lastClicked = $state(null);
   let showStart = $state(false);
+  let showImport = $state(false);
+
+  // import autocomplete
+  let query = $state("");
+  let results = $state([]);
+  let hi = $state(0);
+  let searchTimer;
 
   // start-modal fields
+  let mLib = $state("");
   let mHost = $state("");
   let mScratch = $state("");
   let mRange = $state("");
@@ -28,45 +36,104 @@
     return r.json();
   };
 
-  async function loadLibraries() {
-    const d = await j("/api/libraries");
-    libraries = d.libraries || [];
-    if (!lib && libraries.length) {
-      // open on something with work in it rather than the alphabetical first
-      lib = (libraries.find((l) => l.archived > 0) || libraries[0]).path;
-    }
-  }
-
   async function refresh() {
-    if (!lib) return;
     try {
-      const d = await j(`/api/queue?lib=${encodeURIComponent(lib)}`);
-      if (d.error) { error = d.error; return; }
+      const d = await j("/api/queue");
       rows = d.rows || [];
       counts = d.counts || {};
       hosts = d.hosts || [];
-      runRange = d.run_range || "";
+      libs = d.libraries || [];
       if (!mHost && hosts.length) {
         mHost = hosts[0].id;
         mScratch = hosts[0].default_scratch || "";
       }
-      error = "";
+      error = libs.find((l) => l.error)?.error || "";
     } catch (e) { error = String(e); }
   }
 
-  async function hold(eps, on) {
-    if (!eps.length) return;
-    busy = "hold";
+  async function search() {
     try {
-      const d = await j("/api/hold", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ library: lib, episodes: eps, hold: on }),
-      });
-      notice = d.ok ? `${on ? "held" : "released"} ${eps.length} episode${eps.length > 1 ? "s" : ""}` : `failed: ${d.error}`;
+      const d = await j(`/api/browse?q=${encodeURIComponent(query)}`);
+      results = d.results || []; hi = 0;
+    } catch (e) { results = []; }
+  }
+  function onQuery() { clearTimeout(searchTimer); searchTimer = setTimeout(search, 120); }
+
+  async function importLib(path) {
+    busy = "import";
+    try {
+      const d = await j("/api/import", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
+      notice = d.ok ? `imported ${path.split("/").pop()}` : `failed: ${d.error}`;
+      if (d.ok) { showImport = false; query = ""; results = []; }
       await refresh();
     } catch (e) { notice = String(e); }
     finally { busy = ""; }
   }
+
+  async function unimport(path) {
+    if (!confirm(`Remove ${path.split("/").pop()} from the queue?\n\nNothing on disk is touched.`)) return;
+    busy = "unimport";
+    try {
+      await j("/api/unimport", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
+      selected = new Set();
+      await refresh();
+    } finally { busy = ""; }
+  }
+
+  // Selected rows grouped by library: every mutation is per-library, because
+  // an episode NUMBER only means something inside one show.
+  function byLibrary() {
+    const m = new Map();
+    for (const r of rows) {
+      if (!selected.has(key(r)) || r.n === null) continue;
+      if (!m.has(r.library)) m.set(r.library, []);
+      m.get(r.library).push(r.n);
+    }
+    return m;
+  }
+
+  async function mutate(endpoint, extra, label) {
+    const groups = byLibrary();
+    if (!groups.size) return;
+    busy = label;
+    try {
+      let n = 0;
+      for (const [library, episodes] of groups) {
+        const d = await j(endpoint, { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ library, episodes, ...extra }) });
+        if (!d.ok) { notice = `failed: ${d.error}`; break; }
+        n += episodes.length;
+      }
+      if (!notice.startsWith("failed")) notice = `${label} ${n} episode${n > 1 ? "s" : ""}`;
+      await refresh();
+    } catch (e) { notice = String(e); }
+    finally { busy = ""; }
+  }
+
+  const hold    = (on) => mutate("/api/hold", { hold: on }, on ? "held" : "released");
+
+  async function abort() {
+    const h = runningHost;
+    if (!h) return;
+    if (!confirm(`Abort ${h.label} now?\n\nThe episode in flight is discarded. Finished chunks stay in scratch and a later run skips them, and delivery is atomic, so nothing half-written reaches the library.`)) return;
+    busy = "abort";
+    try {
+      const d = await j("/api/abort", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ host: h.id }) });
+      notice = d.ok ? `aborted ${h.label}` : `failed: ${d.error}`;
+      await refresh();
+    } catch (e) { notice = String(e); }
+    finally { busy = ""; }
+  }
+  const remove  = () => {
+    const n = byLibrary().size ? [...byLibrary().values()].flat().length : 0;
+    if (!n) return;
+    if (!confirm(`Remove ${n} episode${n > 1 ? "s" : ""} from the queue?\n\nThe source files are NOT deleted — they stay exactly where they are.`)) return;
+    return mutate("/api/remove", { remove: true }, "removed");
+  };
 
   async function act(id, action) {
     busy = action;
@@ -86,7 +153,7 @@
     try {
       const d = await j("/api/start", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ host: mHost, library: lib, scratch: mScratch,
+        body: JSON.stringify({ host: mHost, library: mLib, scratch: mScratch,
                                range: mRange.trim() || undefined }),
       });
       notice = d.ok ? `started on ${d.host} — scratch ${d.work}` : `refused: ${d.error}`;
@@ -102,20 +169,28 @@
     const s = new Set(selected);
     if (ev.shiftKey && lastClicked !== null) {
       const [a, b] = [Math.min(lastClicked, i), Math.max(lastClicked, i)];
-      for (let k = a; k <= b; k++) if (rows[k].status !== "done") s.add(rows[k].n);
+      for (let k = a; k <= b; k++) if (rows[k].status !== "done") s.add(key(rows[k]));
     } else if (ev.ctrlKey || ev.metaKey) {
-      s.has(r.n) ? s.delete(r.n) : s.add(r.n);
+      s.has(key(r)) ? s.delete(key(r)) : s.add(key(r));
       lastClicked = i;
     } else {
-      s.clear(); s.add(r.n); lastClicked = i;
+      s.clear(); s.add(key(r)); lastClicked = i;
     }
     selected = s;
   }
 
-  const selectedRows = $derived(rows.filter((r) => selected.has(r.n)));
+  // autofocus the search when the import modal opens. An `autofocus` attribute
+  // warns (it is wrong on a page), but inside a modal that just opened it is
+  // exactly right — the user pressed + to type a name.
+  const focusOnMount = (node) => { node.focus(); };
+
+  const key = (r) => `${r.library}#${r.n}`;
+  const selectedRows = $derived(rows.filter((r) => selected.has(key(r))));
   const canHold    = $derived(selectedRows.some((r) => r.status === "queued"));
   const canRelease = $derived(selectedRows.some((r) => r.status === "held"));
+  const canRemove  = $derived(selectedRows.some((r) => r.status !== "running"));
   const selHost = $derived(hosts.find((h) => h.id === mHost));
+  const runningHost = $derived(hosts.find((h) => h.reachable && h.state !== "idle"));
 
   const hhmm = (s) => {
     if (!s || s < 0) return "–";
@@ -124,7 +199,6 @@
   };
 
   onMount(async () => {
-    await loadLibraries();
     await refresh();
     timer = setInterval(refresh, 3000);
   });
@@ -137,11 +211,6 @@
 
 <nav class="topbar">
   <span class="brand">upscale</span>
-  <select class="libpick" bind:value={lib} onchange={() => { selected = new Set(); refresh(); }}>
-    {#each libraries as l}
-      <option value={l.path}>{l.name}</option>
-    {/each}
-  </select>
 
   <span class="counts">
     {#if counts.running}<b class="c-running">{counts.running} running</b>{/if}
@@ -156,27 +225,41 @@
     <span class="hostchip" class:down={!h.reachable} title={h.error || h.work || ""}>
       {h.label}
       <em>{h.reachable ? (h.phase && h.phase !== "idle" ? h.phase : h.state) : "unreachable"}</em>
-      {#if h.reachable}
-        <button onclick={() => act(h.id, h.state === "paused" ? "resume" : "pause")} disabled={!!busy}>
-          {h.state === "paused" ? "▶" : "❚❚"}
-        </button>
-      {/if}
     </span>
   {/each}
 
-  <button class="add" onclick={() => { mRange = ""; showStart = true; }} title="Start a run">+</button>
+  <button class="tb" onclick={() => { mRange = ""; mLib = libs[0]?.path || ""; showStart = true; }}
+          disabled={!libs.length}>▶ Start</button>
+  <button class="tb" onclick={() => act(runningHost?.id, "stop")} disabled={!runningHost || !!busy}
+          title="Finish the current episode, then stop">■ Stop</button>
+  <button class="tb danger" onclick={abort} disabled={!runningHost || !!busy}
+          title="Kill the current episode now">✕ Abort</button>
+  <button class="add" onclick={() => { showImport = true; query = ""; search(); }} title="Import a library">+</button>
 </nav>
 
 {#if error}<p class="err bar">{error}</p>{/if}
 {#if notice}<button class="notice bar" onclick={() => (notice = "")}>{notice}</button>{/if}
 
+{#if libs.length}
+  <div class="libbar">
+    {#each libs as l}
+      <span class="libchip">
+        {l.name}
+        <span class="muted small">{l.counts?.queued ?? 0} queued</span>
+        <button title="Remove from queue" onclick={() => unimport(l.path)} disabled={!!busy}>×</button>
+      </span>
+    {/each}
+  </div>
+{/if}
+
 {#if selected.size}
   <div class="selbar">
     <span>{selected.size} selected</span>
-    <button onclick={() => hold([...selected], true)} disabled={!canHold || !!busy}>❚❚ Hold</button>
-    <button onclick={() => hold([...selected], false)} disabled={!canRelease || !!busy}>▶ Release</button>
+    <button onclick={() => hold(true)} disabled={!canHold || !!busy}>❚❚ Hold</button>
+    <button onclick={() => hold(false)} disabled={!canRelease || !!busy}>▶ Release</button>
+    <button class="danger" onclick={remove} disabled={!canRemove || !!busy}>🗑 Delete</button>
     <button class="ghost" onclick={() => (selected = new Set())}>Clear</button>
-    <span class="muted small">shift-click for a range · ctrl-click to add</span>
+    <span class="muted small">shift-click for a range · ctrl-click to add · delete removes from the queue, never from disk</span>
   </div>
 {/if}
 
@@ -197,7 +280,7 @@
           onclick={(e) => rowClick(e, i, r)}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); rowClick(e, i, r); } }}>
         <td class="num">{r.n ?? "–"}</td>
-        <td class="name" title={r.name}>{r.name}</td>
+        <td class="name" title="{r.library_name} · {r.name}">{#if libs.length > 1}<span class="libtag">{r.library_name}</span>{/if}{r.name}</td>
         <td class="st"><span class="pill {r.status}">{r.status === "running" && r.phase ? r.phase : r.status}</span></td>
         <td class="pr">
           {#if r.status === "running" || r.status === "paused"}
@@ -214,16 +297,51 @@
         <td class="et">{r.eta_s ? hhmm(r.eta_s) : ""}</td>
       </tr>
     {:else}
-      <tr><td colspan="6" class="muted pad">nothing here — pick another library</td></tr>
+      <tr><td colspan="6" class="muted pad">{libs.length ? "nothing outstanding in the imported libraries" : "no libraries imported — press + to add one"}</td></tr>
     {/each}
   </tbody>
 </table>
+
+{#if showImport}
+  <button class="scrim" aria-label="Close" onclick={() => (showImport = false)}></button>
+  <div class="modal">
+    <h2>Import a library</h2>
+    <input class="search" bind:value={query} oninput={onQuery} placeholder="type to filter — bleach, gin, naruto…"
+           use:focusOnMount
+           onkeydown={(e) => {
+             if (e.key === "ArrowDown") { hi = Math.min(hi + 1, results.length - 1); e.preventDefault(); }
+             else if (e.key === "ArrowUp") { hi = Math.max(hi - 1, 0); e.preventDefault(); }
+             else if (e.key === "Enter" && results[hi] && !results[hi].imported) importLib(results[hi].path);
+           }} />
+    <ul class="ac">
+      {#each results as r, i}
+        <li>
+          <button class="acrow" class:hi={i === hi} class:dim={r.imported}
+                  onmouseenter={() => (hi = i)}
+                  onclick={() => !r.imported && importLib(r.path)} disabled={r.imported || !!busy}>
+            <span class="acname">{r.name}</span>
+            <span class="muted small">{r.files} files</span>
+            {#if r.imported}<span class="pill done">imported</span>{/if}
+          </button>
+        </li>
+      {:else}
+        <li class="muted pad small">nothing under the media root matches</li>
+      {/each}
+    </ul>
+    <p class="muted small">Importing only adds it to this queue. Nothing is copied, moved or upscaled until you press Start.</p>
+  </div>
+{/if}
 
 {#if showStart}
   <button class="scrim" aria-label="Close" onclick={() => (showStart = false)}></button>
   <div class="modal">
     <h2>Start a run</h2>
     <div class="form">
+      <label>Library
+        <select bind:value={mLib}>
+          {#each libs as l}<option value={l.path}>{l.name}</option>{/each}
+        </select>
+      </label>
       <label>Destination host
         <select bind:value={mHost} onchange={() => { mScratch = selHost?.default_scratch || ""; }}>
           {#each hosts as h}<option value={h.id}>{h.label}</option>{/each}
@@ -238,13 +356,13 @@
         <input bind:value={mRange} placeholder={runRange ? "everything not held" : "any · 3 · 3-5 · 20-"} />
       </label>
     </div>
-    <p class="muted small">
-      Source: <b>{libraries.find((l) => l.path === lib)?.name ?? lib}</b>.
-      {#if !mRange.trim()}
-        Runs everything not held{counts.held ? ` (${counts.held} held will be skipped)` : ""} —
-        <span class="mono">{runRange.length > 70 ? runRange.slice(0, 70) + "…" : runRange || "nothing outstanding"}</span>
-      {/if}
-    </p>
+    {#if !mRange.trim()}
+      {@const L = libs.find((l) => l.path === mLib)}
+      <p class="muted small">
+        Runs everything in <b>{L?.name ?? "—"}</b> that is not held or deleted —
+        <span class="mono">{(L?.run_range || "").length > 70 ? L.run_range.slice(0, 70) + "…" : (L?.run_range || "nothing outstanding")}</span>
+      </p>
+    {/if}
     <div class="row gap">
       <button class="primary" onclick={start} disabled={!mHost || !!busy}>
         {busy === "start" ? "starting…" : "Start"}
@@ -272,6 +390,29 @@
   .hostchip.down em { color: #f8899f; }
   .hostchip button { background: #232838; border: 0; color: #e6e6e6; border-radius: 999px;
     width: 1.6rem; height: 1.6rem; cursor: pointer; font-size: .7rem; }
+  .tb { background: #1b2030; color: #e6e6e6; border: 1px solid #2b3244; border-radius: 6px;
+    padding: .3rem .6rem; font: inherit; font-size: .8rem; cursor: pointer; }
+  .tb:hover:not(:disabled) { background: #232838; }
+  .tb:disabled { opacity: .4; cursor: not-allowed; }
+  .tb.danger, .selbar .danger { border-color: #5a2233; color: #f8899f; }
+  .libbar { display: flex; gap: .4rem; padding: .4rem .9rem; background: #0e1119;
+    border-bottom: 1px solid #171b26; flex-wrap: wrap; }
+  .libchip { display: inline-flex; align-items: center; gap: .4rem; font-size: .78rem;
+    background: #161a24; border: 1px solid #232838; border-radius: 999px; padding: .15rem .25rem .15rem .6rem; }
+  .libchip button { background: transparent; border: 0; color: #8b93a7; cursor: pointer;
+    font-size: .95rem; line-height: 1; padding: 0 .3rem; }
+  .libchip button:hover { color: #f8899f; }
+  .libtag { color: #7ab6f5; font-size: .72rem; margin-right: .45rem; }
+  .search { width: 100%; box-sizing: border-box; margin-bottom: .6rem; }
+  .ac { list-style: none; margin: 0; padding: 0; max-height: 46vh; overflow-y: auto;
+    border: 1px solid #232838; border-radius: 8px; }
+  .ac li + li { border-top: 1px solid #171b26; }
+  .acrow { display: flex; align-items: center; gap: .6rem; width: 100%; text-align: left;
+    background: transparent; border: 0; color: #e6e6e6; font: inherit; font-size: .85rem;
+    padding: .45rem .6rem; cursor: pointer; }
+  .acrow.hi { background: #16203a; }
+  .acrow.dim { opacity: .5; cursor: default; }
+  .acname { flex: 1; }
   .add { width: 2rem; height: 2rem; border-radius: 8px; background: #1d4ed8; color: #fff;
     border: 0; font-size: 1.2rem; line-height: 1; cursor: pointer; }
   .add:hover { background: #2563eb; }
