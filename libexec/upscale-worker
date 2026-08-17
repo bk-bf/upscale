@@ -238,6 +238,46 @@ EOF
   say "processed $final frames, $(du -h "$OUT" | cut -f1)"
 }
 
+# Identity, not just shape.
+#
+# The episode that nearly shipped had the right duration, the right frame count
+# and the right stream layout. It was simply a DIFFERENT EPISODE, and every
+# count-based check in do_deliver passed it. Only comparing content catches that.
+#
+# This check existed, but only in `upscale collect` - the path that drove the
+# rented box. Everything delivered locally by `upscale run` / `upscale ep` went
+# out unverified.
+#
+# Best-of-N, not all-of-N, and that is not laziness: `-ss` before `-i` seeks to
+# the nearest keyframe, and an MPEG-4 source and an h264 output do not share
+# keyframe positions, so individual samples legitimately compare different frames
+# and score low - 13-18 dB on a known-good episode. A WRONG episode has no good
+# match at ANY timestamp; the near-miss scored 13.6 dB at its best, against
+# 29-44 dB for correct ones.
+#
+# Decoding uses $FFDEC for the same reason extraction does: the source is
+# MPEG-4 ASP, and a decoder that lies about it makes the comparison meaningless.
+IDENT_MIN_DB=${IDENT_MIN_DB:-20}
+ident_psnr(){          # $1 delivered mkv  $2 source -> best dB seen, "0" on error
+  local t best=0 p w h tmp
+  tmp=$(mktemp -d) || { printf '0'; return 0; }
+  read -r w h < <(ffprobe -v error -select_streams v -show_entries stream=width,height \
+                    -of csv=p=0 "$2" 2>/dev/null | tr ',' ' ') || true
+  if [ -z "${w:-}" ]; then rm -rf "$tmp"; printf '0'; return 0; fi
+  for t in 120 400 700 1000 1300; do
+    "$FFDEC" -v error -ss "$t" -i "$1" -frames:v 1 "$tmp/a.png" -y 2>/dev/null || continue
+    "$FFDEC" -v error -ss "$t" -i "$2" -frames:v 1 "$tmp/b.png" -y 2>/dev/null || continue
+    # NOT -v error on this one: the psnr filter reports at info level, and -v
+    # error hides the very line being parsed - which silently scores everything 0.
+    p=$("$FFDEC" -hide_banner -i "$tmp/a.png" -i "$tmp/b.png" \
+          -lavfi "[0:v]scale=$w:$h,format=gray[a];[1:v]format=gray[b];[a][b]psnr" \
+          -f null - 2>&1 | grep -oE 'average:[0-9.]+' | head -1 | cut -d: -f2) || p=0
+    # `if`, not `awk ... && best=$p`: a false `a && b` is fatal under set -e.
+    if awk -v a="${p:-0}" -v b="$best" 'BEGIN{exit !(a>b)}'; then best=$p; fi
+  done
+  rm -rf "$tmp"; printf '%s' "${best:-0}"
+}
+
 do_deliver(){
   # Sources may already live in the archive (the whole library was moved there
   # up front, so Jellyfin shows only finished upscales). In that case the
@@ -250,6 +290,18 @@ do_deliver(){
     *)            dest="${1:-$(dirname "$SRC_REMOTE")}" ;;
   esac
   [ -f "$OUT" ] || die "nothing to deliver; run process first"
+
+  # Verify BEFORE the upload, not after: the link is ~2.2 MB/s, so a wrong
+  # episode caught here costs seconds instead of half an hour of transfer, and
+  # nothing wrong ever reaches the library path at all.
+  [ -f "$LOCAL" ] || die "source gone from $W; cannot verify identity - re-run fetch"
+  local ident
+  ident=$(ident_psnr "$OUT" "$LOCAL") || ident=0
+  if awk -v x="${ident:-0}" -v m="$IDENT_MIN_DB" 'BEGIN{exit !(x>=m)}'; then
+    say "identity ok: ${ident} dB (floor ${IDENT_MIN_DB})"
+  else
+    die "IDENTITY CHECK FAILED for $BASE: best ${ident} dB < ${IDENT_MIN_DB} dB. Refusing to deliver - this output does not match its source."
+  fi
 
   say "delivering $BASE.mkv -> $dest"
   # Upload to a hidden temp name and rename only after the size is verified, so
