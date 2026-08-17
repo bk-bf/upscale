@@ -135,78 +135,222 @@ def _set_for(key: str, lib: str) -> set[int]:
     return {int(n) for n in (_state().get(key, {}).get(lib) or [])}
 
 
-def held_for(lib: str) -> set[int]:
-    return _set_for("held", lib)
+def held_for(_bucket: str = "*") -> set[str]:
+    """Held FILE PATHS. Keyed by path, not episode number: the queue holds
+    files now, and two shows both have an episode 3."""
+    return set(_state().get("held", {}).get("*") or [])
 
 
-def removed_for(lib: str) -> set[int]:
-    return _set_for("removed", lib)
+def removed_for(_bucket: str = "*") -> set[str]:
+    return set(_state().get("removed", {}).get("*") or [])
 
 
-def mutate_set(key: str, lib: str, episodes: list[int], add: bool) -> set[int]:
+def mutate_set(key: str, paths: list[str], add: bool) -> set[str]:
     with _state_lock:
         s = _state()
-        cur = {int(n) for n in (s.setdefault(key, {}).get(lib) or [])}
-        cur = (cur | set(episodes)) if add else (cur - set(episodes))
-        s[key][lib] = sorted(cur)
+        cur = set(s.setdefault(key, {}).get("*") or [])
+        cur = (cur | set(paths)) if add else (cur - set(paths))
+        s[key]["*"] = sorted(cur)
         _save_state(s)
         return cur
 
 
-def set_held(lib: str, episodes: list[int], hold: bool) -> set[int]:
-    return mutate_set("held", lib, episodes, hold)
+def all_hosts(cfg: dict) -> dict:
+    """Hosts from config.json plus any onboarded through the UI.
+
+    Onboarded ones live in the state file rather than config.json so that
+    adding a machine never rewrites a hand-written, commented config.
+    """
+    merged = dict(cfg.get("hosts") or {})
+    merged.update(_state().get("hosts") or {})
+    return merged
+
+
+def probe_host(ssh_target: str) -> dict:
+    """Look before saving. An entry that cannot be reached is worse than no
+    entry: it shows up as a broken panel forever and nobody remembers why."""
+    script = (
+        "echo HOST=$(hostname); "
+        "echo WORKER=$( (command -v upscale-worker || ls ~/.local/libexec/upscale-worker) 2>/dev/null | head -1); "
+        "echo UPSCALE=$( (command -v upscale || ls ~/.local/bin/upscale) 2>/dev/null | head -1); "
+        "echo GPU=$(lspci 2>/dev/null | grep -iE 'vga|3d controller' | head -1 | cut -d: -f3- | sed 's/^ //'); "
+        "echo CPUS=$(nproc); "
+        "for d in $HOME/upscale-scratch /mnt/scratch/upscale-ep /mnt/scratch /tmp; do "
+        "  [ -d \"$d\" ] && echo SCRATCH=$d:$(df -Pk \"$d\" | awk 'NR==2{print int($4/1048576)}'); done"
+    )
+    rc, out, err = ssh_to(ssh_target, script, timeout=25)
+    if rc != 0:
+        return {"ok": False, "error": (err or f"ssh exited {rc}").strip()[:400]}
+    info, scratch = {}, {}
+    for line in out.splitlines():
+        k, _, v = line.partition("=")
+        if k == "SCRATCH" and ":" in v:
+            d, _, free = v.rpartition(":")
+            scratch[Path(d).name if d != "/tmp" else "tmp"] = {"path": d, "free_gb": int(free or 0)}
+        elif k:
+            info[k.lower()] = v.strip()
+    return {"ok": True, **info, "scratch": scratch,
+            "ready": bool(info.get("worker")),
+            "note": "" if info.get("worker") else
+                    "upscale-worker not found on that machine - install it there first "
+                    "(./install.sh in the upscale repo), or this host cannot run anything."}
+
+
+def save_host(host_id: str, entry: dict) -> dict:
+    with _state_lock:
+        st = _state()
+        st.setdefault("hosts", {})[host_id] = entry
+        _save_state(st)
+        return st["hosts"]
+
+
+def forget_host(host_id: str) -> dict:
+    with _state_lock:
+        st = _state()
+        st.setdefault("hosts", {}).pop(host_id, None)
+        _save_state(st)
+        return st["hosts"]
 
 
 def imports() -> list[str]:
     return list(_state().get("imports") or [])
 
 
-def add_import(path: str) -> list[str]:
+def add_imports(paths: list[str]) -> list[str]:
     with _state_lock:
         s = _state()
-        if path not in s["imports"]:
-            s["imports"].append(path)
+        for p in paths:
+            if p not in s["imports"]:
+                s["imports"].append(p)
         _save_state(s)
         return list(s["imports"])
 
 
-def drop_import(path: str) -> list[str]:
-    """Remove a library and forget its holds and deletions with it.
+def drop_imports(paths: list[str]) -> list[str]:
+    """Remove entries and forget any hold or deletion attached to them, so a
+    re-import does not silently reinstate a decision made who knows when."""
+    with _state_lock:
+        s = _state()
+        keep = set(paths)
+        s["imports"] = [p for p in s["imports"] if p not in keep]
+        for k in ("held", "removed"):
+            s[k]["*"] = sorted(set(s.get(k, {}).get("*") or []) - keep)
+        _save_state(s)
+        return list(s["imports"])
 
-    Leaving them behind means re-importing a library silently reinstates
-    decisions made who-knows-when, which is worse than starting clean.
+
+def count_videos(d: Path, budget: int = 4000) -> int:
+    """Video files under d, walking at most `budget` entries.
+
+    Bounded on purpose: this runs for every row of an autocomplete, and an
+    unbounded rglob over something like /mnt/media would make each keystroke
+    walk the whole library.
     """
-    with _state_lock:
-        s = _state()
-        s["imports"] = [p for p in s["imports"] if p != path]
-        s["held"].pop(path, None)
-        s["removed"].pop(path, None)
-        _save_state(s)
-        return list(s["imports"])
+    n = seen = 0
+    stack = [d]
+    while stack and seen < budget:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    seen += 1
+                    if seen >= budget:
+                        break
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name.startswith(".") and e.name != ".upscale-originals":
+                            continue
+                        stack.append(Path(e.path))
+                    elif os.path.splitext(e.name)[1].lower() in VIDEO_EXT:
+                        n += 1
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
+            continue
+    return n
 
 
-def browse(cfg: dict, q: str) -> list[dict]:
-    """Folders under media_root matching q, for the import autocomplete."""
-    root = Path(cfg.get("media_root", "/mnt/media/tv"))
-    q = (q or "").strip().lower()
+def browse_roots(cfg: dict) -> list[str]:
+    r = cfg.get("browse_roots")
+    if r:
+        return [str(Path(p)) for p in r]
+    return [str(Path(cfg.get("media_root", "/mnt/media/tv")).parent)]
+
+
+def under_roots(cfg: dict, p: Path) -> bool:
+    return any(str(p) == r or str(p).startswith(r.rstrip("/") + "/") for r in browse_roots(cfg))
+
+
+def browse(cfg: dict, q: str) -> dict:
+    """Directory completion for the import box — ANY directory, not one root.
+
+    Two modes, chosen by whether the query looks like a path:
+      "/mnt/media/an"  -> complete the last segment inside /mnt/media
+      "gin"            -> match directory names one level under each root
+    A directory with no video files is still listed so it can be walked into;
+    it just cannot be imported.
+    """
+    q = (q or "").strip()
     already = set(imports())
+    roots = browse_roots(cfg)
+    cands: list[Path] = []
+    base_shown = ""
+
+    if q.startswith("/"):
+        if q.endswith("/"):
+            base, frag = Path(q), ""
+        else:
+            base, frag = Path(q).parent, Path(q).name.lower()
+        base_shown = str(base)
+        try:
+            cands = sorted((d for d in base.iterdir()
+                            if d.is_dir() and not d.name.startswith(".")
+                            and d.name.lower().startswith(frag)),
+                           key=lambda d: d.name.lower())
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
+            cands = []
+    else:
+        low = q.lower()
+        for r in roots:
+            try:
+                cands += [d for d in Path(r).iterdir()
+                          if d.is_dir() and not d.name.startswith(".")
+                          and (not low or low in d.name.lower())]
+            except (PermissionError, FileNotFoundError):
+                continue
+        cands.sort(key=lambda d: d.name.lower())
+
     out = []
-    if not root.is_dir():
-        return out
-    for d in sorted(root.iterdir()):
-        if not d.is_dir() or d.name.startswith("."):
-            continue
-        if q and q not in d.name.lower():
-            continue
-        n = sum(1 for p in d.rglob("*")
-                if p.suffix.lower() in VIDEO_EXT and ".upscale-originals" not in p.parts)
-        if not n:
-            continue
-        out.append({"name": d.name, "path": str(d), "files": n,
-                    "imported": str(d) in already})
-        if len(out) >= 40:
-            break
-    return out
+    for d in cands[:60]:
+        n = count_videos(d)
+        out.append({"kind": "dir", "name": d.name, "path": str(d), "files": n,
+                    "importable": False, "imported": False})
+
+    # Video files in the directory being browsed. These are what actually get
+    # imported - a queue entry is one episode, not a folder.
+    vids = []
+    if q.startswith("/"):
+        d = Path(q) if q.endswith("/") else Path(q).parent
+        frag = "" if q.endswith("/") else Path(q).name.lower()
+        try:
+            for f in sorted(d.iterdir(), key=lambda x: x.name.lower()):
+                if (f.is_file() and f.suffix.lower() in VIDEO_EXT
+                        and not f.name.startswith(".")
+                        and f.name.lower().startswith(frag)):
+                    vids.append({"kind": "file", "name": f.name, "path": str(f),
+                                 "size": f.stat().st_size,
+                                 "importable": under_roots(cfg, f),
+                                 "imported": str(f) in already})
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
+            pass
+    return {"results": out + vids[:400], "base": base_shown, "roots": roots}
+
+
+# A queue entry is a FILE, so the library root has to be inferred from it: the
+# worker needs LIB to work out where the output goes and where the original is
+# archived. "Season 1"/"Specials" are containers, not the show.
+SEASONISH = __import__("re").compile(r"(?i)^(season\b|specials$|s\d+$)")
+
+
+def library_root(f: Path) -> Path:
+    d = f.parent
+    return d.parent if SEASONISH.match(d.name) else d
 
 
 EP_RE = __import__("re").compile(r"[Ss](\d+)[Ee](\d+)")
@@ -217,64 +361,69 @@ def ep_num(name: str) -> int | None:
     return int(m.group(2)) if m else None
 
 
-def queue_rows(cfg: dict, lib: str, host_states: list[dict]) -> dict:
-    """One row per episode: what is done, held, running, or waiting.
+def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
+    """One row per imported FILE.
 
-    Done is read from the ARCHIVE, because that is what "done" means to this
-    pipeline - the original is moved aside once its upscale is published.
+    Status is derived, not stored:
+      running  the file's name is what a host says it is working on
+      done     the source is gone from its path and sits in the archive - which
+               is exactly what this pipeline means by finished
+      held     the user paused it
+      queued   everything else
+
+    A missing file that is NOT in the archive is reported as `missing` rather
+    than quietly dropped: it usually means it was renamed or moved, and hiding
+    that would make the queue silently shorter than the user's intent.
     """
-    out = outstanding(cfg, lib)
-    if out.get("error"):
-        return {"error": out["error"], "rows": []}
-    held, gone = held_for(lib), removed_for(lib)
     running = {}
     for h in host_states:
         epname = (h.get("episode") or "")
         if epname and h.get("state") in ("running", "working", "paused", "stopping"):
             running[epname] = h
 
+    held, gone = held_for("*"), removed_for("*")
     rows = []
-    arch = Path(lib) / ".upscale-originals"
-    done_names = {p.name for p in arch.rglob("*") if p.suffix.lower() in VIDEO_EXT} if arch.is_dir() else set()
-    for p in sorted(done_names):
-        n = ep_num(p)
-        rows.append({"n": n, "name": p, "status": "done", "path": ""})
-    for e in out["episodes"]:
-        n = ep_num(e["name"])
-        h = running.get(e["name"])
-        # Deleted episodes leave the queue entirely - that is the difference
-        # between delete and hold, and why they are separate sets.
-        if n is not None and n in gone and not h:
+    for path in imports():
+        p = Path(path)
+        n = ep_num(p.name)
+        if path in gone:
             continue
+        h = running.get(p.name)
+        lib = library_root(p)
+        arch = lib / ".upscale-originals"
+        archived = arch.is_dir() and any(x.name == p.name for x in arch.rglob("*"))
         if h:
             status = "paused" if h.get("state") == "paused" else "running"
-        elif n is not None and n in held:
+        elif archived:
+            # THE ARCHIVE IS THE DEFINITION OF DONE, not the path disappearing.
+            # With .mkv sources the delivered file takes the source's own path,
+            # so "the file is gone" is never true for them and every finished
+            # episode read as still queued.
+            status = "done"
+        elif not p.exists():
+            status = "missing"
+        elif path in held:
             status = "held"
         else:
             status = "queued"
-        row = {"n": n, "name": e["name"], "path": e["path"], "status": status}
+        row = {"n": n, "name": p.name, "path": path, "status": status,
+               "library": str(lib), "library_name": lib.name,
+               "size": p.stat().st_size if p.exists() else 0,
+               "device": h.get("label", "") if h else ""}
         if h:
             row.update({"percent": h.get("percent", 0), "fps": h.get("fps", 0),
                         "eta_s": h.get("eta_s", 0), "phase": h.get("phase", ""),
+                        "phase_percent": h.get("phase_percent", 0),
+                        "elapsed_s": h.get("elapsed_s", 0),
+                        "frames_done": h.get("frames_done", 0),
+                        "frames_total": h.get("frames_total", 0),
                         "host": h.get("id", "")})
         rows.append(row)
-    rows.sort(key=lambda r: (r["n"] is None, r["n"] if r["n"] is not None else 0, r["name"]))
-    return {"rows": rows, "held": sorted(held),
-            "counts": {s: sum(1 for r in rows if r["status"] == s)
-                       for s in ("done", "running", "paused", "held", "queued")}}
-
-
-def range_expr(cfg: dict, lib: str) -> str:
-    """The episode set to actually run: outstanding MINUS held.
-
-    Passed to `upscale ep` as an explicit comma list rather than `any`, so a
-    hold is honoured by the pipeline itself instead of being a UI-only fiction.
-    """
-    out = outstanding(cfg, lib)
-    skip = held_for(lib) | removed_for(lib)
-    nums = sorted({n for e in out.get("episodes", [])
-                   if (n := ep_num(e["name"])) is not None and n not in skip})
-    return ",".join(str(n) for n in nums)
+    rows.sort(key=lambda r: (r["library_name"].lower(), r["n"] is None,
+                             r["n"] if r["n"] is not None else 0, r["name"]))
+    return {"rows": rows,
+            "counts": {st: sum(1 for r in rows if r["status"] == st)
+                       for st in ("done", "running", "paused", "held", "queued", "missing")}}
 
 
 def abort_host(cfg: dict, host: str) -> dict:
@@ -290,7 +439,7 @@ def abort_host(cfg: dict, host: str) -> dict:
     size matches), so an abort mid-upload cannot leave a half-file in the
     library.
     """
-    h = (cfg.get("hosts") or {}).get(host)
+    h = all_hosts(cfg).get(host)
     if not h:
         return {"ok": False, "error": f"unknown host {host!r}"}
     remote = ("pkill -f '[u]pscale (ep|run|once)' ; "
@@ -361,39 +510,50 @@ def host_running(h: dict, name: str) -> dict:
 
 
 # ----------------------------------------------------------------- actions ---
-def start_job(cfg: dict, host: str, lib: str, rng: str, scratch: str) -> dict:
-    h = (cfg.get("hosts") or {}).get(host)
+def start_job(cfg: dict, host: str, paths: list[str], scratch: str) -> dict:
+    """Run the given files on a host, in order, one after another.
+
+    A file, not a range: the queue holds episodes now, and the worker's own
+    one-shot `run` takes exactly one source. LIB and ARCHIVE are set PER FILE,
+    because a selection can span shows and the worker uses LIB to work out both
+    where the output goes and where the original is archived.
+
+    setsid+nohup because this must outlive the ssh connection, the browser and
+    this service: it is a many-hour job, not a web request.
+    """
+    h = all_hosts(cfg).get(host)
     if not h:
         return {"ok": False, "error": f"unknown host {host!r}"}
-    libs = {l["path"]: l for l in libraries(cfg)}
-    if lib not in libs:
-        return {"ok": False, "error": f"unknown library {lib!r}"}
-    scratches = h.get("scratch") or {}
-    work = scratches.get(scratch)
+    if not paths:
+        return {"ok": False, "error": "nothing to run"}
+    work = (h.get("scratch") or {}).get(scratch)
     if scratch and not work:
         return {"ok": False, "error": f"unknown scratch {scratch!r} for {host}"}
 
     st = host_status(host, h)
-    if st.get("state") in ("running", "paused", "stopping"):
+    if st.get("state") in ("running", "working", "paused", "stopping"):
         return {"ok": False, "error": f"{host} is already on {st.get('episode') or 'a job'}"}
 
-    up = h.get("upscale") or "upscale"
-    env = f"SRC_EXT={shlex.quote(src_ext_for(cfg, Path(lib).name))}"
-    if work:
-        env += f" WORK={shlex.quote(work)}"
-    # setsid+nohup: this must outlive the ssh connection, the browser, and this
-    # service. The pipeline is a 24-hour job; a web request is not its lifetime.
-    remote = (f"setsid nohup env {env} {shlex.quote(up)} ep {shlex.quote(rng)} "
-              f"ubuntu:{shlex.quote(lib)} >> ~/upscale-ui.log 2>&1 < /dev/null & echo started")
+    worker = h.get("worker") or "upscale-worker"
+    lines = []
+    for f in paths:
+        lib = library_root(Path(f))
+        lines.append(
+            f"LIB={shlex.quote(str(lib))} ARCHIVE={shlex.quote(str(lib / '.upscale-originals'))} "
+            + (f"WORK={shlex.quote(work)} " if work else "")
+            + f"{shlex.quote(worker)} run {shlex.quote(f)} || exit 1")
+    script = "; ".join(lines)
+    remote = (f"setsid nohup sh -c {shlex.quote(script)} "
+              f">> ~/upscale-ui.log 2>&1 < /dev/null & echo started")
     rc, out, err = ssh_to(h.get("ssh", host), remote, timeout=25)
     if rc != 0:
         return {"ok": False, "error": (err or f"ssh exited {rc}").strip()[:300]}
-    return {"ok": True, "started": out.strip(), "host": host, "library": lib,
-            "range": rng, "work": work or "(host default)"}
+    return {"ok": True, "host": host, "count": len(paths),
+            "work": work or "(host default)"}
 
 
 def control(cfg: dict, host: str, action: str) -> dict:
-    h = (cfg.get("hosts") or {}).get(host)
+    h = all_hosts(cfg).get(host)
     if not h:
         return {"ok": False, "error": f"unknown host {host!r}"}
     if action not in ("pause", "resume", "stop"):
@@ -453,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "lib is required"}, 400)
             return self._json(outstanding(cfg, lib))
         if path == "/api/hosts":
-            hosts = cfg.get("hosts") or {}
+            hosts = all_hosts(cfg)
             out = []
             for name, h in hosts.items():
                 st = host_status(name, h)
@@ -464,29 +624,21 @@ class Handler(BaseHTTPRequestHandler):
                 out.append(st)
             return self._json({"hosts": out, "ts": int(time.time())})
         if path == "/api/browse":
-            return self._json({"results": browse(cfg, (q.get("q") or [""])[0])})
+            return self._json(browse(cfg, (q.get("q") or [""])[0]))
         if path == "/api/queue":
-            hosts = cfg.get("hosts") or {}
+            hosts = all_hosts(cfg)
             states = []
             for name, h in hosts.items():
                 st = host_status(name, h)
                 if st.get("reachable"):
                     st.update(host_running(h, name))
                 states.append(st)
-            # One table across every imported library, so the queue is the queue
-            # rather than a per-library view you have to remember to switch.
-            libs, rows, counts = [], [], {}
-            for lib in imports():
-                qr = queue_rows(cfg, lib, states)
-                name = Path(lib).name
-                libs.append({"path": lib, "name": name, "error": qr.get("error"),
-                             "run_range": range_expr(cfg, lib) if not qr.get("error") else "",
-                             "counts": qr.get("counts", {})})
-                for r in qr.get("rows", []):
-                    rows.append({**r, "library": lib, "library_name": name})
-                for k, v in (qr.get("counts") or {}).items():
-                    counts[k] = counts.get(k, 0) + v
-            return self._json({"libraries": libs, "rows": rows, "counts": counts,
+            qr = queue_rows(cfg, states)
+            libs = {}
+            for r in qr["rows"]:
+                libs.setdefault(r["library"], {"path": r["library"], "name": r["library_name"], "n": 0})
+                libs[r["library"]]["n"] += 1
+            return self._json({**qr, "libraries": list(libs.values()),
                                "hosts": states, "ts": int(time.time())})
         if path == "/api/health":
             return self._json({"ok": True, "config": str(CONFIG_PATH), "error": cfg.get("_error")})
@@ -501,47 +653,71 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return self._json({"ok": False, "error": "bad JSON body"}, 400)
         if path == "/api/start":
-            lib = body.get("library", "")
-            # An explicit episode list, not "any": that is how a hold reaches the
-            # pipeline instead of being a label this page draws on top of it.
-            rng = body.get("range") or (range_expr(cfg, lib) if lib else "") or "any"
-            return self._json(start_job(cfg, body.get("host", ""), lib, rng, body.get("scratch", "")))
+            paths = body.get("paths") or []
+            if not paths:
+                # Nothing selected: run everything queued, in table order, so the
+                # obvious click does the obvious thing.
+                cur = queue_rows(cfg, [host_status(n, h) for n, h in all_hosts(cfg).items()])
+                paths = [r["path"] for r in cur["rows"] if r["status"] == "queued"]
+            return self._json(start_job(cfg, body.get("host", ""), paths, body.get("scratch", "")))
+        if path == "/api/hosts/probe":
+            return self._json(probe_host((body.get("ssh") or "").strip()))
+        if path == "/api/hosts/add":
+            ssh_t = (body.get("ssh") or "").strip()
+            hid = (body.get("id") or "").strip() or ssh_t.split("@")[-1].split()[0]
+            if not ssh_t or not hid:
+                return self._json({"ok": False, "error": "ssh target is required"}, 400)
+            pr = probe_host(ssh_t)
+            if not pr.get("ok"):
+                return self._json({"ok": False, "error": pr.get("error")}, 400)
+            scratch = body.get("scratch") or {k: v["path"] for k, v in (pr.get("scratch") or {}).items()}
+            entry = {"ssh": ssh_t,
+                     "label": (body.get("label") or "").strip() or f"{pr.get('host', hid)}",
+                     "scratch": scratch,
+                     "default_scratch": body.get("default_scratch") or next(iter(scratch), ""),
+                     "worker": pr.get("worker") or "upscale-worker",
+                     "upscale": pr.get("upscale") or "upscale"}
+            return self._json({"ok": True, "id": hid, "hosts": save_host(hid, entry),
+                               "probe": pr})
+        if path == "/api/hosts/remove":
+            return self._json({"ok": True, "hosts": forget_host((body.get("id") or "").strip())})
         if path == "/api/hold":
-            lib = body.get("library", "")
-            eps = [int(n) for n in (body.get("episodes") or []) if str(n).isdigit()]
-            hold = bool(body.get("hold", True))
-            if not lib or not eps:
-                return self._json({"ok": False, "error": "library and episodes are required"}, 400)
+            paths = body.get("paths") or []
+            if not paths:
+                return self._json({"ok": False, "error": "paths are required"}, 400)
             # A RUNNING episode cannot be held - it is already on the GPU. qBit
-            # behaves the same way: pausing the active item stops the transfer,
-            # which here means pausing its host.
-            held = set_held(lib, eps, hold)
-            return self._json({"ok": True, "held": sorted(held),
-                               "run_range": range_expr(cfg, lib)})
+            # behaves the same way: pausing the active item stops it, which here
+            # means pausing its host.
+            return self._json({"ok": True,
+                               "held": sorted(mutate_set("held", paths, bool(body.get("hold", True))))})
         if path in ("/api/pause", "/api/resume", "/api/stop"):
             return self._json(control(cfg, body.get("host", ""), path.rsplit("/", 1)[1]))
         if path == "/api/abort":
             return self._json(abort_host(cfg, body.get("host", "")))
         if path == "/api/import":
-            p = (body.get("path") or "").rstrip("/")
-            root = str(Path(cfg.get("media_root", "/mnt/media/tv")))
-            # Only inside media_root, and only somewhere that exists: this value
-            # reaches `upscale --list` as LIB.
-            if not p or not p.startswith(root + "/") or not Path(p).is_dir():
-                return self._json({"ok": False, "error": f"not a library under {root}"}, 400)
-            return self._json({"ok": True, "imports": add_import(p)})
+            paths = [str(Path(x)) for x in (body.get("paths") or []) if x]
+            good, bad = [], []
+            for x in paths:
+                px = Path(x)
+                if px.is_file() and px.suffix.lower() in VIDEO_EXT and under_roots(cfg, px):
+                    good.append(x)
+                else:
+                    bad.append(x)
+            if not good:
+                return self._json({"ok": False,
+                                   "error": f"no importable video files ({len(bad)} rejected)"}, 400)
+            return self._json({"ok": True, "imports": add_imports(good),
+                               "added": len(good), "rejected": bad[:5]})
         if path == "/api/unimport":
-            return self._json({"ok": True, "imports": drop_import((body.get("path") or "").rstrip("/"))})
+            return self._json({"ok": True, "imports": drop_imports(body.get("paths") or [])})
         if path == "/api/remove":
-            lib = body.get("library", "")
-            eps = [int(n) for n in (body.get("episodes") or []) if str(n).isdigit()]
-            if not lib or not eps:
-                return self._json({"ok": False, "error": "library and episodes are required"}, 400)
-            # Delete removes from the QUEUE, never from disk. Nothing here
-            # deletes media; the source stays exactly where it is.
-            gone = mutate_set("removed", lib, eps, bool(body.get("remove", True)))
-            return self._json({"ok": True, "removed": sorted(gone),
-                               "run_range": range_expr(cfg, lib)})
+            paths = body.get("paths") or []
+            if not paths:
+                return self._json({"ok": False, "error": "paths are required"}, 400)
+            # Delete removes from the QUEUE, never from disk. Nothing in this
+            # service deletes media; the source stays exactly where it is.
+            drop_imports(paths)
+            return self._json({"ok": True, "imports": imports()})
         return self._json({"error": "not found"}, 404)
 
 

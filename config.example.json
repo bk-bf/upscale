@@ -8,6 +8,9 @@
   "upscale_bin": "/home/ubuntu/.local/bin/upscale",
   "_upscale_bin_comment": "ABSOLUTE. A systemd --user service has no ~/.local/bin on its PATH, so a bare \"upscale\" resolves to nothing and every library reports an error.",
 
+  "browse_roots": ["/mnt/media", "/home/ubuntu"],
+  "_browse_roots_comment": "Where the import box may browse. Any directory under these can be imported, not just media_root - a library is wherever you keep it.",
+
   "media_root": "/mnt/media/tv",
   "_media_root_comment": "Scanned one level deep for libraries. A directory counts as a library when it holds video files, so a new show appears without editing this file.",
 
