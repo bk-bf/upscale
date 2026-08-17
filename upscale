@@ -59,6 +59,15 @@ REMOTE=${REMOTE:-ubuntu}
 LIB=${LIB:-/mnt/media/tv/Bleach}
 ARCHIVE=${ARCHIVE:-$LIB/.upscale-originals}
 WORK=${WORK:-/mnt/scratch/upscale-ep}   # must match the worker's scratch dir
+# EXPORTED, because the worker is a SEPARATE PROCESS carrying the same three
+# names with the same Bleach defaults. Without this, pointing the queue at
+# another library moved only half the pipeline: the worker still archived
+# against /mnt/media/tv/Bleach, so `rel=${SRC_REMOTE#"$LIB"/}` stripped nothing
+# and the original was moved to
+#   /mnt/media/tv/Bleach/.upscale-originals//mnt/media/tv/<other-show>/...
+# Marking them exported here also covers the reassignment `upscale ep` performs
+# when given a library argument.
+export REMOTE LIB ARCHIVE WORK
 LIMIT=${LIMIT:-0}                 # 0 = no limit; used to bound test runs
 IDLE=${IDLE:-300}                 # seconds to wait when there is no work
 STATE=${STATE:-$HOME/.upscale-queue}
