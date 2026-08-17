@@ -32,48 +32,7 @@ ARCHIVE=${ARCHIVE:-$LIB/.upscale-originals}
 MODEL=${MODEL:-animejanai-suc}
 MODEL_DIR=${MODEL_DIR:-$HOME/upscale-bench/models_janai}
 BIN=${BIN:-$HOME/upscale-bench/bin/realesrgan-ncnn-vulkan}
-# ONE upscaler process with `-j load:proc:save`, not WORKERS of them.
-#
-# The old comment below recorded a sweep of the process count (4->33.1 fps,
-# 8->38.7, 12->36.4). That sweep was tuning the wrong knob. `-j` defaults to
-# `1:2:2`, so N processes were really running N load / 2N proc / 2N save threads
-# - arithmetic one process can be asked for directly - while paying N model loads
-# and N Vulkan inits per chunk and keeping N private queues, so a chunk could not
-# finish until its slowest shard did. Overnight measurement: +24% on its own,
-# the single largest change found.
-#
-# THE THREAD RULE IS NOT OPTIONAL. One process at the DEFAULT -j measured 7.710
-# fps - 43.6% BELOW the four-process baseline - because it drops from 8 save
-# threads to 2. "One process instead of N" and "derive -j from the machine" are
-# ONE change; porting the first without the second is far worse than shipping
-# nothing.
-#
-# What tracks the hardware is the SAVE count, at roughly one per usable CPU:
-# `load` inflates a 1x PNG, `save` deflates a 2x one (four times the pixels), and
-# `proc` mostly blocks on the GPU. Swept against a 9.6-CPU quota: save=4 gave
-# -7.9%, save=8 was the peak, save=16 gave back nine points to oversubscription.
-#
-# Usable CPUs is neither `nproc` nor the cgroup quota alone - a rented box
-# reported 40 processors while capped at 9.6 by cpu.max. Whichever is smallest is
-# what the process actually gets.
-cpus(){
-  local aff quota p n
-  aff=$(nproc)                       # nproc honours sched_getaffinity
-  quota=$aff
-  if [ -r /sys/fs/cgroup/cpu.max ]; then
-    read -r p n < /sys/fs/cgroup/cpu.max || true
-    if [ "${p:-max}" != max ] && [ "${n:-0}" -gt 0 ]; then quota=$((p / n)); fi
-  elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
-    p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us) || p=0
-    n=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us) || n=0
-    if [ "${p:-0}" -gt 0 ] && [ "${n:-0}" -gt 0 ]; then quota=$((p / n)); fi
-  fi
-  if [ "$quota" -lt "$aff" ]; then aff=$quota; fi
-  if [ "$aff" -lt 2 ]; then aff=2; fi
-  printf '%s' "$aff"
-}
-CPUS=$(cpus)
-JOBS=${JOBS:-$(( CPUS / 2 > 0 ? CPUS / 2 : 1 )):$CPUS:$CPUS}   # load:proc:save
+WORKERS=${WORKERS:-8}   # measured: 4->33.1 fps, 8->38.7, 12->36.4 (contention)
 CHUNK=${CHUNK:-2000}
 SCALE=${SCALE:-2}
 CRF=${CRF:-18}
@@ -181,7 +140,7 @@ do_process(){
   local FPS TOTAL
   FPS=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$LOCAL")
   TOTAL=$(vframes "$LOCAL")
-  say "$BASE: $TOTAL frames @ $FPS, $MODEL x$SCALE, -j $JOBS on $CPUS cpus"
+  say "$BASE: $TOTAL frames @ $FPS, $MODEL x$SCALE, $WORKERS workers"
   verify_decoder
 
   cat > "$JOB" <<EOF
@@ -198,15 +157,7 @@ EOF
   # duplicates frames to hit a target rate.
   if [ "$(pngs "$FRAMES")" != "$TOTAL" ]; then
     rm -f "$FRAMES"/*.png
-    # -compression_level 0: store, do not deflate. These frames are written once
-    # by ffmpeg, read back once by the upscaler, and deleted - so compressing
-    # them is paid twice, to deflate and to inflate again, and buys nothing.
-    # Measured +9.0% end-to-end when removed from the finished configuration.
-    # Legal because every check downstream hashes DECODED content, not file bytes.
-    # Cost is scratch: measured on this content, 0.37 MB/frame deflated against
-    # 0.88 MB/frame stored - about 12 GB -> 30 GB for a full 33k-frame episode.
-    "$FFDEC" -v error -nostdin -i "$LOCAL" -fps_mode passthrough \
-             -compression_level 0 "$FRAMES/%06d.png" -y
+    "$FFDEC" -v error -i "$LOCAL" -fps_mode passthrough "$FRAMES/%06d.png" -y
     local got; got=$(pngs "$FRAMES")
     [ "$got" = "$TOTAL" ] || die "extracted $got of $TOTAL frames"
     say "extracted $got frames"
@@ -216,7 +167,7 @@ EOF
   mapfile -t ALL < <(find "$FRAMES" -maxdepth 1 -name '*.png' -type f | sort)
   [ "${#ALL[@]}" = "$TOTAL" ] || die "listed ${#ALL[@]} files, expected $TOTAL"
 
-  local i=0 idx=0 seg n staged got enc_pid=""
+  local i=0 idx=0 seg n staged got enc_pid="" wpids wp
   while [ "$i" -lt "$TOTAL" ]; do
     idx=$((idx+1))
     seg=$(printf '%s/seg_%04d.mkv' "$SEGDIR" "$idx")
@@ -227,21 +178,23 @@ EOF
     while [ -f "$PAUSE" ]; do sleep 5; done
     [ -f "$STOP" ] && { say "stopped after chunk $((idx-1))"; break; }
 
-    # ONE staging dir, and the hardlinks made in ONE `ln -t` call. The old code
-    # forked mkdir+ln once per frame - ~2000 forks per chunk, all of it in the
-    # gaps between upscale phases with the GPU sitting idle.
     rm -rf "$W/shard"; mkdir -p "$W/shard"
-    ln -f -t "$W/shard" -- "${ALL[@]:i:n}"
-    staged=$(pngs "$W/shard")
+    for ((k=i; k<i+n; k++)); do
+      d="$W/shard/$(( (k-i) % WORKERS ))"; mkdir -p "$d"; ln -f "${ALL[$k]}" "$d/"
+    done
+    staged=0; for ((p=0; p<WORKERS; p++)); do staged=$((staged + $(pngs "$W/shard/$p"))); done
     [ "$staged" = "$n" ] || die "chunk $idx staged $staged of $n"
 
     mkdir -p "$UP"
-    # ONE upscaler over the whole chunk, with -j derived from the machine (see
-    # the cpus()/JOBS block above). Not N processes on N shards: that paid N
-    # model loads and N Vulkan inits per chunk, and a chunk could not finish
-    # until its slowest shard did.
-    "$BIN" -i "$W/shard" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png \
-           -j "$JOBS" >/dev/null 2>&1 || die "upscaler failed on chunk $idx"
+    # Collect worker PIDs and wait on those specifically. A bare `wait` waits for
+    # ALL children, which would reap the background encode from the previous
+    # chunk and make the later `wait "$enc_pid"` fail with "not a child".
+    wpids=()
+    for ((p=0; p<WORKERS; p++)); do
+      "$BIN" -i "$W/shard/$p" -o "$UP" -m "$MODEL_DIR" -n "$MODEL" -s "$SCALE" -f png >/dev/null 2>&1 &
+      wpids+=($!)
+    done
+    for wp in "${wpids[@]}"; do wait "$wp" || die "an upscale worker failed"; done
     got=$(pngs "$UP"); [ "$got" = "$n" ] || die "chunk $idx upscaled $got of $n"
 
     # Hand the frames off by RENAME (instant, same filesystem) and encode them in
