@@ -259,12 +259,21 @@ EOF
 # MPEG-4 ASP, and a decoder that lies about it makes the comparison meaningless.
 IDENT_MIN_DB=${IDENT_MIN_DB:-20}
 ident_psnr(){          # $1 delivered mkv  $2 source -> best dB seen, "0" on error
-  local t best=0 p w h tmp
+  local t best=0 p w h tmp dur
+  local -a times
   tmp=$(mktemp -d) || { printf '0'; return 0; }
   read -r w h < <(ffprobe -v error -select_streams v -show_entries stream=width,height \
                     -of csv=p=0 "$2" 2>/dev/null | tr ',' ' ') || true
   if [ -z "${w:-}" ]; then rm -rf "$tmp"; printf '0'; return 0; fi
-  for t in 120 400 700 1000 1300; do
+  # Sample at FRACTIONS of the duration, never fixed timestamps. The original
+  # 120/400/700/1000/1300 set was written for 23-minute episodes: on anything
+  # shorter every seek falls past the end, every sample is skipped, and the
+  # function returns 0 - which reads as "wrong episode" and refuses a delivery
+  # that is perfectly correct. Caught by a 3-second round-trip test.
+  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$2" 2>/dev/null) || dur=0
+  mapfile -t times < <(awk -v d="${dur:-0}" 'BEGIN{ if (d <= 0) d = 0;
+      split("10 25 45 65 85", p, " "); for (i = 1; i <= 5; i++) printf "%.2f\n", d * p[i] / 100 }')
+  for t in "${times[@]}"; do
     "$FFDEC" -v error -ss "$t" -i "$1" -frames:v 1 "$tmp/a.png" -y 2>/dev/null || continue
     "$FFDEC" -v error -ss "$t" -i "$2" -frames:v 1 "$tmp/b.png" -y 2>/dev/null || continue
     # NOT -v error on this one: the psnr filter reports at info level, and -v
@@ -313,17 +322,26 @@ do_deliver(){
   lsz=$(stat -c%s "$OUT")
   rsz=$(retry ssh "$REMOTE" "stat -c%s $(printf '%q' "$dest/$tmp")") || die "delivered file not found"
   [ "$lsz" = "$rsz" ] || die "delivered size $rsz != local $lsz"
-  retry ssh "$REMOTE" "mv -f $(printf '%q' "$dest/$tmp") $(printf '%q' "$dest/$BASE.mkv")" \
-    || die "could not publish $BASE.mkv"
-
+  # ARCHIVE BEFORE PUBLISHING.
+  #
+  # When sources are .mkv (SRC_EXT=mkv), the delivered path IS the source path:
+  # "$dest/$BASE.mkv" is the very file this episode was fetched from. Publishing
+  # first would overwrite the original and then archive the upscale on top of it
+  # - original gone, archive holding a copy of the output, and every later run
+  # comparing the result against itself. With .avi sources the two paths always
+  # differed, which is why this order was safe for years and is not any more.
   if [ "$pre_archived" = 1 ]; then
     say "original already archived, leaving in place"
   else
     local rel="${SRC_REMOTE#"$LIB"/}"
     retry ssh "$REMOTE" "mkdir -p $(printf '%q' "$ARCHIVE/$(dirname "$rel")") && \
-                   mv -n $(printf '%q' "$SRC_REMOTE") $(printf '%q' "$ARCHIVE/$rel")"
+                   mv -n $(printf '%q' "$SRC_REMOTE") $(printf '%q' "$ARCHIVE/$rel")" \
+      || die "could not archive the original - refusing to publish over it"
     say "archived original -> $ARCHIVE/$rel"
   fi
+
+  retry ssh "$REMOTE" "mv -f $(printf '%q' "$dest/$tmp") $(printf '%q' "$dest/$BASE.mkv")" \
+    || die "could not publish $BASE.mkv"
   rm -rf "$W"
 }
 

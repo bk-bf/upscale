@@ -92,6 +92,13 @@ fi
 # not export them, the worker still owns its own defaults.
 WORKERS=${WORKERS:-8}
 CHUNK=${CHUNK:-2000}
+# Which extensions are SOURCES. Comma or space separated; ".avi" for the DVD-era
+# rips this was built on, "mkv" for a show that arrives as h264/hevc already.
+#
+# Setting this to mkv makes sources and outputs share an extension, which the
+# discovery rule below has to handle explicitly - a delivered file is otherwise
+# indistinguishable from work still to do. See emit().
+SRC_EXT=${SRC_EXT:-avi}
 CONFIG="$STATE/config"
 say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$QLOG" >&2; }
 
@@ -143,6 +150,14 @@ lib_cmd(){  # run one command string wherever the library lives
 # Ask the server what is outstanding. Archived sources first, library sources
 # last; both sorted, so the order is stable across restarts.
 discover(){
+  # Build the find expression for SRC_EXT here, in THIS shell, and interpolate
+  # it: %q quotes the globs so they reach find intact instead of being expanded
+  # by whichever shell runs the remote script.
+  local _e SRCFIND=''
+  for _e in ${SRC_EXT//,/ }; do
+    SRCFIND="$SRCFIND -o -iname $(printf '%q' "*.$_e")"
+  done
+  SRCFIND="\\( ${SRCFIND# -o } \\)"
   lib_sh <<REMOTE_EOF
 set -euo pipefail
 lib=$(printf '%q' "$LIB"); arc=$(printf '%q' "$ARCHIVE")
@@ -167,9 +182,37 @@ ignored(){   # \$1 = source path
   done < "\$lib/.upscaleignore"
   return 1
 }
-emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in
+# Is there an ARCHIVED original for this identity? That is what tells a delivered
+# output apart from a source when the two share an extension - see emit().
+archived_for(){   # \$1 = SxxEyy (may be empty)   \$2 = basename without extension
+  [ -d "\$arc" ] || return 1
+  if [ -n "\$1" ]; then
+    find "\$arc" -type f -iname "*\$1*" 2>/dev/null | grep -q .
+  else
+    find "\$arc" -type f -name "\$2.*" 2>/dev/null | grep -q .
+  fi
+}
+emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in, \$3 = arc|lib
   if ignored "\$1"; then return 0; fi
   base=\$(basename "\${1%.*}")
+  # When SRC_EXT includes mkv, a source and a delivered output look identical:
+  # same extension, same episode identity, same directory. Two rules separate
+  # them, and both are needed.
+  #
+  # 1. An output is not its own proof of completion. The match below must ignore
+  #    the candidate itself, or every mkv source reports "already done".
+  # 2. Once an episode is finished its ORIGINAL is in the archive. So a LIBRARY
+  #    file whose identity already has an archived source is the output, not
+  #    work - otherwise the queue re-upscales its own results for ever.
+  #
+  # Only for library candidates whose extension is the output extension; an .avi
+  # source is never confusable with an .mkv output.
+  ext=\$(printf '%s' "\${1##*.}" | tr 'A-Z' 'a-z')
+  if [ "\$3" = lib ] && [ "\$ext" = mkv ]; then
+    if archived_for "\$(printf '%s' "\$base" | grep -oiE 'S[0-9]+E[0-9]+' | head -1 || true)" "\$base"; then
+      return 0
+    fi
+  fi
   # Match on EPISODE IDENTITY (SxxEyy), not on the exact filename.
   #
   # The delivered file does not keep the source's name. Sonarr re-detects the
@@ -184,14 +227,16 @@ emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in
   # exists to handle specials was never reached.
   se=\$(printf '%s' "\$base" | grep -oiE 'S[0-9]+E[0-9]+' | head -1) || se=''
   if [ -n "\$se" ]; then
-    if find "\$2" -maxdepth 1 -iname "*\$se*.mkv" 2>/dev/null | grep -q .; then return 0; fi
+    # ! -samefile "\$1": a candidate must not count as its own output.
+    if find "\$2" -maxdepth 1 -iname "*\$se*.mkv" ! -samefile "\$1" 2>/dev/null | grep -q .; then return 0; fi
     # a delivery in flight for this episode, by identity, for the same reason
     if find "\$2" -maxdepth 1 -iname ".*\$se*.mkv.part*" -newermt '30 minutes ago' 2>/dev/null | grep -q .; then
       return 0
     fi
   else
-    # no SxxEyy (specials): fall back to the exact name
-    if [ -f "\$2/\$base.mkv" ]; then return 0; fi
+    # no SxxEyy (specials): fall back to the exact name. Same self-match caveat:
+    # with SRC_EXT=mkv the source IS "\$2/\$base.mkv".
+    if [ -f "\$2/\$base.mkv" ] && [ "\$2/\$base.mkv" != "\$1" ]; then return 0; fi
     if find "\$2" -maxdepth 1 -name ".\$base.mkv.part*" -newermt '30 minutes ago' 2>/dev/null | grep -q .; then
       return 0
     fi
@@ -200,13 +245,13 @@ emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in
 }
 # archived sources -> output goes back to the matching library folder
 if [ -d "\$arc" ]; then
-  find "\$arc" -type f -name '*.avi' | sort | while read -r f; do
-    rel=\${f#"\$arc"/}; emit "\$f" "\$lib/\$(dirname "\$rel")"
+  find "\$arc" -type f $SRCFIND | sort | while read -r f; do
+    rel=\${f#"\$arc"/}; emit "\$f" "\$lib/\$(dirname "\$rel")" arc
   done
 fi
 # sources still in the library -> output lands beside them
-find "\$lib" -type f -name '*.avi' -not -path "\$lib/.*" | sort | while read -r f; do
-  emit "\$f" "\$(dirname "\$f")"
+find "\$lib" -type f $SRCFIND -not -path "\$lib/.*" | sort | while read -r f; do
+  emit "\$f" "\$(dirname "\$f")" lib
 done
 REMOTE_EOF
 }
@@ -1012,11 +1057,17 @@ col_fail(){            # $1 = source path, $2 = basename, $3 = reason
 # Cost is a couple of seconds per episode against a 25-minute render.
 IDENT_MIN_DB=${IDENT_MIN_DB:-20}
 ident_psnr(){          # $1 delivered  $2 source -> best-of-N dB
-  local t best=0 p w h tmp; tmp=$(mktemp -d) || { printf '0'; return 0; }
+  local t best=0 p w h tmp dur; local -a times; tmp=$(mktemp -d) || { printf '0'; return 0; }
   read -r w h < <(ffprobe -v error -select_streams v -show_entries stream=width,height \
                     -of csv=p=0 "$2" 2>/dev/null | tr ',' ' ') || true
   [ -n "${w:-}" ] || { rm -rf "$tmp"; printf '0'; return 0; }
-  for t in 120 400 700 1000 1300; do
+  # Fractions of the duration, not fixed timestamps - a fixed set scores 0 on
+  # any episode shorter than the largest timestamp, which reads as "wrong
+  # episode" and refuses a correct delivery.
+  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$2" 2>/dev/null) || dur=0
+  mapfile -t times < <(awk -v d="${dur:-0}" 'BEGIN{ if (d <= 0) d = 0;
+      split("10 25 45 65 85", q, " "); for (i = 1; i <= 5; i++) printf "%.2f\n", d * q[i] / 100 }')
+  for t in "${times[@]}"; do
     ffmpeg -v error -ss "$t" -i "$1" -frames:v 1 "$tmp/a.png" -y 2>/dev/null || continue
     ffmpeg -v error -ss "$t" -i "$2" -frames:v 1 "$tmp/b.png" -y 2>/dev/null || continue
     # NOT -v error here: the psnr filter reports at info level, and -v error

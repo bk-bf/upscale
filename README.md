@@ -69,6 +69,28 @@ Everything is an environment variable:
 | `LIMIT` | `0` | stop after N episodes (`0` = unlimited) |
 | `EPISODES` | `any` | which episodes this machine owns (see below) |
 | `IDENT_MIN_DB` | `20` | identity floor: an output scoring below this against its own source is refused |
+| `SRC_EXT` | `avi` | which extensions are sources. `mkv` for a show that already arrives as h264/hevc; comma or space separated for both |
+
+### Sources that are already `.mkv`
+
+`SRC_EXT=mkv` makes sources and outputs share an extension, which breaks the
+"which source has no matching `.mkv`?" question the whole design rests on — a
+delivered file then looks exactly like work still to do, and the queue upscales
+its own results for ever. Two rules restore it:
+
+- a candidate never counts as its **own** output (`! -samefile`)
+- a **library** file whose episode identity already has an **archived** original
+  is a finished output, not work — archiving is what "done" means here
+
+So completion is still derived, not remembered; no saved work list appears.
+
+Delivery also archives the original **before** publishing, because with
+`SRC_EXT=mkv` the delivered path *is* the source path. The old order would have
+overwritten the original and then archived the upscale on top of it.
+
+```bash
+SRC_EXT=mkv LIB=/mnt/media/tv/Gintama upscale ep 3
+```
 
 ### Excluding sources: `$LIB/.upscaleignore`
 
