@@ -69,10 +69,10 @@ keyframe's PTS lands on the *previous* one. Cutting at `83.416666` when the keyf
 at `83.417000` silently took 42 extra frames.
 → Cut by verified frame count, not computed timestamp, and assert the total afterwards.
 
-## `set -e` and exit status — six separate outages
+## `set -e` and exit status — seven separate outages
 
 `var=$(cmd)` **adopts cmd's exit status**. Under `set -euo pipefail` that kills the
-script, with no message. This caused six different failures before the pattern was
+script, with no message. This caused seven different failures before the pattern was
 recognised:
 
 - the profiler died the moment nothing matched a `pgrep`
@@ -85,6 +85,13 @@ recognised:
 - `ep=$(sed ... "$QLOG" | tail -1)` did the same thing on the GPU box, where
   there is no collector log to read. Exit 2, no output, nothing in any log.
   `2>/dev/null` hides the message but not the status.
+- **`se=$(… | grep -oiE 'S[0-9]+E[0-9]+' | head -1)` in `discover()`'s `emit`**
+  made the whole library report **nothing outstanding**. One archived file —
+  `Specials/[Lunar] Bleach S1-S2 [640x480][AF803142].avi` — carries no `SxxEyy`,
+  so grep exits 1, the assignment adopts it, and the discovery subshell dies
+  before emitting a single candidate. The queue then sits idle looking healthy,
+  and the `else` branch written specifically to handle specials by exact name is
+  unreachable. `epkey()` and `epnum()` had `|| se=''`; `emit` did not.
 
 Related: **`grep -c` and `pgrep -c` print `0` *and* exit non-zero.** So
 `n=$(grep -c x f || echo 0)` yields the string `"0\n0"`, which then blows up any
@@ -167,6 +174,17 @@ Every one of these made the pipeline *look* broken or fine when it wasn't:
   of 9.6. Tuning workers on `nproc` caused hard CFS throttling — 2654 of 7294 periods
   throttled — and made 8 workers **three times slower** than 4 on that box. Read
   `cpu.cfs_quota_us`, not `nproc`.
+- **`~/.local/bin` is not on the PATH of a non-interactive ssh session.** The run loop
+  called the worker as a bare `upscale-ep`, so `upscale run` died with
+  `line 1306: upscale-ep: command not found` the moment it was started over ssh rather
+  than from a login shell. The same trap hit `ssh ubuntu wake-desktop` and `ssh laptop
+  osd` in unrelated tooling — assume no PATH beyond the system default.
+  **Worse than failing:** `install.sh` installs the worker as `libexec/upscale-worker`,
+  but the bare name `upscale-ep` is what the pre-rename installs left on `$PATH`. On a
+  machine carrying both, `run` silently executed the *old* worker — the one with no
+  decoder cross-check and no PSNR delivery check, i.e. exactly the version whose missing
+  guards are the subject of this file. Resolve the worker by path (`$WORKER`), never by
+  name.
 
 ## The one that nearly shipped: the wrong episode, correctly counted
 
