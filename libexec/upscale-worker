@@ -87,7 +87,24 @@ cmd_status(){
 # Always valid JSON, including when there is no job at all - a consumer should
 # never have to distinguish "no job" from "ssh failed" by parse error.
 cmd_status_json(){
-  local segs=0 chunks=0 state=idle df=0 pct=0 fps=0 elapsed=0 eta=0 ep=""
+  local segs=0 chunks=0 state=idle df=0 pct=0 fps=0 elapsed=0 eta=0 ep="" phase=idle
+  # THE JOB FILE IS NOT THE JOB. do_process writes it and deletes it again when
+  # the GPU work ends, so it exists for only one of the three phases. Fetch and
+  # deliver are minutes each - ~900 MB over a ~2 MB/s link - and reading $JOB
+  # alone reported "idle" while an 861 MB upload was in flight.
+  #
+  # The worker PROCESS is the ground truth that something is happening; the job
+  # file, the GPU and rsync then say which phase it is in.
+  local wargs=""
+  wargs=$(pgrep -af '[u]pscale-worker (run|fetch|process|deliver)' 2>/dev/null | head -1) || wargs=""
+  if [ -n "$wargs" ]; then
+    state=working
+    # Everything after the phase word is the path - NOT the last space-separated
+    # token. Episode titles are full of spaces ("A Gentle Right Arm SDTV.mkv"),
+    # so ${wargs##* } returned "HDTV-720p.mkv".
+    ep=$(printf '%s' "$wargs" | sed -E 's#^.*upscale-worker (run|fetch|process|deliver) ##')
+    ep=$(basename "$ep")
+  fi
   if [ -f "$JOB" ]; then
     # shellcheck disable=SC1090
     . "$JOB"
@@ -110,11 +127,24 @@ cmd_status_json(){
   # file persists across a crash, so "running" alone would lie.
   local busy=false
   pgrep -f '[r]ealesrgan-ncnn-vulkan' >/dev/null 2>&1 && busy=true
+
+  # Which phase, in the order that makes a single answer unambiguous. rsync
+  # carrying an .mkv is the finished episode going OUT; anything else rsync is
+  # doing here is the source coming IN.
+  if [ "$busy" = true ]; then
+    phase=processing
+  elif pgrep -f '[r]sync .*\.mkv' >/dev/null 2>&1; then
+    phase=delivering
+  elif pgrep -f '[r]sync ' >/dev/null 2>&1; then
+    phase=fetching
+  elif [ -n "$wargs" ]; then
+    phase=working          # between phases: extracting, encoding, verifying
+  fi
   printf '{"host":"%s","state":"%s","episode":"%s","chunks_done":%d,"chunks_total":%d,' \
     "$(hostname)" "$state" "${ep//\"/}" "$segs" "$chunks"
   printf '"frames_done":%d,"frames_total":%d,"percent":%d,"fps":%s,"elapsed_s":%d,"eta_s":%d,' \
     "$df" "${TOTAL:-0}" "$pct" "${fps:-0}" "$elapsed" "${eta:-0}"
-  printf '"gpu_busy":%s,"work":"%s"}\n' "$busy" "$WORK"
+  printf '"gpu_busy":%s,"phase":"%s","work":"%s"}\n' "$busy" "$phase" "$WORK"
 }
 
 PHASE="${1:-}"
