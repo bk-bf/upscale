@@ -62,10 +62,11 @@ Everything is an environment variable:
 | `LIB` | `/mnt/media/tv/Bleach` | library root on the server |
 | `ARCHIVE` | `$LIB/.upscale-originals` | where originals go once replaced |
 | `MODEL` / `MODEL_DIR` | `animejanai-suc` | ncnn model name and directory |
-| `WORKERS` | `8` | concurrent upscaler processes (measured optimum) |
+| `JOBS` | derived | upscaler `-j load:proc:save`; defaults to `cpus/2 : cpus : cpus` from the machine's *usable* CPUs |
+| `WORKERS` | `8` | **no longer used by the worker** — one upscaler process replaced N (see below); still read by the queue for back-compat |
 | `CHUNK` | `2000` | frames per resumable chunk |
 | `CRF` / `PRESET` | `18` / `veryfast` | x264 encode settings |
-| `WORK` | `/mnt/scratch/upscale` | scratch dir (needs ~12 GB free) |
+| `WORK` | `/mnt/scratch/upscale` | scratch dir (needs **~30 GB** free for a 23-min episode: frames are stored, not deflated) |
 | `LIMIT` | `0` | stop after N episodes (`0` = unlimited) |
 | `EPISODES` | `any` | which episodes this machine owns (see below) |
 | `IDENT_MIN_DB` | `20` | identity floor: an output scoring below this against its own source is refused |
@@ -314,6 +315,29 @@ duplicate and reusing their upscales is nearly free. It was rejected here becaus
 judders on slow pans: the frames aren't bit-identical (compression noise differs), so the
 match has to be perceptual, and a perceptual match that's wrong freezes real motion.
 `tools/dedup/` keeps the implementation for anyone whose source tolerates it.
+
+### The worker-count row above was tuning the wrong knob
+
+An overnight optimisation loop (`research/`, and `PERFORMANCE-DATA.md`) found that the
+"concurrent workers" line was measuring a proxy. `realesrgan-ncnn-vulkan` takes
+`-j load:proc:save`, defaulting to `1:2:2`, so *N processes* meant N load / 2N proc / 2N
+save threads — arithmetic one process can be asked for directly, without paying N model
+loads and N Vulkan inits per chunk, and without a chunk waiting on its slowest shard.
+
+**These are one change, not two.** One process at the *default* `-j` measured 7.710 fps,
+**43.6% below** the four-process baseline, because it drops from 8 save threads to 2.
+Porting "one process instead of N" without the thread rule is far worse than shipping
+nothing. What tracks the hardware is the **save** count, at roughly one per usable CPU —
+and usable is `min(nproc, cgroup quota)`, since one rented box reported 40 processors
+while capped at 9.6.
+
+Kept and ported: the single upscaler with derived `-j`, `-compression_level 0` on
+extraction (+9.0% when removed from the finished config; costs ~12 GB → ~30 GB of
+scratch), and batched hardlinks (one `ln -t` per chunk instead of ~2000 forks).
+
+**Not ported: one upscaler invocation per *episode* rather than per chunk** (+6.3%). It
+deletes chunking, and chunking is what makes this worker resumable — `chunk N complete,
+skipping` after a power cut. The research harness has no such requirement; this does.
 
 ## Notes
 
