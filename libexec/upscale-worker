@@ -80,9 +80,46 @@ cmd_status(){
   fi
 }
 
+# Same facts as cmd_status, as JSON, for anything that is not a human: the web
+# UI polls this over ssh rather than scraping the text form, which would break
+# the moment a label is reworded.
+#
+# Always valid JSON, including when there is no job at all - a consumer should
+# never have to distinguish "no job" from "ssh failed" by parse error.
+cmd_status_json(){
+  local segs=0 chunks=0 state=idle df=0 pct=0 fps=0 elapsed=0 eta=0 ep=""
+  if [ -f "$JOB" ]; then
+    # shellcheck disable=SC1090
+    . "$JOB"
+    ep=$(basename "$SRC")
+    [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
+    chunks=$(( (TOTAL + CHUNK - 1) / CHUNK ))
+    state=running
+    [ -f "$PAUSE" ] && state=paused
+    [ -f "$STOP" ]  && state=stopping
+    kill -0 "$PID" 2>/dev/null || state="not running"
+    df=$(( segs * CHUNK )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
+    pct=$(( TOTAL ? df * 100 / TOTAL : 0 ))
+    if [ -f "$STATE/started" ] && [ "$df" -gt 0 ]; then
+      elapsed=$(( $(date +%s) - $(cat "$STATE/started") ))
+      read -r fps eta < <(awk -v f="$df" -v e="$elapsed" -v r="$((TOTAL-df))" \
+        'BEGIN{ x=(e>0)?f/e:0; printf "%.2f %d\n", x, (x>0)?r/x:0 }')
+    fi
+  fi
+  # A GPU actually turning is the one thing the job file cannot tell you: the
+  # file persists across a crash, so "running" alone would lie.
+  local busy=false
+  pgrep -f '[r]ealesrgan-ncnn-vulkan' >/dev/null 2>&1 && busy=true
+  printf '{"host":"%s","state":"%s","episode":"%s","chunks_done":%d,"chunks_total":%d,' \
+    "$(hostname)" "$state" "${ep//\"/}" "$segs" "$chunks"
+  printf '"frames_done":%d,"frames_total":%d,"percent":%d,"fps":%s,"elapsed_s":%d,"eta_s":%d,' \
+    "$df" "${TOTAL:-0}" "$pct" "${fps:-0}" "$elapsed" "${eta:-0}"
+  printf '"gpu_busy":%s,"work":"%s"}\n' "$busy" "$WORK"
+}
+
 PHASE="${1:-}"
 case "$PHASE" in
-  status) cmd_status; exit 0 ;;
+  status) if [ "${2:-}" = --json ]; then cmd_status_json; else cmd_status; fi; exit 0 ;;
   pause)  touch "$PAUSE"; echo "pausing after current chunk"; exit 0 ;;
   resume) rm -f "$PAUSE"; echo resumed; exit 0 ;;
   stop)   touch "$STOP";  echo "stopping after current chunk"; exit 0 ;;
