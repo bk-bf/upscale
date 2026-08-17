@@ -1,0 +1,28 @@
+# upscale-ui — the web front end for the upscale pipeline.
+#
+# A WEB SERVICE genuinely has to be a daemon: it must answer a request that
+# arrives when nobody is logged in. That is not the same thing as the upscale
+# QUEUE daemon, which was removed on purpose - this service never upscales
+# anything and never starts work on its own. It only answers HTTP, and starts a
+# run when someone presses a button.
+#
+#   ./install.sh --with-units
+#   loginctl enable-linger "$USER"
+#   systemctl --user enable --now upscale-ui
+[Unit]
+Description=upscale web UI
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@SRC@
+ExecStart=/usr/bin/python3 @SRC@/server.py
+Restart=on-failure
+RestartSec=5
+# It binds the tailscale address, which does not exist until tailscaled is up;
+# on a cold boot the unit would otherwise fail before the interface appears.
+ExecStartPre=/bin/sh -c 'for i in $(seq 30); do ip -4 addr show | grep -q 100.122.63.6 && exit 0; sleep 2; done; exit 1'
+
+[Install]
+WantedBy=default.target
