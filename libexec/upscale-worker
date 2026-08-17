@@ -87,7 +87,7 @@ cmd_status(){
 # Always valid JSON, including when there is no job at all - a consumer should
 # never have to distinguish "no job" from "ssh failed" by parse error.
 cmd_status_json(){
-  local segs=0 chunks=0 state=idle df=0 pct=0 fps=0 elapsed=0 eta=0 ep="" phase=idle
+  local segs=0 chunks=0 state=idle df=0 pct=0 fps=0 elapsed=0 eta=0 ep="" phase=idle pp=0
   # THE JOB FILE IS NOT THE JOB. do_process writes it and deletes it again when
   # the GPU work ends, so it exists for only one of the three phases. Fetch and
   # deliver are minutes each - ~900 MB over a ~2 MB/s link - and reading $JOB
@@ -115,12 +115,24 @@ cmd_status_json(){
     [ -f "$PAUSE" ] && state=paused
     [ -f "$STOP" ]  && state=stopping
     kill -0 "$PID" 2>/dev/null || state="not running"
-    df=$(( segs * CHUNK )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
+    # Completed segments PLUS the frames already upscaled in the current chunk.
+    # Counting only finished segments left rate and eta empty for the first
+    # ~3 minutes of every episode, and made the bar jump once per chunk instead
+    # of moving - the queue's own display has counted both for this reason.
+    local inflight=0
+    [ -n "${UPDIR:-}" ] && [ -d "$UPDIR" ] && inflight=$(pngs "$UPDIR")
+    df=$(( segs * CHUNK + inflight )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
     pct=$(( TOTAL ? df * 100 / TOTAL : 0 ))
-    if [ -f "$STATE/started" ] && [ "$df" -gt 0 ]; then
-      elapsed=$(( $(date +%s) - $(cat "$STATE/started") ))
-      read -r fps eta < <(awk -v f="$df" -v e="$elapsed" -v r="$((TOTAL-df))" \
-        'BEGIN{ x=(e>0)?f/e:0; printf "%.2f %d\n", x, (x>0)?r/x:0 }')
+    [ -f "$STATE/started" ] && elapsed=$(( $(date +%s) - $(cat "$STATE/started") ))
+    # Rate over the UPSCALE phase only - see upscale_started above.
+    if [ -f "$STATE/upscale_started" ]; then
+      local _t0=0 _b=0
+      read -r _t0 _b < "$STATE/upscale_started" || true
+      local _dt=$(( $(date +%s) - ${_t0:-0} )) _dfr=$(( df - ${_b:-0} ))
+      if [ "$_dt" -gt 0 ] && [ "$_dfr" -gt 0 ]; then
+        read -r fps eta < <(awk -v f="$_dfr" -v e="$_dt" -v r="$((TOTAL-df))" \
+          'BEGIN{ x=(e>0)?f/e:0; printf "%.2f %d\n", x, (x>0)?r/x:0 }')
+      fi
     fi
   fi
   # A GPU actually turning is the one thing the job file cannot tell you: the
@@ -128,23 +140,70 @@ cmd_status_json(){
   local busy=false
   pgrep -f '[r]ealesrgan-ncnn-vulkan' >/dev/null 2>&1 && busy=true
 
-  # Which phase, in the order that makes a single answer unambiguous. rsync
-  # carrying an .mkv is the finished episode going OUT; anything else rsync is
-  # doing here is the source coming IN.
-  if [ "$busy" = true ]; then
-    phase=processing
-  elif pgrep -f '[r]sync .*\.mkv' >/dev/null 2>&1; then
-    phase=delivering
+  # WHICH PHASE, and how far through it. "processing" covered four different
+  # minutes-long activities, so a bar could only be drawn for one of them.
+  #
+  # Order matters: the tests below are not mutually exclusive (a chunk encodes
+  # while the GPU works on the next one), so the first match wins and the list
+  # is ordered by what the user would call the episode's current activity.
+  #
+  # ffmpeg appears in three of these phases, so they are told apart by what it
+  # was asked to do, not by the fact that it is running.
+  local ffargs=""
+  ffargs=$(pgrep -af '[f]fmpeg' 2>/dev/null | head -3) || ffargs=""
+  # $FRAMES/$OUT/$LOCAL are assigned AFTER this branch exits, so they are unbound
+  # here and `set -u` makes a bare reference fatal - status would die instead of
+  # reporting. The job file carries SEGDIR, and the whole work dir hangs off it.
+  local wdir="" framesdir="" extracted=0
+  if [ -n "${SEGDIR:-}" ]; then
+    wdir=$(dirname "$SEGDIR"); framesdir="$wdir/frames"
+    [ -d "$framesdir" ] && extracted=$(pngs "$framesdir")
+  fi
+
+  if pgrep -f '[r]sync .*\.mkv' >/dev/null 2>&1; then
+    phase=delivering                       # the finished episode going OUT
   elif pgrep -f '[r]sync ' >/dev/null 2>&1; then
-    phase=fetching
+    phase=fetching                         # the source coming IN
+  elif printf '%s' "$ffargs" | grep -q 'fps_mode passthrough'; then
+    phase=extracting
+    [ "${TOTAL:-0}" -gt 0 ] && pp=$(( extracted * 100 / TOTAL ))
+  elif [ "$busy" = true ]; then
+    phase=upscaling
+    pp=$pct
+  elif printf '%s' "$ffargs" | grep -q '\-f concat'; then
+    phase=muxing                           # final concat + audio remux
+    pp=99
+  elif printf '%s' "$ffargs" | grep -q 'libx264'; then
+    phase=encoding                         # a finished chunk becoming a segment
+    pp=$pct
   elif [ -n "$wargs" ]; then
-    phase=working          # between phases: extracting, encoding, verifying
+    phase=working
   fi
   printf '{"host":"%s","state":"%s","episode":"%s","chunks_done":%d,"chunks_total":%d,' \
     "$(hostname)" "$state" "${ep//\"/}" "$segs" "$chunks"
   printf '"frames_done":%d,"frames_total":%d,"percent":%d,"fps":%s,"elapsed_s":%d,"eta_s":%d,' \
     "$df" "${TOTAL:-0}" "$pct" "${fps:-0}" "$elapsed" "${eta:-0}"
-  printf '"gpu_busy":%s,"phase":"%s","work":"%s"}\n' "$busy" "$phase" "$WORK"
+  # phase_percent is progress THROUGH THE CURRENT PHASE; percent stays whole-
+  # episode. out_bytes/fetch_bytes let the server measure the two transfer
+  # phases, since the other end of each is a file on the server.
+  local outb=0 fetchb=0 f
+  if [ -n "$wdir" ]; then
+    for f in "$wdir"/*.mkv; do
+      [ -f "$f" ] && outb=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    done
+    for f in "$wdir/src" "$wdir/src.part"; do
+      [ -f "$f" ] && fetchb=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    done
+  fi
+  printf '"gpu_busy":%s,"phase":"%s","phase_percent":%d,"frames_extracted":%d,' \
+    "$busy" "$phase" "$pp" "$extracted"
+  # The scratch dir of the RUNNING job, not this invocation's default. `status`
+  # is a separate process and does not inherit the queue's WORK, so it reported
+  # /mnt/scratch while the job was actually on the M.2 - the exact fact the disk
+  # change was made to control.
+  local wreal="$WORK"
+  [ -n "$wdir" ] && wreal=$(dirname "$wdir")
+  printf '"out_bytes":%d,"fetch_bytes":%d,"work":"%s"}\n' "$outb" "$fetchb" "$wreal"
 }
 
 PHASE="${1:-}"
@@ -233,6 +292,18 @@ EOF
 
   mapfile -t ALL < <(find "$FRAMES" -maxdepth 1 -name '*.png' -type f | sort)
   [ "${#ALL[@]}" = "$TOTAL" ] || die "listed ${#ALL[@]} files, expected $TOTAL"
+
+  # Rate and ETA must measure the GPU phase, not the episode. $STATE/started is
+  # written before extraction, and extraction is minutes (276 s for a 68,715
+  # frame double episode) with no frames upscaled - averaging that in reported
+  # 5.8 fps for a pipeline running at 20.6, and turned a 54-minute ETA into 3h.
+  #
+  # The frame count at this moment is recorded too: a resumed episode starts
+  # with chunks already done, and dividing those by a clock that starts now
+  # would read as impossibly fast.
+  local _s0=0
+  [ -d "$SEGDIR" ] && _s0=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
+  printf '%s %s\n' "$(date +%s)" "$(( _s0 * CHUNK ))" > "$STATE/upscale_started"
 
   local i=0 idx=0 seg n staged got enc_pid="" wpids wp
   while [ "$i" -lt "$TOTAL" ]; do

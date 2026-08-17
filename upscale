@@ -1366,6 +1366,11 @@ case "${1:-}" in
     _n=0
     for _src in "${_cands[@]}"; do
       [ -n "$_src" ] || continue
+      # Honour --stop and --pause between episodes. Without this an `ep` run was
+      # unstoppable except by killing it: --stop writes the flag, the run loop
+      # never looked at it, and the queue took the next episode anyway.
+      while [ -f "$PAUSE" ]; do sleep 5; done
+      if [ -f "$STOP" ]; then echo "stopped before $(basename "${_src%.*}")"; break; fi
       ep_in_set "$(epnum "$(basename "${_src%.*}")")" "$RANGE" || continue
       echo "==> $(basename "${_src%.*}")"
       "$WORKER" run "$_src" || { echo "FAILED: $_src" >&2; exit 1; }
