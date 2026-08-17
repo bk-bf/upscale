@@ -146,7 +146,29 @@ discover(){
   lib_sh <<REMOTE_EOF
 set -euo pipefail
 lib=$(printf '%q' "$LIB"); arc=$(printf '%q' "$ARCHIVE")
+# Not everything with a video extension is an episode. Extras, batch files and
+# anything deliberately left alone have no output and never will, so without a
+# way to say so they read as outstanding for ever and the queue offers them on
+# every single cycle.
+#
+# \$LIB/.upscaleignore: one glob per line, '#' comments, blank lines ignored.
+# Matched against the basename AND against the path relative to the library or
+# the archive, so both "*.nfo.avi" and "Specials/*" work.
+ignored(){   # \$1 = source path
+  [ -f "\$lib/.upscaleignore" ] || return 1
+  local pat b rel
+  # Strip the ARCHIVE prefix first: it lives inside the library, so stripping
+  # \$lib first leaves ".upscale-originals/..." and every relative pattern misses.
+  b=\$(basename "\$1"); rel=\${1#"\$arc"/}; rel=\${rel#"\$lib"/}
+  while IFS= read -r pat || [ -n "\$pat" ]; do
+    case "\$pat" in ''|'#'*) continue ;; esac
+    case "\$b"   in \$pat) return 0 ;; esac
+    case "\$rel" in \$pat) return 0 ;; esac
+  done < "\$lib/.upscaleignore"
+  return 1
+}
 emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in
+  if ignored "\$1"; then return 0; fi
   base=\$(basename "\${1%.*}")
   # Match on EPISODE IDENTITY (SxxEyy), not on the exact filename.
   #

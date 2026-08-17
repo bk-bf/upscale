@@ -68,6 +68,25 @@ Everything is an environment variable:
 | `WORK` | `/mnt/scratch/upscale` | scratch dir (needs ~12 GB free) |
 | `LIMIT` | `0` | stop after N episodes (`0` = unlimited) |
 | `EPISODES` | `any` | which episodes this machine owns (see below) |
+| `IDENT_MIN_DB` | `20` | identity floor: an output scoring below this against its own source is refused |
+
+### Excluding sources: `$LIB/.upscaleignore`
+
+Not everything with a video extension is an episode. Extras and batch files have
+no output and never will, so without a way to say so they read as outstanding for
+ever and get offered on every cycle.
+
+One glob per line, `#` comments. Each pattern is matched against the basename and
+against the path relative to the library — archived sources relative to the
+archive, so `Specials/*` catches both a live and an archived copy.
+
+```
+Specials/*
+*.sample.avi
+```
+
+These are shell globs, so a leading `[Lunar]` is a **character class**, not a
+literal — match such files by directory or by a bracket-free substring.
 
 ## Splitting the season across machines
 
