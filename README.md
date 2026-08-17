@@ -47,7 +47,21 @@ cpu  99%   ram 3.4/15.5G   gpu  67%  vram 1.0/8.0G   net 1.7 v 15.2 ^ Mbit/s
 ## Install
 
 ```bash
-./install.sh                                      # only `upscale` lands on $PATH
+./install.sh          # only `upscale` lands on $PATH; no daemon is installed
+```
+
+Then drive it by command — one range, one run, exits when done:
+
+```bash
+upscale ep 3-5
+upscale ep 3-5 ubuntu:/mnt/media/tv/Gintama
+```
+
+The always-on queue daemon is **opt-in**, because a service that survives reboots
+also wakes up and starts upscaling on its own:
+
+```bash
+WITH_QUEUE_SERVICE=1 ./install.sh
 loginctl enable-linger "$USER"                    # start without logging in
 systemctl --user enable --now upscale.service     # survives reboots
 ```
