@@ -5,6 +5,9 @@
   "bind": "100.122.63.6",
   "_bind_comment": "The TAILSCALE IP, not 127.0.0.1. Caddy runs in a container, so its loopback is not this host's - a service on 127.0.0.1 is unreachable to it. Native services here bind the tailnet address for exactly this reason (dashboard :8443, copyparty :3923). The address is CGNAT and not routable from the internet.",
 
+  "upscale_bin": "/home/ubuntu/.local/bin/upscale",
+  "_upscale_bin_comment": "ABSOLUTE. A systemd --user service has no ~/.local/bin on its PATH, so a bare \"upscale\" resolves to nothing and every library reports an error.",
+
   "media_root": "/mnt/media/tv",
   "_media_root_comment": "Scanned one level deep for libraries. A directory counts as a library when it holds video files, so a new show appears without editing this file.",
 

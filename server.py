@@ -95,6 +95,106 @@ def src_ext_for(cfg: dict, lib_name: str) -> str:
     return m.get(lib_name) or m.get("default") or "avi"
 
 
+# ------------------------------------------------------------------- queue ---
+# The ONLY thing stored on disk: which episodes the user has held back. That is
+# intent, and nothing else can derive it. Everything else on this page - what is
+# outstanding, what is done, what is running - is still asked for fresh, so the
+# stored file can never disagree with the library.
+STATE_FILE = HERE / "queue-state.json"
+_state_lock = threading.Lock()
+
+
+def _state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"held": {}}
+
+
+def _save_state(s: dict) -> None:
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s, indent=1))
+    tmp.replace(STATE_FILE)          # atomic: a torn state file would lose holds
+
+
+def held_for(lib: str) -> set[int]:
+    return {int(n) for n in (_state().get("held", {}).get(lib) or [])}
+
+
+def set_held(lib: str, episodes: list[int], hold: bool) -> set[int]:
+    with _state_lock:
+        s = _state()
+        cur = {int(n) for n in (s.setdefault("held", {}).get(lib) or [])}
+        cur = (cur | set(episodes)) if hold else (cur - set(episodes))
+        s["held"][lib] = sorted(cur)
+        _save_state(s)
+        return cur
+
+
+EP_RE = __import__("re").compile(r"[Ss](\d+)[Ee](\d+)")
+
+
+def ep_num(name: str) -> int | None:
+    m = EP_RE.search(name)
+    return int(m.group(2)) if m else None
+
+
+def queue_rows(cfg: dict, lib: str, host_states: list[dict]) -> dict:
+    """One row per episode: what is done, held, running, or waiting.
+
+    Done is read from the ARCHIVE, because that is what "done" means to this
+    pipeline - the original is moved aside once its upscale is published.
+    """
+    out = outstanding(cfg, lib)
+    if out.get("error"):
+        return {"error": out["error"], "rows": []}
+    held = held_for(lib)
+    running = {}
+    for h in host_states:
+        epname = (h.get("episode") or "")
+        if epname and h.get("state") in ("running", "working", "paused", "stopping"):
+            running[epname] = h
+
+    rows = []
+    arch = Path(lib) / ".upscale-originals"
+    done_names = {p.name for p in arch.rglob("*") if p.suffix.lower() in VIDEO_EXT} if arch.is_dir() else set()
+    for p in sorted(done_names):
+        n = ep_num(p)
+        rows.append({"n": n, "name": p, "status": "done", "path": ""})
+    for e in out["episodes"]:
+        n = ep_num(e["name"])
+        h = running.get(e["name"])
+        if h:
+            status = "paused" if h.get("state") == "paused" else "running"
+        elif n is not None and n in held:
+            status = "held"
+        else:
+            status = "queued"
+        row = {"n": n, "name": e["name"], "path": e["path"], "status": status}
+        if h:
+            row.update({"percent": h.get("percent", 0), "fps": h.get("fps", 0),
+                        "eta_s": h.get("eta_s", 0), "phase": h.get("phase", ""),
+                        "host": h.get("id", "")})
+        rows.append(row)
+    rows.sort(key=lambda r: (r["n"] is None, r["n"] if r["n"] is not None else 0, r["name"]))
+    return {"rows": rows, "held": sorted(held),
+            "counts": {s: sum(1 for r in rows if r["status"] == s)
+                       for s in ("done", "running", "paused", "held", "queued")}}
+
+
+def range_expr(cfg: dict, lib: str) -> str:
+    """The episode set to actually run: outstanding MINUS held.
+
+    Passed to `upscale ep` as an explicit comma list rather than `any`, so a
+    hold is honoured by the pipeline itself instead of being a UI-only fiction.
+    """
+    out = outstanding(cfg, lib)
+    held = held_for(lib)
+    nums = sorted({n for e in out.get("episodes", [])
+                   if (n := ep_num(e["name"])) is not None and n not in held})
+    return ",".join(str(n) for n in nums)
+
+
 def outstanding(cfg: dict, lib_path: str) -> dict:
     """What the pipeline itself says is left. One source of truth, not two."""
     up = cfg.get("upscale_bin") or "upscale"
@@ -251,6 +351,19 @@ class Handler(BaseHTTPRequestHandler):
                 st["default_scratch"] = h.get("default_scratch")
                 out.append(st)
             return self._json({"hosts": out, "ts": int(time.time())})
+        if path == "/api/queue":
+            lib = (q.get("lib") or [""])[0]
+            if not lib:
+                return self._json({"error": "lib is required"}, 400)
+            hosts = cfg.get("hosts") or {}
+            states = []
+            for name, h in hosts.items():
+                st = host_status(name, h)
+                if st.get("reachable"):
+                    st.update(host_running(h, name))
+                states.append(st)
+            return self._json({**queue_rows(cfg, lib, states), "hosts": states,
+                               "run_range": range_expr(cfg, lib), "ts": int(time.time())})
         if path == "/api/health":
             return self._json({"ok": True, "config": str(CONFIG_PATH), "error": cfg.get("_error")})
         return self._static(path)
@@ -264,8 +377,23 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return self._json({"ok": False, "error": "bad JSON body"}, 400)
         if path == "/api/start":
-            return self._json(start_job(cfg, body.get("host", ""), body.get("library", ""),
-                                        body.get("range", "any") or "any", body.get("scratch", "")))
+            lib = body.get("library", "")
+            # An explicit episode list, not "any": that is how a hold reaches the
+            # pipeline instead of being a label this page draws on top of it.
+            rng = body.get("range") or (range_expr(cfg, lib) if lib else "") or "any"
+            return self._json(start_job(cfg, body.get("host", ""), lib, rng, body.get("scratch", "")))
+        if path == "/api/hold":
+            lib = body.get("library", "")
+            eps = [int(n) for n in (body.get("episodes") or []) if str(n).isdigit()]
+            hold = bool(body.get("hold", True))
+            if not lib or not eps:
+                return self._json({"ok": False, "error": "library and episodes are required"}, 400)
+            # A RUNNING episode cannot be held - it is already on the GPU. qBit
+            # behaves the same way: pausing the active item stops the transfer,
+            # which here means pausing its host.
+            held = set_held(lib, eps, hold)
+            return self._json({"ok": True, "held": sorted(held),
+                               "run_range": range_expr(cfg, lib)})
         if path in ("/api/pause", "/api/resume", "/api/stop"):
             return self._json(control(cfg, body.get("host", ""), path.rsplit("/", 1)[1]))
         return self._json({"error": "not found"}, 404)
