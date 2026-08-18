@@ -449,19 +449,28 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
             pd, pt = h.get("phase_done", 0), h.get("phase_total", 0)
             ph = h.get("phase", "")
             if ph == "delivering":
+                # The total is the finished file's size, which only the worker
+                # knows; the bytes delivered so far are in the .part, which only
+                # this machine can see. Neither side can draw this bar alone.
                 part = next((x for x in p.parent.glob(f".{p.stem}*.part*")), None)
                 if part:
                     pd = part.stat().st_size
+                pt = h.get("out_bytes") or pt
             elif ph == "fetching":
                 pd, pt = h.get("fetch_bytes", 0), (p.stat().st_size if p.exists() else 0)
             pp = h.get("phase_percent", -1)
+            peta, prate = h.get("phase_eta_s", 0), 0.0
             if pt and pd:
                 pp = min(100, int(pd * 100 / pt))
+                # Derived here for the phases the worker cannot time itself.
+                e, r = phase_eta(h.get("id", ""), ph, pd, pt)
+                if e:
+                    peta, prate = e, r
             row.update({"percent": h.get("percent", 0), "fps": h.get("fps", 0),
                         "eta_s": h.get("eta_s", 0), "phase": ph,
                         "phase_percent": pp, "phase_done": pd, "phase_total": pt,
                         "phase_unit": h.get("phase_unit", ""),
-                        "phase_eta_s": h.get("phase_eta_s", 0),
+                        "phase_eta_s": peta, "phase_rate": prate,
                         "phase_elapsed_s": h.get("phase_elapsed_s", 0),
                         "elapsed_s": h.get("elapsed_s", 0),
                         "frames_done": h.get("frames_done", 0),
@@ -590,6 +599,32 @@ def host_running(h: dict, name: str) -> dict:
 # stops, and pressing Start picks it up again. That is deliberate - a web
 # service restarting must never abandon a two-hour render, and must never
 # silently start new work either.
+# Rate history per (host, phase), for the phases whose progress only this
+# machine can see. The worker cannot time an upload it is pushing blind; this
+# server watches the .part grow, so the ETA has to be derived here.
+_rate_hist: dict[tuple, list] = {}
+
+
+def phase_eta(host: str, phase: str, done: int, total: int) -> tuple[int, float]:
+    """-> (eta_seconds, bytes_per_second). Zero when there is not enough history."""
+    if not phase or total <= 0 or done <= 0:
+        _rate_hist.pop((host, phase), None)
+        return 0, 0.0
+    now = time.time()
+    hist = _rate_hist.setdefault((host, phase), [])
+    if hist and done < hist[-1][1]:
+        hist.clear()                      # went backwards: a new file, not progress
+    hist.append((now, done))
+    del hist[:-40]                        # ~2 min at a 3 s poll
+    if len(hist) < 2:
+        return 0, 0.0
+    dt, dd = now - hist[0][0], done - hist[0][1]
+    if dt < 3 or dd <= 0:
+        return 0, 0.0
+    rate = dd / dt
+    return int((total - done) / rate), rate
+
+
 _drivers: dict[str, "Driver"] = {}
 _drivers_lock = threading.Lock()
 
