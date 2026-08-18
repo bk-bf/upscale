@@ -70,8 +70,33 @@ phase_set(){
 retry(){ local n=0 max=${RETRIES:-60}
   until "$@"; do n=$((n+1)); [ "$n" -ge "$max" ] && return 1
     say "retry $n/$max: $1 ..."; sleep $(( n<10 ? 10 : 30 )); done; }
-vframes(){ ffprobe -v error -count_frames -select_streams v \
-             -show_entries stream=nb_read_frames -of csv=p=0 "$1"; }
+# Frame count. -count_frames decodes every single frame, which costs minutes on
+# a 1440p master, and the worker asks for this count four times per episode
+# (source, every chunk, the mux, and the timestamp normalisation). Where a codec
+# stores exactly one frame per packet, counting packets is the same number in
+# about a second. MPEG-4 ASP packed bitstream can carry two frames in one packet,
+# so the fast answer is only trusted when it agrees with duration * fps; anything
+# else falls back to the honest decode.
+vfast(){ ffprobe -v error -count_packets -select_streams v \
+           -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null; }
+vslow(){ ffprobe -v error -count_frames -select_streams v \
+           -show_entries stream=nb_read_frames -of csv=p=0 "$1"; }
+vframes(){
+  local pk dur fps
+  pk=$(vfast "$1") || pk=''
+  case "$pk" in ''|*[!0-9]*) vslow "$1"; return $?;; esac
+  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null) || dur=''
+  fps=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate \
+          -of csv=p=0 "$1" 2>/dev/null) || fps=''
+  if awk -v p="$pk" -v d="$dur" -v f="$fps" '
+        BEGIN{ n=split(f,a,"/"); if(n!=2||a[2]+0==0||d+0<=0) exit 1
+               e=d*a[1]/a[2]; if(e<=0) exit 1
+               diff=p-e; if(diff<0) diff=-diff
+               exit !(diff <= 5 || diff/e <= 0.005) }'; then
+    echo "$pk"; return 0
+  fi
+  vslow "$1"
+}
 
 cmd_status(){
   [ -f "$JOB" ] || { echo "no job"; return 0; }
