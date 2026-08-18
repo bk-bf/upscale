@@ -29,6 +29,7 @@
   let probing = $state(false);
 
   // start
+  let night = $state(false);
   let sHost = $state("");
   let sScratch = $state("");
 
@@ -46,6 +47,7 @@
       rows = d.rows || [];
       counts = d.counts || {};
       hosts = d.hosts || [];
+      night = !!d.night_mode;
       if (!sHost && hosts.length) { sHost = hosts[0].id; sScratch = hosts[0].default_scratch || ""; }
       error = "";
     } catch (e) { error = String(e); }
@@ -121,7 +123,7 @@
       : rows.filter(r => r.status === "queued").map(r => r.path);
     if (!paths.length) { notice = "nothing queued to start"; return; }
     const d = await post("/api/start", { host: sHost, scratch: sScratch, paths }, "start");
-    if (d?.ok) { notice = `started ${d.count} episode(s) on ${d.host} — scratch ${d.work}`; showStart = false; }
+    if (d?.ok) { notice = `started ${d.count} on ${d.label} (${d.work})`; showStart = false; }
   }
 
   async function abort() {
@@ -148,13 +150,39 @@
     const s = new Set(selected);
     if (ev.shiftKey && lastClicked !== null) {
       const [a, b] = [Math.min(lastClicked, i), Math.max(lastClicked, i)];
-      for (let k = a; k <= b; k++) s.add(rows[k].path);
+      for (let k = a; k <= b; k++) s.add(sorted[k].path);
     } else if (ev.ctrlKey || ev.metaKey) {
       s.has(r.path) ? s.delete(r.path) : s.add(r.path);
       lastClicked = i;
     } else { s.clear(); s.add(r.path); lastClicked = i; }
     selected = s;
   }
+
+  // Sorting is a view, applied over whatever the server last sent - the table
+  // keeps refreshing every 3s underneath it, so it must not be a one-off sort
+  // of the array.
+  let sortKey = $state("n");
+  let sortDir = $state(1);
+  function sortBy(k) {
+    if (sortKey === k) sortDir = -sortDir;
+    else { sortKey = k; sortDir = k === "n" ? 1 : 1; }
+  }
+  const RANK = { running: 0, delivering: 1, paused: 2, queued: 3, held: 4, missing: 5, done: 6 };
+  const sorted = $derived([...rows].sort((a, b) => {
+    const k = sortKey;
+    let x, y;
+    if (k === "status") { x = RANK[a.status] ?? 9; y = RANK[b.status] ?? 9; }
+    else if (k === "progress") { x = a.phase_percent ?? -1; y = b.phase_percent ?? -1; }
+    else if (k === "rate") { x = a.fps || 0; y = b.fps || 0; }
+    else if (k === "eta") { x = a.phase_eta_s || a.eta_s || 0; y = b.phase_eta_s || b.eta_s || 0; }
+    else if (k === "n") { x = a.n ?? 1e9; y = b.n ?? 1e9; }
+    else { x = (a[k] ?? "").toString().toLowerCase(); y = (b[k] ?? "").toString().toLowerCase(); }
+    if (x < y) return -sortDir;
+    if (x > y) return sortDir;
+    // Episode number as the tiebreak, so an equal column never shuffles rows
+    // between refreshes.
+    return (a.n ?? 0) - (b.n ?? 0);
+  }));
 
   const sel = $derived(rows.filter(r => selected.has(r.path)));
   const canHold    = $derived(sel.some(r => r.status === "queued" || r.status === "running"));
@@ -174,7 +202,7 @@
   // counting frames, MB/s for the two that move bytes, nothing for a phase with
   // nothing to count.
   function phaseRate(r) {
-    if (r.status !== "running" && r.status !== "paused") return "";
+    if (!["running", "paused", "delivering"].includes(r.status)) return "";
     if (r.phase_unit === "bytes" && r.phase_elapsed_s > 0 && r.phase_done > 0)
       return `${(r.phase_done / r.phase_elapsed_s / 1048576).toFixed(1)} MB/s`;
     if (r.phase === "upscaling" && r.fps) return `${r.fps} fps`;
@@ -196,6 +224,7 @@
   <span class="brand">upscale</span>
   <span class="counts">
     {#if counts.running}<b class="c-run">{counts.running} running</b>{/if}
+    {#if counts.delivering}<span class="c-dev">{counts.delivering} delivering</span>{/if}
     <span>{counts.queued ?? 0} queued</span>
     {#if counts.held}<span class="c-held">{counts.held} held</span>{/if}
     {#if counts.missing}<span class="c-miss">{counts.missing} missing</span>{/if}
@@ -206,22 +235,27 @@
   {#each hosts as h}
     <span class="chip" class:down={!h.reachable} title={h.error || h.work || ""}>
       {h.label}<em>{h.reachable ? (h.phase && h.phase !== "idle" ? h.phase : h.state) : "unreachable"}</em>
-      {#if h.queue_running}<span class="qtag" title={h.queue_note || ""}>queue{h.queue_stopping ? " stopping" : ""}</span>{/if}
+      {#if h.queue_running}
+        <span class="qtag" class:stopping={h.queue_stopping} title={h.queue_note || ""}>
+          {h.queue_stopping ? "stopping" : "queue"}
+        </span>
+      {:else}
+        <span class="qtag off" title={h.queue_note || ""}>stopped</span>
+      {/if}
     </span>
   {/each}
 
   <button class="tb" onclick={() => (showStart = true)} disabled={!hosts.length || !!busy}>▶ Start</button>
-  <button class="tb" onclick={() => post("/api/stop", { host: (runningHost || hosts[0])?.id }, "stop")}
+  <button class="tb" onclick={() => post("/api/stop", { host: (hosts.find(h => h.queue_running) || runningHost || hosts[0])?.id }, "stop")}
           disabled={!hosts.length || !!busy}
           title="Stop the whole queue: finish the episode in flight, then stop">■ Stop</button>
   <button class="tb danger" onclick={abort} disabled={!runningHost || !!busy}
           title="Kill the current episode now">✕ Abort</button>
+  <button class="tb" class:on={night} onclick={() => post("/api/night", { on: !night }, night ? "day" : "night")}
+          title="Fewer workers and encoder threads from the next episode">{night ? "☾ Night" : "☀ Day"}</button>
   <button class="tb" onclick={() => { showMachine = true; probe = null; }} title="Onboard a GPU machine">⚙ Machines</button>
   <button class="add" onclick={() => { showImport = true; picked = new Set(); browse(); }} title="Import episodes">+</button>
 </nav>
-
-{#if error}<p class="bar err">{error}</p>{/if}
-{#if notice}<button class="bar notice" onclick={() => (notice = "")}>{notice}</button>{/if}
 
 {#if selected.size}
   <div class="selbar">
@@ -233,13 +267,23 @@
   </div>
 {/if}
 
+{#if error}<p class="bar err">{error}</p>{/if}
+{#if notice}<button class="bar notice" onclick={() => (notice = "")}>{notice}</button>{/if}
+
 <table>
   <thead><tr>
-    <th class="num">#</th><th>Episode</th><th class="lib">Library</th><th class="dev">Device</th>
-    <th class="st">Status</th><th class="pr">Progress</th><th class="rt">Rate</th><th class="et">ETA</th>
+    {#each [["n","#","num"],["name","Episode",""],["library_name","Library","lib"],
+            ["device","Device","dev"],["status","Status","st"],["progress","Progress","pr"],
+            ["rate","Rate","rt"],["eta","ETA","et"]] as [k, label, cls]}
+      <th class={cls}>
+        <button class="sorth" onclick={() => sortBy(k)}>
+          {label}{#if sortKey === k}<span class="arrow">{sortDir > 0 ? "▲" : "▼"}</span>{/if}
+        </button>
+      </th>
+    {/each}
   </tr></thead>
   <tbody>
-    {#each rows as r, i}
+    {#each sorted as r, i}
       <tr class={r.status} class:sel={selected.has(r.path)} tabindex="0" role="button"
           onclick={(e) => rowClick(e, i, r)}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); rowClick(e, i, r); } }}>
@@ -252,7 +296,7 @@
         <td class="dev">{#if r.device}<span class="devtag">{r.device}</span>{:else}<span class="muted">—</span>{/if}</td>
         <td class="st"><span class="pill {r.status}">{r.status === "running" && r.phase ? r.phase : r.status}</span></td>
         <td class="pr">
-          {#if r.status === "running" || r.status === "paused"}
+          {#if r.status === "running" || r.status === "paused" || r.status === "delivering"}
             <!-- THE PHASE'S OWN BAR. Each phase measures a different thing, so
                  an episode-level number cannot represent any of them - which is
                  how a 39% episode sat at 39% through minutes of verifying and
@@ -390,7 +434,7 @@
     padding: .55rem .9rem; background: #12151d; border-bottom: 1px solid #232838; flex-wrap: wrap; }
   .brand { font-weight: 700; }
   .counts { display: flex; gap: .55rem; font-size: .8rem; align-items: center; }
-  .c-run { color: #6ee7a0; } .c-held { color: #f5d76e; } .c-miss { color: #f8899f; }
+  .c-run { color: #6ee7a0; } .c-dev { color: #7ab6f5; } .c-held { color: #f5d76e; } .c-miss { color: #f8899f; }
   .spacer { flex: 1; }
   .chip { display: inline-flex; gap: .4rem; align-items: center; font-size: .78rem;
     background: #171b26; border: 1px solid #232838; border-radius: 999px; padding: .2rem .6rem; }
@@ -400,6 +444,7 @@
     padding: .3rem .6rem; font: inherit; font-size: .8rem; cursor: pointer; }
   .tb:hover:not(:disabled) { background: #232838; }
   .tb:disabled, .selbar button:disabled { opacity: .4; cursor: not-allowed; }
+  .tb.on { background: #1e2a3f; border-color: #35507a; color: #9dc4f5; }
   .tb.danger, .selbar .danger { border-color: #5a2233; color: #f8899f; }
   .add { width: 2rem; height: 2rem; border-radius: 8px; background: #1d4ed8; color: #fff;
     border: 0; font-size: 1.2rem; line-height: 1; cursor: pointer; }
@@ -413,11 +458,18 @@
     border-radius: 6px; padding: .25rem .6rem; font: inherit; font-size: .8rem; cursor: pointer; }
   .ghost { background: transparent !important; }
   table { width: 100%; border-collapse: collapse; }
+  .sorth { background: none; border: 0; color: inherit; font: inherit; padding: 0;
+    cursor: pointer; text-transform: inherit; letter-spacing: inherit; }
+  .sorth:hover { color: #e6e6e6; }
+  .arrow { font-size: .6rem; margin-left: .25rem; }
   thead th { position: sticky; top: 2.9rem; background: #12151d; text-align: left; font-size: .7rem;
     text-transform: uppercase; letter-spacing: .07em; color: #8b93a7; padding: .45rem .6rem;
     border-bottom: 1px solid #232838; }
   tbody td { padding: .34rem .6rem; border-bottom: 1px solid #171b26; font-size: .84rem; }
   tbody tr:hover { background: #12151d; }
+  /* Shift-click is a range selection here, not a text selection - without this
+     the browser paints the run of rows blue as if it were a paragraph. */
+  tbody, thead { user-select: none; -webkit-user-select: none; }
   tbody tr.sel { background: #16203a; }
   tbody tr.done { color: #6b7280; }
   tbody tr:focus-visible { outline: 2px solid #3b82f6; outline-offset: -2px; }
@@ -429,6 +481,8 @@
   .rt, .et { color: #8b93a7; font-variant-numeric: tabular-nums; }
   .qtag { font-size: .68rem; background: #12351f; color: #6ee7a0;
     padding: .05rem .4rem; border-radius: 999px; }
+  .qtag.stopping { background: #3a3212; color: #f5d76e; }
+  .qtag.off { background: #232838; color: #8b93a7; }
   .devtag { font-size: .74rem; background: #17273f; color: #7ab6f5; padding: .1rem .45rem; border-radius: 999px; }
   .pill { font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; padding: .1rem .4rem;
     border-radius: 999px; background: #232838; color: #aab; }
@@ -436,6 +490,7 @@
   .pill.delivering, .pill.fetching, .pill.extracting, .pill.encoding, .pill.muxing,
   .pill.working { background: #17273f; color: #7ab6f5; }
   .pill.paused, .pill.held { background: #3a3212; color: #f5d76e; }
+  .pill.delivering { background: #17273f; color: #7ab6f5; }
   .pill.missing { background: #3a1620; color: #f8899f; }
   .pill.done { background: #1a1f1a; color: #6b8a6b; }
   .bar2 { height: 6px; width: 7rem; background: #232838; border-radius: 3px; overflow: hidden;

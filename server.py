@@ -123,6 +123,7 @@ def _state() -> dict:
     s.setdefault("held", {})
     s.setdefault("removed", {})
     s.setdefault("assigned", {})     # file path -> host id
+    s.setdefault("active", {})       # host id -> scratch, while its queue should run
     return s
 
 
@@ -419,8 +420,16 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
         lib = library_root(p)
         arch = lib / ".upscale-originals"
         archived = arch.is_dir() and any(x.name == p.name for x in arch.rglob("*"))
+        # A background delivery is a state of its own now that phases overlap:
+        # the GPU has moved to the next episode while this one still uploads.
+        # Detected here rather than asked of the host, because the .part is
+        # arriving on THIS machine - and if it is missed, the episode reads as
+        # queued and the queue starts it a second time.
+        part = next((x for x in p.parent.glob(f".{p.stem}*.part*")), None)
         if h:
             status = "paused" if h.get("state") == "paused" else "running"
+        elif part and not archived:
+            status = "delivering"
         elif archived:
             # THE ARCHIVE IS THE DEFINITION OF DONE, not the path disappearing.
             # With .mkv sources the delivered file takes the source's own path,
@@ -442,6 +451,16 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
                # "where is it running?" - an assigned episode has an answer long
                # before a GPU touches it.
                "device": (h.get("label") if h else host_labels.get(assigned_to, "")) or ""}
+        if status == "delivering" and not h:
+            # A background delivery, measured entirely on this side: the .part
+            # arriving here, against the size recorded when it was launched.
+            done = part.stat().st_size if part else 0
+            total = _deliveries.get(path, 0)
+            eta, rate = phase_eta("deliver:" + path, "delivering", done, total)
+            row.update({"phase": "delivering",
+                        "phase_percent": min(100, int(done * 100 / total)) if total else -1,
+                        "phase_done": done, "phase_total": total, "phase_unit": "bytes",
+                        "phase_eta_s": eta, "phase_rate": rate})
         if h:
             # The two transfer phases can only be measured HERE: the other end
             # of each is a file on this machine. The worker reports how many
@@ -625,6 +644,10 @@ def phase_eta(host: str, phase: str, done: int, total: int) -> tuple[int, float]
     return int((total - done) / rate), rate
 
 
+# path -> size of the finished file, recorded when a background delivery starts.
+# The server can see the .part arriving but not what it is aiming at.
+_deliveries: dict[str, int] = {}
+
 _drivers: dict[str, "Driver"] = {}
 _drivers_lock = threading.Lock()
 
@@ -668,7 +691,14 @@ class Driver(threading.Thread):
                 return p
         return ""
 
-    def _launch(self, path: str) -> bool:
+    def _launch(self, path: str, phase: str = "run", wait: bool = False) -> bool:
+        """Run one PHASE of one episode on this host.
+
+        Phases are separate so they can overlap. The pipeline was always built
+        that way - the link is ~1 MB/s, so a ~1.5 GB delivery is ~25 minutes,
+        and running it between episodes leaves the GPU idle for every one of
+        them. Only `process` is exclusive; fetches and deliveries run alongside.
+        """
         h = self._h()
         work = (h.get("scratch") or {}).get(self.scratch)
         worker = h.get("worker") or "upscale-worker"
@@ -676,13 +706,36 @@ class Driver(threading.Thread):
         env = (f"LIB={shlex.quote(str(lib))} "
                f"ARCHIVE={shlex.quote(str(lib / '.upscale-originals'))} "
                + (f"WORK={shlex.quote(work)} " if work else ""))
-        remote = (f"setsid nohup env {env}{shlex.quote(worker)} run {shlex.quote(path)} "
-                  f">> ~/upscale-ui.log 2>&1 < /dev/null & echo started")
-        rc, _, err = ssh_to(h.get("ssh", self.host), remote, timeout=25)
+        # Night mode is per-episode, not global: it takes effect on the next
+        # episode rather than disturbing one already on the card.
+        if load_config().get("night_mode"):
+            for k, v in (h.get("night") or {}).items():
+                env += f"{k}={shlex.quote(str(v))} "
+        cmd = f"env {env}{shlex.quote(worker)} {phase} {shlex.quote(path)}"
+        remote = (cmd if wait else
+                  f"setsid nohup sh -c {shlex.quote(cmd)} >> ~/upscale-ui.log 2>&1 < /dev/null & echo started")
+        rc, _, err = ssh_to(h.get("ssh", self.host), remote, timeout=(3600 if wait else 25))
         if rc != 0:
-            self.note = (err or f"ssh exited {rc}").strip()[:200]
+            self.note = f"{phase} failed: {(err or f'ssh exited {rc}').strip()[:160]}"
             return False
         return True
+
+    def _out_size(self, path: str) -> int:
+        """Size of the finished file, asked for once when a delivery starts.
+
+        The server can watch the .part arrive but has no idea what it is aiming
+        at; the desktop knows. Without this the upload has a bar and no total.
+        """
+        h = self._h()
+        base = Path(path).stem
+        work = (h.get("scratch") or {}).get(self.scratch) or ""
+        rc, out, _ = ssh_to(h.get("ssh", self.host),
+                            f"stat -c%s {shlex.quote(work)}/{shlex.quote(base)}/{shlex.quote(base)}.mkv 2>/dev/null || echo 0",
+                            timeout=15)
+        try:
+            return int(out.strip() or 0)
+        except ValueError:
+            return 0
 
     def _kill_current(self):
         h = self._h()
@@ -695,45 +748,53 @@ class Driver(threading.Thread):
         return any(r["path"] == path and r["status"] == "queued"
                    for r in queue_rows(load_config(), [])["rows"])
 
-    def run(self):
-        # ADOPT whatever is already running. This service restarting must not
-        # lock the queue until the episode in flight ends - the render survives
-        # a restart, so the sequencing has to be able to rejoin it.
+    def _gpu_busy(self) -> bool:
+        """Is the exclusive phase occupied? A fetch or a delivery running
+        alongside must not read as the GPU being in use."""
         st = host_status(self.host, self._h())
-        if st.get("state") in ("running", "working", "paused", "stopping"):
-            self.current = st.get("episode", "")
-            self.note = f"adopted {self.current}"
-            quiet = 0
-            while quiet < 3:
-                time.sleep(4)
-                st = host_status(self.host, self._h())
-                if not st.get("reachable"):
-                    continue
-                if st.get("state") in ("running", "working", "paused", "stopping"):
-                    quiet = 0
-                else:
-                    quiet += 1
-            self.current = ""
+        if not st.get("reachable"):
+            return True                    # unknown is not free
+        return st.get("phase") in ("counting", "extracting", "verifying",
+                                   "upscaling", "encoding", "muxing")
 
-        while True:
-            path = self._next_path()
+    def run(self):
+        # Adopt whatever is already running: this service restarting must not
+        # lock the queue until the episode in flight ends.
+        while self._gpu_busy():
+            time.sleep(4)
+            if self.stop_after_current:
+                break
+
+        prefetched = ""
+        while not self.stop_after_current:
+            path = prefetched or self._next_path()
+            prefetched = ""
             if not path:
                 self.note = "nothing left to run"
                 break
+
+            # 1. make sure this episode's source is here (usually already is,
+            #    prefetched during the previous episode's GPU work)
             self.current = path
-            if not self._launch(path):
+            self.note = f"fetching {Path(path).name}"
+            if not self._launch(path, "fetch", wait=True):
                 break
 
-            # 1. WAIT FOR IT TO ACTUALLY START. Treating "not busy" as finished
-            #    is what turned this loop into a launch storm: a status blip
-            #    right after launch read as a completed episode, so the same
-            #    file was started again every few seconds - three workers ended
-            #    up on one episode, sharing a scratch dir.
-            started = False
-            for _ in range(30):                       # up to ~2 min
+            # 2. START THE GPU, then immediately queue the next fetch alongside
+            #    it. The transfer is free if it happens while the card works.
+            self.note = f"processing {Path(path).name}"
+            if not self._launch(path, "process"):
+                break
+            nxt = self._next_path()
+            if nxt and nxt != path:
+                self._launch(nxt, "fetch")     # detached, overlaps the GPU
+                prefetched = nxt
+
+            # 3. wait for the GPU phase only
+            started, quiet = False, 0
+            for _ in range(40):
                 time.sleep(4)
-                st = host_status(self.host, self._h())
-                if st.get("state") in ("running", "working", "paused", "stopping"):
+                if self._gpu_busy():
                     started = True
                     break
                 if path in held_for():
@@ -742,40 +803,85 @@ class Driver(threading.Thread):
                 self.note = f"{Path(path).name} never started - stopping rather than retrying"
                 self._kill_current()
                 break
-
-            # 2. Watch until it is genuinely finished.
-            quiet = 0
-            while True:
+            while started:
                 time.sleep(4)
-                st = host_status(self.host, self._h())
-                if not st.get("reachable"):
-                    continue                          # a blip is not an outcome
+                if self.stop_after_current:
+                    # Stop means the QUEUE stops. The episode on the card keeps
+                    # going and is still delivered - abandoning it would throw
+                    # away hours - but nothing new is taken, and the UI says so
+                    # the moment the button is pressed rather than at the next
+                    # episode boundary, which can be an hour away.
+                    self.note = "stopping: finishing the current episode"
                 if path in held_for():
                     self.note = f"skipped {Path(path).name}"
                     self._kill_current()
                     break
-                if st.get("state") in ("running", "working", "paused", "stopping"):
+                if self._gpu_busy():
                     quiet = 0
                     continue
                 quiet += 1
-                if quiet >= 3:                        # ~12 s of genuine silence
+                if quiet >= 3:
                     break
 
-            # 3. DONE IS DERIVED, NOT ASSUMED. If the worker stopped but the
-            #    episode is still queued, it failed - and relaunching it is the
-            #    storm again. Stop and say so.
-            if path not in held_for() and self._still_queued(path):
-                self.note = (f"{Path(path).name} stopped without finishing - "
-                             f"queue halted so it cannot loop on it")
-                break
+            # Deliver even when stopping: the work is done, the upload is what
+            # makes it real, and it costs the GPU nothing.
+            # 4. DELIVER IN THE BACKGROUND and take the next episode now. This
+            #    is the whole point: ~25 minutes of upload used to be ~25
+            #    minutes of idle GPU, once per episode.
+            if path not in held_for():
+                total = self._out_size(path)
+                if total:
+                    with _drivers_lock:
+                        _deliveries[path] = total
+                    self._launch(path, "deliver")
+                    self.note = f"delivering {Path(path).name} in the background"
+                else:
+                    self.note = (f"{Path(path).name} produced no output - queue halted "
+                                 f"so it cannot loop on it")
+                    break
             self.current = ""
-            if self.stop_after_current:
-                self.note = "stopped after the current episode"
-                break
         self.current = ""
+        if self.stop_after_current:
+            self.note = "stopped after the current episode"
         with _drivers_lock:
             if _drivers.get(self.host) is self:
                 _drivers.pop(self.host, None)
+
+
+def set_active(host: str, scratch: str | None) -> None:
+    """Persist that a host's queue SHOULD be running.
+
+    The sequencer is a thread, so it dies with the process. Without this, every
+    restart of this service silently stopped the queue and left the machine
+    idle with work outstanding - which is indistinguishable, from the outside,
+    from the queue being broken.
+    """
+    with _state_lock:
+        st = _state()
+        if scratch is None:
+            st.setdefault("active", {}).pop(host, None)
+        else:
+            st.setdefault("active", {})[host] = scratch
+        _save_state(st)
+
+
+def resume_active() -> None:
+    """Restart the sequencers that were meant to be running. Called at startup.
+
+    It only re-attaches to work the user already started; it never starts
+    anything new, and a host already busy is adopted rather than restarted.
+    """
+    for host, scratch in (_state().get("active") or {}).items():
+        cfg = load_config()
+        if host not in all_hosts(cfg):
+            continue
+        with _drivers_lock:
+            if _drivers.get(host) and _drivers[host].is_alive():
+                continue
+            d = Driver(cfg, host, scratch)
+            _drivers[host] = d
+            d.start()
+        print(f"resumed queue on {host} (scratch {scratch})", flush=True)
 
 
 def start_job(cfg: dict, host: str, scratch: str, paths: list[str] | None = None) -> dict:
@@ -791,19 +897,34 @@ def start_job(cfg: dict, host: str, scratch: str, paths: list[str] | None = None
         d = Driver(cfg, host, scratch)
         _drivers[host] = d
         d.start()
-    return {"ok": True, "host": host, "work": (h.get("scratch") or {}).get(scratch) or "(host default)"}
+    set_active(host, scratch)
+    # What it will actually take: the explicit selection, or everything queued
+    # and not assigned elsewhere. The caller says so in one line, so it has to
+    # be a real number rather than left for the UI to guess.
+    if paths:
+        n = len(paths)
+    else:
+        a = assignments()
+        n = sum(1 for r in queue_rows(cfg, [])["rows"]
+                if r["status"] == "queued" and a.get(r["path"], host) == host)
+    return {"ok": True, "host": host, "count": n,
+            "label": h.get("label", host),
+            "work": (h.get("scratch") or {}).get(scratch) or "host default"}
 
 
 def driver_state(host: str) -> dict:
     d = _drivers.get(host)
+    active = host in (_state().get("active") or {})
     if not d or not d.is_alive():
-        return {"queue_running": False, "queue_note": ""}
+        return {"queue_running": False, "queue_stopping": False,
+                "queue_note": "" if active else "stopped"}
     return {"queue_running": True, "queue_note": d.note,
             "queue_stopping": d.stop_after_current,
             "queue_current": Path(d.current).name if d.current else ""}
 
 
 def stop_driver(host: str, kill: bool = False) -> dict:
+    set_active(host, None)           # stop meaning stop, across restarts too
     d = _drivers.get(host)
     if not d or not d.is_alive():
         return {"ok": True, "note": "no queue was running"}
@@ -901,9 +1022,12 @@ class Handler(BaseHTTPRequestHandler):
                 libs.setdefault(r["library"], {"path": r["library"], "name": r["library_name"], "n": 0})
                 libs[r["library"]]["n"] += 1
             return self._json({**qr, "libraries": list(libs.values()),
-                               "hosts": states, "ts": int(time.time())})
+                               "hosts": states, "night_mode": bool(cfg.get("night_mode")),
+                               "ts": int(time.time())})
         if path == "/api/health":
-            return self._json({"ok": True, "config": str(CONFIG_PATH), "error": cfg.get("_error")})
+            return self._json({"ok": True, "config": str(CONFIG_PATH),
+                               "night_mode": bool(cfg.get("night_mode")),
+                               "error": cfg.get("_error")})
         return self._static(path)
 
     def do_POST(self):
@@ -939,6 +1063,15 @@ class Handler(BaseHTTPRequestHandler):
                      "upscale": pr.get("upscale") or "upscale"}
             return self._json({"ok": True, "id": hid, "hosts": save_host(hid, entry),
                                "probe": pr})
+        if path == "/api/night":
+            on = bool(body.get("on"))
+            cfg_path = CONFIG_PATH
+            c = json.loads(cfg_path.read_text())
+            c["night_mode"] = on
+            tmp = cfg_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(c, indent=2))
+            tmp.replace(cfg_path)
+            return self._json({"ok": True, "night_mode": on})
         if path == "/api/assign":
             return self._json({"ok": True,
                                "assigned": assign(body.get("paths") or [], body.get("host") or "")})
@@ -970,8 +1103,14 @@ class Handler(BaseHTTPRequestHandler):
             # It also writes the pipeline's own flag, so an `upscale ep` run
             # started outside this UI stops too.
             host = body.get("host", "")
-            control(cfg, host, "stop")
-            return self._json({"ok": True, **stop_driver(host)})
+            control(cfg, host, "stop")          # the pipeline's own flag too
+            r = stop_driver(host)
+            # Every host, not just one: Stop is the queue, and a second machine
+            # quietly carrying on is exactly the surprise this avoids.
+            for other in all_hosts(cfg):
+                if other != host:
+                    stop_driver(other)
+            return self._json({"ok": True, **r})
         if path == "/api/abort":
             stop_driver(body.get("host", ""), kill=False)   # stop sequencing first
             return self._json(abort_host(cfg, body.get("host", "")))
@@ -1006,6 +1145,7 @@ def main():
     cfg = load_config()
     port = int(os.environ.get("UPSCALE_UI_PORT") or cfg.get("port") or 8790)
     bind = os.environ.get("UPSCALE_UI_BIND") or cfg.get("bind") or "127.0.0.1"
+    resume_active()
     srv = ThreadingHTTPServer((bind, port), Handler)
     srv.daemon_threads = True
     print(f"upscale-ui on http://{bind}:{port}  (config: {CONFIG_PATH})", flush=True)
