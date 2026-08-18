@@ -660,6 +660,53 @@ class Driver(threading.Thread):
         self.current = ""
         self.note = ""
         self._cfg = cfg
+        # ONE TRANSFER AT A TIME, DELIVERIES FIRST.
+        #
+        # The link is ~1 MB/s in total. A fetch and a delivery running together
+        # do not go twice as fast, they each take twice as long - and the one
+        # that matters is the delivery, because that is what makes an episode
+        # watchable. Transfers are therefore serialised through this queue and
+        # ordered by priority, and both are scheduled to run while the GPU is
+        # working, which costs nothing because upscaling uses no bandwidth.
+        self._xfer: list[dict] = []
+        self._xfer_cv = threading.Condition()
+        self._xfer_done: set = set()
+        self._shutdown = False
+        threading.Thread(target=self._xfer_loop, daemon=True).start()
+
+    # --- transfers --------------------------------------------------------
+    def _enqueue(self, path: str, phase: str, prio: int):
+        with self._xfer_cv:
+            if any(x["path"] == path and x["phase"] == phase for x in self._xfer):
+                return
+            if (path, phase) in self._xfer_done:
+                return
+            self._xfer.append({"path": path, "phase": phase, "prio": prio})
+            self._xfer_cv.notify()
+
+    def _xfer_loop(self):
+        while not self._shutdown:
+            with self._xfer_cv:
+                while not self._xfer and not self._shutdown:
+                    self._xfer_cv.wait(timeout=2)
+                if self._shutdown:
+                    return
+                # deliver (0) before fetch (1); ties keep insertion order
+                self._xfer.sort(key=lambda x: x["prio"])
+                item = self._xfer.pop(0)
+            ok = self._launch(item["path"], item["phase"], wait=True)
+            with self._xfer_cv:
+                self._xfer_done.add((item["path"], item["phase"]))
+                if not ok:
+                    self.note = f"{item['phase']} failed: {Path(item['path']).name}"
+                self._xfer_cv.notify_all()
+
+    def _wait_xfer(self, path: str, phase: str) -> bool:
+        """Block until this transfer has had its turn."""
+        with self._xfer_cv:
+            while (path, phase) not in self._xfer_done and not self._shutdown:
+                self._xfer_cv.wait(timeout=2)
+        return (path, phase) in self._xfer_done
 
     # --- helpers ----------------------------------------------------------
     def _h(self):
@@ -714,6 +761,22 @@ class Driver(threading.Thread):
             self.note = f"{phase} failed: {(err or f'ssh exited {rc}').strip()[:160]}"
             return False
         return True
+
+    def _await_output(self, path: str, tries: int = 45) -> int:
+        """Wait for the finished file to appear before judging the episode.
+
+        The mux runs after the last chunk and takes minutes on a long episode,
+        and during it the output is still <name>.mkv.part. Looking once, right
+        after the GPU goes quiet, saw nothing and concluded the episode had
+        produced no output - which halted the queue and stranded a finished
+        964 MB render in scratch.
+        """
+        for _ in range(tries):
+            n = self._out_size(path)
+            if n:
+                return n
+            time.sleep(4)
+        return 0
 
     def _out_size(self, path: str) -> int:
         """Size of the finished file, asked for once when a delivery starts.
@@ -787,21 +850,39 @@ class Driver(threading.Thread):
                 self.note = "nothing left to run"
                 break
 
-            # 1. make sure this episode's source is here (usually already is,
-            #    prefetched during the previous episode's GPU work)
+            # 1. make sure this episode's source is here. Usually it already
+            #    is, prefetched during the previous episode's GPU work, in
+            #    which case this returns at once.
             self.current = path
             self.note = f"fetching {Path(path).name}"
-            if not self._launch(path, "fetch", wait=True):
+            self._enqueue(path, "fetch", 1)
+            if not self._wait_xfer(path, "fetch"):
                 break
 
-            # 2. START THE GPU, then immediately queue the next fetch alongside
+            # 2. ALREADY UPSCALED? Deliver it instead of running the GPU again.
+            #    An episode whose output is sitting in scratch has been paid
+            #    for; re-processing it wastes hours and, because do_process
+            #    returns immediately, looks to the watcher below like an
+            #    episode that never started.
+            existing = self._out_size(path)
+            if existing:
+                self.note = f"delivering {Path(path).name} (already upscaled)"
+                with _drivers_lock:
+                    _deliveries[path] = existing
+                self._enqueue(path, "deliver", 0)
+                self.current = ""
+                continue
+
+            # 3. START THE GPU, then immediately queue the next fetch alongside
             #    it. The transfer is free if it happens while the card works.
             self.note = f"processing {Path(path).name}"
             if not self._launch(path, "process"):
                 break
             nxt = self._next_path()
             if nxt and nxt != path:
-                self._launch(nxt, "fetch")     # detached, overlaps the GPU
+                # Queued, not launched: if a delivery turns up while this is
+                # still waiting, the delivery goes first.
+                self._enqueue(nxt, "fetch", 1)
                 prefetched = nxt
 
             # 3. wait for the GPU phase only
@@ -845,11 +926,14 @@ class Driver(threading.Thread):
             #    is the whole point: ~25 minutes of upload used to be ~25
             #    minutes of idle GPU, once per episode.
             if path not in held_for():
-                total = self._out_size(path)
+                total = self._await_output(path)
                 if total:
                     with _drivers_lock:
                         _deliveries[path] = total
-                    self._launch(path, "deliver")
+                    # Priority 0: ahead of any queued fetch. An episode nobody
+                    # can watch yet outranks a source nobody needs until the
+                    # card is free.
+                    self._enqueue(path, "deliver", 0)
                     self.note = f"delivering {Path(path).name} in the background"
                 else:
                     self.note = (f"{Path(path).name} produced no output - queue halted "
@@ -859,6 +943,12 @@ class Driver(threading.Thread):
         self.current = ""
         if self.stop_after_current:
             self.note = "stopped after the current episode"
+        # Let a transfer in flight finish - it is bandwidth already spent - but
+        # take nothing new.
+        with self._xfer_cv:
+            self._xfer.clear()
+            self._shutdown = True
+            self._xfer_cv.notify_all()
         with _drivers_lock:
             if _drivers.get(self.host) is self:
                 _drivers.pop(self.host, None)
