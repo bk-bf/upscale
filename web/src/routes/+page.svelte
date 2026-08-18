@@ -93,7 +93,13 @@
   async function hold(on) {
     const want = on ? ["queued", "running"] : ["held", "paused"];
     const paths = sel.filter(r => want.includes(r.status)).map(r => r.path);
-    if (!paths.length) return;
+    if (!paths.length) {
+      // Returning quietly here made Hold look broken: nothing moved, nothing
+      // was said, and the only wrong thing was the selection.
+      notice = `nothing to ${on ? "hold" : "release"} — selected: `
+             + [...new Set(sel.map(r => r.status))].join(", ");
+      return;
+    }
     busy = on ? "hold" : "release";
     try {
       const d = await j("/api/hold", { method: "POST",
@@ -120,6 +126,7 @@
       ? rows.filter(r => selected.has(r.path) && r.status === "queued").map(r => r.path)
       : rows.filter(r => r.status === "queued").map(r => r.path);
     if (!paths.length) { notice = "nothing queued to start"; return; }
+    notice = `starting ${paths.length} on ${sHost}…`;
     const d = await post("/api/start", { host: sHost, scratch: sScratch, paths }, "start");
     if (d?.ok) { notice = `started ${d.count} on ${d.label} (${d.work})`; showStart = false; }
   }
@@ -249,7 +256,7 @@
   <button class="tb" onclick={() => (showStart = true)} disabled={!hosts.length || !!busy}>▶ Start</button>
   <button class="tb" onclick={() => post("/api/stop", { host: (hosts.find(h => h.queue_running) || runningHost || hosts[0])?.id }, "stop")}
           disabled={!hosts.length || !!busy}
-          title="Stop the whole queue: finish the episode in flight, then stop">■ Stop</button>
+          title="Stop everything now. Finished chunks are kept; Start resumes from there.">■ Stop</button>
   <button class="tb" onclick={() => { showMachine = true; probe = null; }} title="Onboard a GPU machine">⚙ Machines</button>
   <button class="add" onclick={() => { showImport = true; picked = new Set(); browse(); }} title="Import episodes">+</button>
 </nav>

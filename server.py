@@ -401,9 +401,33 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
     than quietly dropped: it usually means it was renamed or moved, and hiding
     that would make the queue silently shorter than the user's intent.
     """
+    # WHICH EPISODE IS RUNNING IS THE SEQUENCER'S ANSWER, NOT THE WORKER'S.
+    #
+    # The worker names the episode from its job file, and that file belongs to
+    # the PREVIOUS episode until the new one finishes counting frames - minutes,
+    # on a long episode. For all of that time the row the user just started read
+    # `queued` while the card was demonstrably working on it, and the episode
+    # before it read `running`. That is what "I started it three times and it
+    # just stays queued" was: the queue was running it every time.
+    #
+    # The driver launched the thing, so it knows. Where it has an answer, it
+    # wins, and the host's live phase is attributed to THAT path.
+    driving: dict = {}
+    if host_states:
+        by_id = {x.get("id"): x for x in host_states}
+        for hid, d in list(_drivers.items()):
+            if d.is_alive() and d.current and not d.stop_after_current:
+                driving[d.current] = by_id.get(hid) or {"id": hid}
+    claimed = {x.get("id") for x in driving.values()}
+
     running = {}
     for h in host_states:
-        epname = (h.get("episode") or "")
+        if h.get("id") in claimed:
+            continue                      # already spoken for, by name not guess
+        # The fallback name is scraped off a remote command line, so it arrives
+        # wrapped in the shell quoting the command was sent with - "...mkv'"
+        # never matched any file and the row stayed queued.
+        epname = (h.get("episode") or "").strip().strip("'\"")
         if epname and h.get("state") in ("running", "working", "paused", "stopping"):
             running[epname] = h
 
@@ -416,7 +440,7 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
         n = ep_num(p.name)
         if path in gone:
             continue
-        h = running.get(p.name)
+        h = driving.get(path) or running.get(p.name)
         lib = library_root(p)
         arch = lib / ".upscale-originals"
         archived = arch.is_dir() and any(x.name == p.name for x in arch.rglob("*"))
@@ -520,9 +544,53 @@ def kill_episode(cfg: dict, host: str) -> None:
     h = all_hosts(cfg).get(host)
     if not h:
         return
+    # "[r]sync .*upscale" was close enough to a bare rsync pattern to be a
+    # hazard: these machines also run the user's own file syncs, and one of
+    # those under a path containing "upscale" would have been killed too.
+    # Match this host's declared scratch paths instead, like kill_transfers.
+    pats = ["[u]pscale-worker", "[r]ealesrgan-ncnn-vulkan"]
+    for sp in (h.get("scratch") or {}).values():
+        if sp:
+            pats.append("[r]sync.*" + str(sp).rstrip("/"))
     ssh_to(h.get("ssh", host),
-           "pkill -f '[u]pscale-worker' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; "
-           "pkill -f '[r]sync .*upscale' ; true", timeout=20)
+           " ; ".join("pkill -f " + shlex.quote(x) for x in pats) + " ; true",
+           timeout=20)
+
+
+def kill_gpu(cfg: dict, host: str) -> None:
+    """Kill the upscale work on a host, leaving transfers alone.
+
+    Deliberately not rsync: killing deliveries once threw away 443 MB of a
+    FINISHED episode's upload because a different episode was being stopped.
+    That bandwidth is already spent and separately valuable.
+    """
+    h = all_hosts(cfg).get(host)
+    if not h:
+        return
+    ssh_to(h.get("ssh", host),
+           "pkill -f '[u]pscale-worker process' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true",
+           timeout=20)
+
+
+def kill_transfers(cfg: dict, host: str) -> None:
+    """Kill fetches and deliveries on a host.
+
+    Safe: both rsyncs run with --partial, so a killed transfer leaves a resume
+    point behind. It costs the in-flight buffer, not the bytes already sent.
+
+    Matched on this host's own scratch paths, never a bare "rsync" - the same
+    machines run the user's unrelated syncs, and killing those would be a far
+    worse surprise than a slow Stop.
+    """
+    h = all_hosts(cfg).get(host)
+    if not h:
+        return
+    pats = ["[u]pscale-worker deliver", "[u]pscale-worker fetch"]
+    for sp in (h.get("scratch") or {}).values():
+        if sp:
+            pats.append("[r]sync.*" + str(sp).rstrip("/"))
+    cmd = " ; ".join("pkill -f " + shlex.quote(x) for x in pats) + " ; true"
+    ssh_to(h.get("ssh", host), cmd, timeout=20)
 
 
 def abort_host(cfg: dict, host: str) -> dict:
@@ -664,7 +732,10 @@ class Driver(threading.Thread):
         self.host, self.scratch = host, scratch
         self.stop_after_current = False
         self.current = ""
-        self.note = ""
+        # Never blank: the note IS the queue's answer in the UI, and an empty
+        # one for the first seconds after Start reads as a button that did
+        # nothing at all.
+        self.note = "starting"
         self._cfg = cfg
         # ONE TRANSFER AT A TIME, DELIVERIES FIRST.
         #
@@ -779,6 +850,8 @@ class Driver(threading.Thread):
         964 MB render in scratch.
         """
         for _ in range(tries):
+            if self.stop_after_current or self._shutdown:
+                return 0             # Stop must not wait out three more minutes
             n = self._out_size(path)
             if n:
                 return n
@@ -803,17 +876,8 @@ class Driver(threading.Thread):
             return 0
 
     def _kill_current(self):
-        """Stop the GPU work. NOT the transfers.
-
-        This used to pkill rsync too, so abandoning an episode on the card also
-        killed an unrelated upload of a FINISHED one - 443 MB of a delivery
-        thrown away because a different episode was being skipped. A transfer is
-        separate work and separately valuable.
-        """
-        h = self._h()
-        ssh_to(h.get("ssh", self.host),
-               "pkill -f '[u]pscale-worker process' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true",
-               timeout=20)
+        """Stop the GPU work. NOT the transfers. See kill_gpu()."""
+        kill_gpu(load_config(), self.host)
 
     def _process_running(self, path: str) -> bool:
         """Is a process phase already running for this episode anywhere?"""
@@ -861,7 +925,14 @@ class Driver(threading.Thread):
     def run(self):
         # Adopt whatever is already running: this service restarting must not
         # lock the queue until the episode in flight ends.
+        adopting = False
         while self._gpu_busy():
+            if not adopting:
+                adopting = True
+                # Otherwise the note sat on "starting" for the rest of an
+                # episode already in flight, which reads as a Start that never
+                # took - the queue IS running, it is just not its turn yet.
+                self.note = "waiting for the episode already running"
             time.sleep(4)
             if self.stop_after_current or self._unreachable_too_long():
                 return
@@ -1018,6 +1089,22 @@ def resume_active() -> None:
         print(f"resumed queue on {host} (scratch {scratch})", flush=True)
 
 
+def _abandon(d: "Driver") -> None:
+    """Tell a sequencer to stop, and stop counting it as one.
+
+    Every blocking wait in the driver re-checks these two flags, so the thread
+    unwinds within a poll and launches nothing further; it also refuses to
+    evict a successor from the registry on its way out. Nothing here waits for
+    it, because a Stop or a Start that blocks on a thread is the unresponsive
+    UI this is meant to fix.
+    """
+    d.stop_after_current = True
+    d._shutdown = True                   # ends the transfer loop
+    with d._xfer_cv:
+        d._xfer.clear()                  # queued transfers never get their turn
+        d._xfer_cv.notify_all()          # release anything blocked in _wait_xfer
+
+
 def start_job(cfg: dict, host: str, scratch: str, paths: list[str] | None = None) -> dict:
     h = all_hosts(cfg).get(host)
     if not h:
@@ -1027,8 +1114,16 @@ def start_job(cfg: dict, host: str, scratch: str, paths: list[str] | None = None
         assign(paths, host)              # queue this selection into this machine
     with _drivers_lock:
         d = _drivers.get(host)
-        if d and d.is_alive():
+        # A sequencer that has been told to stop is NOT a running queue, however
+        # long it takes to notice. Refusing Start because one of those was still
+        # winding down is how Start became a button that did nothing: the reply
+        # was "desktop already has a queue running" while the machine sat idle.
+        # Abandon it instead - it re-checks stop_after_current within a poll,
+        # launches nothing more, and hands ownership over on its way out.
+        if d and d.is_alive() and not (d.stop_after_current or d._shutdown):
             return {"ok": False, "error": f"{host} already has a queue running"}
+        if d:
+            _abandon(d)
         d = Driver(cfg, host, scratch)
         _drivers[host] = d
         d.start()
@@ -1051,35 +1146,66 @@ def driver_state(host: str) -> dict:
     d = _drivers.get(host)
     active = host in (_state().get("active") or {})
     if not d or not d.is_alive():
+        # A blank here is the UI saying nothing at all - neither running nor
+        # stopped - which is indistinguishable from a button that did nothing.
         return {"queue_running": False, "queue_stopping": False,
-                "queue_note": "" if active else "stopped"}
+                "queue_note": (d.note if d and d.note else
+                               ("idle - press Start" if active else "stopped"))}
     return {"queue_running": True, "queue_note": d.note,
             "queue_stopping": d.stop_after_current,
             "queue_current": Path(d.current).name if d.current else ""}
 
 
-def stop_driver(host: str, kill: bool = False) -> dict:
-    """Stop NOW, and keep everything already earned.
+def stop_driver(host: str, kill: bool = True) -> dict:
+    """Stop NOW. Everything, not just the GPU.
 
-    "Finish the current episode, then stop" was indistinguishable from a broken
-    button: on a 25-minute episode the queue sat there saying "stopping" for
-    half an hour. So Stop pauses the worker instead - it holds after the current
-    CHUNK, seconds away, with every finished chunk still in scratch - and the
-    sequencer exits immediately. Start clears the pause and carries on from
-    where it stopped; nothing is re-upscaled.
+    Three earlier shapes of this all read as a broken button. "Finish the
+    episode, then stop" left the queue saying "stopping" for half an hour.
+    "Pause the worker" still let the current CHUNK finish - two minutes of GPU
+    after the click. And killing only the GPU meant that pressing Stop during a
+    fetch or a delivery did visibly nothing at all, because transfers were
+    deliberately spared and the transfer queue kept handing out the next one.
 
-    A transfer in flight is left alone: that bandwidth is already spent.
+    So Stop now takes down the sequencer, the pending transfer queue, the GPU
+    work and the transfers in flight. Nothing earned is lost: finished chunks
+    stay in scratch, a chunk killed mid-encode fails its frame-count check and
+    is redone, and a killed rsync resumes from its .part.
     """
     set_active(host, None)           # stop meaning stop, across restarts too
-    d = _drivers.get(host)
     cfg = load_config()
-    control(cfg, host, "pause")      # worker holds after the current chunk
-    if not d or not d.is_alive():
-        return {"ok": True, "note": "queue stopped"}
-    d.stop_after_current = True
+    with _drivers_lock:
+        d = _drivers.pop(host, None)  # gone from the registry NOW, so the next
+    if d:                             # Start builds a fresh one and is not
+        _abandon(d)                   # refused by a thread still winding down
     if kill:
-        d._kill_current()
-    return {"ok": True, "note": "queue stopped; the episode is paused after its current chunk"}
+        stop_remote(cfg, host)
+    return {"ok": True, "note": "stopped"}
+
+
+def stop_remote(cfg: dict, host: str) -> None:
+    """Everything Stop has to say to a machine, in ONE ssh round trip.
+
+    It used to be four - `upscale --stop`, `upscale --pause`, the GPU pkill, the
+    transfer pkill - each its own connection, each up to 20 s of timeout, run
+    one after another while the click was still in flight. Five seconds of a
+    dead toolbar is itself the unresponsive button being complained about, and
+    none of the four needs the answer of the one before it.
+    """
+    h = all_hosts(cfg).get(host)
+    if not h:
+        return
+    up = h.get("upscale") or "upscale"
+    pats = ["[u]pscale-worker process", "[r]ealesrgan-ncnn-vulkan",
+            "[u]pscale-worker deliver", "[u]pscale-worker fetch"]
+    # Matched on this host's own scratch paths, never a bare "rsync": the same
+    # machines run the user's unrelated file syncs.
+    for sp in (h.get("scratch") or {}).values():
+        if sp:
+            pats.append("[r]sync.*" + str(sp).rstrip("/"))
+    cmd = (f"{shlex.quote(up)} --stop >/dev/null 2>&1 ; "
+           f"{shlex.quote(up)} --pause >/dev/null 2>&1 ; "
+           + " ; ".join("pkill -f " + shlex.quote(x) for x in pats) + " ; true")
+    ssh_to(h.get("ssh", host), cmd, timeout=20)
 
 
 def control(cfg: dict, host: str, action: str) -> dict:
@@ -1225,22 +1351,32 @@ class Handler(BaseHTTPRequestHandler):
                 # one", so the episode has to actually stop. The driver would
                 # notice within a poll, but a host with no driver would sit there
                 # finishing an episode the user just paused.
+                #
+                # Asking the WORKER which episode it is on is not good enough:
+                # its answer comes from a job file belonging to the previous
+                # episode until the new one has finished counting frames, and
+                # comes back wrapped in shell quotes when it is scraped off a
+                # command line. Hold then matched nothing and quietly did not
+                # stop the episode the user had just held. The driver knows the
+                # path it launched, so ask it first.
+                want = set(paths)
                 for name, h in all_hosts(cfg).items():
-                    st = host_status(name, h)
-                    cur = st.get("episode") or ""
-                    if cur and any(Path(p).name == cur for p in paths):
+                    d = _drivers.get(name)
+                    hit = bool(d and d.is_alive() and d.current in want)
+                    if not hit:
+                        cur = (host_status(name, h).get("episode") or "").strip().strip("'\"")
+                        hit = bool(cur) and any(Path(p).name == cur for p in paths)
+                    if hit:
                         kill_episode(cfg, name)
                         skipped.append(name)
             return self._json({"ok": True, "held": sorted(held), "skipped": skipped})
         if path in ("/api/pause", "/api/resume"):
             return self._json(control(cfg, body.get("host", ""), path.rsplit("/", 1)[1]))
         if path == "/api/stop":
-            # Stop is the QUEUE's stop: finish the episode in flight, then stop.
-            # It also writes the pipeline's own flag, so an `upscale ep` run
-            # started outside this UI stops too.
+            # Stop is immediate: the pipeline's own flag, then the GPU work
+            # itself, on every host. Finished chunks survive; Start resumes.
             host = body.get("host", "")
-            control(cfg, host, "stop")          # the pipeline's own flag too
-            r = stop_driver(host)
+            r = stop_driver(host)               # incl. the pipeline's own flag
             # Every host, not just one: Stop is the queue, and a second machine
             # quietly carrying on is exactly the surprise this avoids.
             for other in all_hosts(cfg):
