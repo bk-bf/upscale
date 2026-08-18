@@ -181,9 +181,20 @@ cmd_status_json(){
 
   # $FRAMES/$OUT/$LOCAL are assigned after this branch exits, so they are unbound
   # here; the job file carries SEGDIR and the whole work dir hangs off it.
-  local wdir="" framesdir="" extracted=0
+  local wdir="" framesdir="" extracted=0 _r
   if [ -n "${SEGDIR:-}" ]; then
-    wdir=$(dirname "$SEGDIR"); framesdir="$wdir/frames"
+    wdir=$(dirname "$SEGDIR")
+  elif [ -n "$ep" ]; then
+    # do_process DELETES the job file when the GPU work ends, so during muxing
+    # and delivery there is no SEGDIR to derive from - and the delivered size,
+    # which is the only total the upload bar can use, read as 0. Find the work
+    # dir by the episode name across the scratch roots this machine uses.
+    for _r in "$WORK" "$HOME/upscale-scratch" /mnt/scratch/upscale-ep; do
+      [ -d "$_r/${ep%.*}" ] && { wdir="$_r/${ep%.*}"; break; }
+    done
+  fi
+  if [ -n "$wdir" ]; then
+    framesdir="$wdir/frames"
     [ -d "$framesdir" ] && extracted=$(pngs "$framesdir")
   fi
 
@@ -200,6 +211,28 @@ cmd_status_json(){
     phase=${phase:-idle}
     [ "${pt0:-0}" -gt 0 ] && pelapsed=$(( $(date +%s) - pt0 ))
   fi
+  # REALITY OVERRIDES THE MARKER. The marker is what the worker last declared;
+  # what the machine is visibly doing is what is true. A worker that died, or
+  # one from before markers existed, leaves a stale declaration - and trusting
+  # it showed "upscaling" through muxing and uploading.
+  local ffargs="" fpargs="" live=""
+  ffargs=$(pgrep -af '[f]fmpeg' 2>/dev/null | tr '\n' ' ') || ffargs=""
+  fpargs=$(pgrep -af '[f]fprobe' 2>/dev/null | tr '\n' ' ') || fpargs=""
+  if pgrep -f '[r]sync .*\.mkv' >/dev/null 2>&1;               then live=delivering
+  elif pgrep -f '[r]sync ' >/dev/null 2>&1;                     then live=fetching
+  elif [ "$busy" = true ];                                      then live=upscaling
+  elif printf '%s' "$ffargs" | grep -q -- '-f concat';          then live=muxing
+  elif printf '%s' "$ffargs" | grep -q 'fps_mode passthrough';  then live=extracting
+  elif printf '%s' "$ffargs" | grep -q 'libx264';               then live=encoding
+  elif printf '%s' "$fpargs" | grep -q 'seg_';                  then live=verifying
+  elif printf '%s' "$fpargs" | grep -q 'count_frames';          then live=counting
+  fi
+  if [ -n "$live" ] && [ "$live" != "$phase" ]; then
+    # A phase the marker did not describe has no numbers of its own; say so
+    # rather than carrying the previous phase's totals into it.
+    phase=$live; pdone=0; ptot=0; punit=""; pelapsed=0; peta=0
+  fi
+
   # Live measures, because the marker records where a phase STARTED, not where
   # it has got to.
   case "$phase" in
@@ -228,7 +261,7 @@ cmd_status_json(){
   # phases, since the other end of each is a file on the server.
   local outb=0 fetchb=0 f
   if [ -n "$wdir" ]; then
-    for f in "$wdir"/*.mkv; do
+    for f in "$wdir"/*.mkv "$wdir"/*.mkv.part; do
       [ -f "$f" ] && outb=$(stat -c%s "$f" 2>/dev/null || echo 0)
     done
     for f in "$wdir/src" "$wdir/src.part"; do
