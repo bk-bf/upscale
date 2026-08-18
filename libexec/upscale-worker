@@ -100,7 +100,7 @@ cmd_status(){
 # Always valid JSON, including when there is no job at all - a consumer should
 # never have to distinguish "no job" from "ssh failed" by parse error.
 cmd_status_json(){
-  local segs=0 chunks=0 state=idle df=0 pct=0 fps=0 elapsed=0 eta=0 ep="" phase=idle pp=0
+  local segs=0 chunks=0 state=idle df=0 pct=0 fps=0 elapsed=0 eta=0 ep="" phase=idle pp=0 transfer=""
   # THE JOB FILE IS NOT THE JOB. do_process writes it and deletes it again when
   # the GPU work ends, so it exists for only one of the three phases. Fetch and
   # deliver are minutes each - ~900 MB over a ~2 MB/s link - and reading $JOB
@@ -115,6 +115,11 @@ cmd_status_json(){
     # Everything after the phase word is the path - NOT the last space-separated
     # token. Episode titles are full of spaces ("A Gentle Right Arm SDTV.mkv"),
     # so ${wargs##* } returned "HDTV-720p.mkv".
+    #
+    # This is a FALLBACK. With phases overlapping, several workers run at once -
+    # one on the card, another uploading a finished episode - and pgrep lists
+    # whichever it likes. The job file below names the episode actually being
+    # processed, and it wins when it exists.
     ep=$(printf '%s' "$wargs" | sed -E 's#^.*upscale-worker (run|fetch|process|deliver) ##')
     ep=$(basename "$ep")
   fi
@@ -227,6 +232,12 @@ cmd_status_json(){
   elif printf '%s' "$fpargs" | grep -q 'seg_';                  then live=verifying
   elif printf '%s' "$fpargs" | grep -q 'count_frames';          then live=counting
   fi
+  # Nothing running at all means idle, whatever the marker still says. The
+  # marker is the last thing a worker declared, and a finished worker declares
+  # nothing - so an ended episode kept reporting "upscaling" for ever.
+  if [ -z "$wargs" ] && [ -z "$live" ] && [ -z "$transfer" ]; then
+    phase=idle; pp=-1; pdone=0; ptot=0; punit=""; pelapsed=0; peta=0
+  fi
   if [ -n "$live" ] && [ "$live" != "$phase" ]; then
     # A phase the marker did not describe has no numbers of its own; say so
     # rather than carrying the previous phase's totals into it.
@@ -268,8 +279,8 @@ cmd_status_json(){
       [ -f "$f" ] && fetchb=$(stat -c%s "$f" 2>/dev/null || echo 0)
     done
   fi
-  printf '"gpu_busy":%s,"phase":"%s","phase_percent":%d,"phase_done":%d,"phase_total":%d,' \
-    "$busy" "$phase" "$pp" "${pdone:-0}" "${ptot:-0}"
+  printf '"gpu_busy":%s,"phase":"%s","transfer":"%s","phase_percent":%d,"phase_done":%d,"phase_total":%d,' \
+    "$busy" "$phase" "$transfer" "$pp" "${pdone:-0}" "${ptot:-0}"
   printf '"phase_unit":"%s","phase_elapsed_s":%d,"phase_eta_s":%d,"frames_extracted":%d,' \
     "${punit:-}" "$pelapsed" "$peta" "$extracted"
   # The scratch dir of the RUNNING job, not this invocation's default. `status`
@@ -484,6 +495,39 @@ EOF
          -c copy -f matroska "$OUT.part" -y
   local final; final=$(vframes "$OUT.part")
   [ "$final" = "$TOTAL" ] || die "FINAL MISMATCH: $final frames, source had $TOTAL"
+
+  # NORMALISE THE CONTAINER TIMESTAMPS.
+  #
+  # The concat muxer leaves the video track starting 20 ms after the container's
+  # zero. ffmpeg plays it, mpv plays it, and Jellyfin direct-plays it - but
+  # Fladder's libmpv backend renders no video at all: it allocates the texture,
+  # Skia rejects it ("Trying to use texture on two GrContexts!"), and the video
+  # output is disposed and recreated in a loop while audio runs on. You get the
+  # first frame frozen on screen. An episode remuxed from a finished file starts
+  # at 0 and plays, which is the only reason this was ever found.
+  #
+  # ffmpeg cannot fix it with a stream copy - -output_ts_offset, -itsoffset and
+  # a plain remux all leave it at 20 ms, because the Matroska muxer re-derives
+  # cluster timecodes from the first packet. mkvmerge rebases them. Container
+  # rewrite only, no re-encode, ~30 s.
+  if command -v mkvmerge >/dev/null 2>&1; then
+    if mkvmerge -q -o "$OUT.norm" "$OUT.part" 2>/dev/null; then
+      local nf; nf=$(vframes "$OUT.norm") || nf=0
+      if [ "$nf" = "$TOTAL" ]; then
+        mv -f "$OUT.norm" "$OUT.part"
+        say "timestamps normalised (video starts at 0)"
+      else
+        rm -f "$OUT.norm"
+        say "WARNING: normalise produced $nf of $TOTAL frames - keeping the original"
+      fi
+    else
+      rm -f "$OUT.norm"
+      say "WARNING: mkvmerge failed; delivering without normalising"
+    fi
+  else
+    say "WARNING: mkvmerge not installed - video will start at 20 ms and Fladder's libmpv backend will show no video (install mkvtoolnix)"
+  fi
+
   mv "$OUT.part" "$OUT"
   rm -rf "$FRAMES" "$UP" "$W/shard" "$SEGDIR"
   rm -f "$JOB" "$STATE/started"

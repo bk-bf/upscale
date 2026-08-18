@@ -83,6 +83,7 @@ Everything is an environment variable:
 | `LIMIT` | `0` | stop after N episodes (`0` = unlimited) |
 | `EPISODES` | `any` | which episodes this machine owns (see below) |
 | `IDENT_MIN_DB` | `20` | identity floor: an output scoring below this against its own source is refused |
+| — | — | **`mkvtoolnix` is required on the GPU machine.** The muxed file is normalised with `mkvmerge` before delivery, or the video track starts 20 ms late and Fladder’s libmpv backend shows no video at all — see BUGS.md |
 | `SRC_EXT` | `avi` | which extensions are sources. `mkv` for a show that already arrives as h264/hevc; comma or space separated for both |
 
 ### Sources that are already `.mkv`

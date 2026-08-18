@@ -283,6 +283,53 @@ background job whose silent failure directly wastes GPU time.
 Fix: prefetch the next candidate *after the one actually chosen*, from the same
 `runnable` list the run loop takes from, and log its output.
 
+## The one that produced a file every tool could play except the one that matters
+
+**The concat muxer starts the video track 20 ms after the container's zero, and
+Fladder's libmpv backend then renders no video at all.**
+
+Audio plays, subtitles load, the first frame sits frozen on screen for the whole
+episode. Every other consumer is fine: `ffprobe` reports nothing wrong, `ffmpeg`
+decodes every frame, `mpv` plays it start to finish over sftp, Jellyfin
+direct-plays it without transcoding, and Fladder's *mdk* backend plays it. Only
+libmpv-inside-Flutter fails, and its log says why:
+
+```
+media_kit: TextureGL: Resize: (1920, 1440)
+GrBackendTextureImageGenerator: Trying to use texture on two GrContexts!
+video_output_dispose -> video_output_new -> ...
+```
+
+The video output is torn down and rebuilt in a loop, so no frame is ever
+presented.
+
+How it was cornered, in order:
+
+| test | result |
+|---|---|
+| the delivered file, decoded frame by frame | clean, correct content |
+| the same file in mpv over sftp | plays fully |
+| Jellyfin's stored metadata, codec, profile, level, pixfmt | identical to a working episode |
+| Matroska top-level elements, cluster count, attachments | identical |
+| every field `ffprobe -show_streams -show_format` prints | **identical** |
+| container timestamps | **video starts at 0.020 s, working episode starts at 0** |
+
+The working episode had been remuxed from a finished file for an unrelated
+reason, which is the only thing that gave it a zero start - so the difference
+was an accident, and without it this would have looked like a client bug with no
+cause.
+
+**ffmpeg cannot fix it with a stream copy.** `-output_ts_offset -0.020`,
+`-itsoffset -0.020` and a plain `-c copy` remux all leave it at 20 ms: the
+Matroska muxer re-derives cluster timecodes from the first packet. `mkvmerge -o
+out in` rebases them, and the result matches the working file exactly (video
+0.000, audio 0.020, subs 0.000).
+
+**Fix:** run `mkvmerge` over the muxed file before delivering. Container rewrite,
+no re-encode, ~30 s on a 1 GB episode, frame count re-asserted afterwards. If
+mkvmerge is missing the worker says so loudly rather than shipping a file that
+looks fine everywhere except in front of the person watching it.
+
 ## Measurement mistakes
 
 - **Extrapolating throughput from TFLOPS was wrong every time.** Predicted 2–3 fps for a
