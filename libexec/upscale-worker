@@ -362,12 +362,21 @@ EOF
   # titles like "A Shinigami's Work" otherwise truncate the filename.
   find "$SEGDIR" -name 'seg_*.mkv' | sort |
     sed -e "s/'/'\\\\''/g" -e "s|^|file '|" -e "s|$|'|" > "$SEGDIR/list"
-  # Mux the ORIGINAL audio back in. The video is rebuilt from frames, so it
-  # carries no audio of its own; without this the episode is silent.
-  # -map 1:a? is optional so a source with no audio track still succeeds.
+  # Mux the ORIGINAL audio, SUBTITLES and FONT ATTACHMENTS back in. The video is
+  # rebuilt from frames, so it carries none of them.
+  #
+  # This mapped only video and audio for its whole life, which was invisible on
+  # Bleach - XviD sources with nothing else in them - and silently shipped every
+  # Gintama episode with no subtitles and no fonts. A subtitled show came out
+  # unwatchable and the only fix was a remux, because the upscale itself was
+  # fine. 1:s? and 1:t? are what carry the ass track and the ttf it needs.
+  #
+  # Every map is optional (?) so a source with no audio, no subs or no fonts
+  # still succeeds - do not drop the ? to "tighten" this.
   # -f matroska: ffmpeg cannot infer a container from the ".part" suffix
   ffmpeg -v error -f concat -safe 0 -i "$SEGDIR/list" -i "$LOCAL" \
-         -map 0:v:0 -map "1:a?" -c copy -f matroska "$OUT.part" -y
+         -map 0:v:0 -map "1:a?" -map "1:s?" -map "1:t?" \
+         -c copy -f matroska "$OUT.part" -y
   local final; final=$(vframes "$OUT.part")
   [ "$final" = "$TOTAL" ] || die "FINAL MISMATCH: $final frames, source had $TOTAL"
   mv "$OUT.part" "$OUT"

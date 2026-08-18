@@ -48,6 +48,24 @@ counts were, again, perfect.
 → Mux the original back at concat: `-map 0:v:0 -map "1:a?" -c copy`. No re-encode, so it
 costs nothing. `1:a?` is optional so a source without audio still succeeds.
 
+**And it drops the subtitles and the fonts.** The audio fix mapped video and audio and
+stopped there, so everything delivered afterwards had its `ass` track and its `ttf`
+attachment silently discarded. This survived a whole series unnoticed because Bleach's
+sources are XviD `.avi` carrying neither — the bug could not express itself. The first
+subtitled show, Gintama, delivered an episode that was simply unwatchable: Japanese
+audio, no subtitles, from a source that had both.
+
+Cost: one delivered episode (Gintama S01E03), and the assumption that everything
+delivered before it was complete. Not a re-upscale — the video was correct — only a
+remux of the delivered file against its archived original.
+→ Map every stream class the source can carry: `-map 0:v:0 -map "1:a?" -map "1:s?"
+-map "1:t?" -c copy`. `1:t?` is the attachment specifier; without it the subtitles
+arrive with no font to render them in. Keep every `?`: a source with none of these
+must still succeed.
+
+> Lesson: *a map list is a whitelist, and the streams you leave out do not warn you.*
+> A library whose sources all happen to lack a stream class will never test it.
+
 ## ffmpeg invocation traps
 
 **Apostrophes break concat lists.** The concat demuxer quotes each path in single
