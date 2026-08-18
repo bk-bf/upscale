@@ -745,20 +745,39 @@ class Driver(threading.Thread):
 
     def _gpu_busy(self) -> bool:
         """Is the exclusive phase occupied? A fetch or a delivery running
-        alongside must not read as the GPU being in use."""
+        alongside must not read as the GPU being in use.
+
+        An unreachable host counts as busy so a network blip never starts a
+        second episode - but only for a while: see _unreachable_too_long.
+        """
         st = host_status(self.host, self._h())
         if not st.get("reachable"):
-            return True                    # unknown is not free
+            self._down = getattr(self, "_down", 0) + 1
+            return True
+        self._down = 0
         return st.get("phase") in ("counting", "extracting", "verifying",
                                    "upscaling", "encoding", "muxing")
+
+    def _unreachable_too_long(self) -> bool:
+        """A machine that has been off for minutes is not a blip.
+
+        Without this the sequencer spins against a powered-down box for ever
+        while the page cheerfully reports a running queue - which is worse than
+        saying the host is gone, because it looks like work is happening.
+        """
+        if getattr(self, "_down", 0) < 75:      # ~5 min at a 4 s poll
+            return False
+        self.note = f"{self.host} unreachable - queue stopped"
+        set_active(self.host, None)
+        return True
 
     def run(self):
         # Adopt whatever is already running: this service restarting must not
         # lock the queue until the episode in flight ends.
         while self._gpu_busy():
             time.sleep(4)
-            if self.stop_after_current:
-                break
+            if self.stop_after_current or self._unreachable_too_long():
+                return
 
         prefetched = ""
         while not self.stop_after_current:
@@ -813,6 +832,8 @@ class Driver(threading.Thread):
                     break
                 if self._gpu_busy():
                     quiet = 0
+                    if self._unreachable_too_long():
+                        return
                     continue
                 quiet += 1
                 if quiet >= 3:
