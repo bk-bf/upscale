@@ -122,6 +122,7 @@ def _state() -> dict:
     s.setdefault("imports", [])
     s.setdefault("held", {})
     s.setdefault("removed", {})
+    s.setdefault("assigned", {})     # file path -> host id
     return s
 
 
@@ -210,6 +211,30 @@ def forget_host(host_id: str) -> dict:
         st.setdefault("hosts", {}).pop(host_id, None)
         _save_state(st)
         return st["hosts"]
+
+
+def assignments() -> dict:
+    return dict(_state().get("assigned") or {})
+
+
+def assign(paths: list[str], host: str) -> dict:
+    """Queue episodes INTO a machine.
+
+    An assignment is a claim, which is what makes two machines safe on one
+    queue: a driver only ever runs what is assigned to it, and claims an
+    unassigned episode before starting it, so two drivers cannot take the same
+    file.
+    """
+    with _state_lock:
+        st = _state()
+        a = st.setdefault("assigned", {})
+        for p in paths:
+            if host:
+                a[p] = host
+            else:
+                a.pop(p, None)
+        _save_state(st)
+        return dict(a)
 
 
 def imports() -> list[str]:
@@ -382,6 +407,8 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
             running[epname] = h
 
     held, gone = held_for("*"), removed_for("*")
+    assigned = assignments()
+    host_labels = {h.get("id", ""): h.get("label", "") for h in host_states}
     rows = []
     for path in imports():
         p = Path(path)
@@ -406,10 +433,15 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
             status = "held"
         else:
             status = "queued"
+        assigned_to = assigned.get(path, "")
         row = {"n": n, "name": p.name, "path": path, "status": status,
                "library": str(lib), "library_name": lib.name,
                "size": p.stat().st_size if p.exists() else 0,
-               "device": h.get("label", "") if h else ""}
+               "assigned": assigned_to,
+               # The device column answers "where will this run?", not only
+               # "where is it running?" - an assigned episode has an answer long
+               # before a GPU touches it.
+               "device": (h.get("label") if h else host_labels.get(assigned_to, "")) or ""}
         if h:
             row.update({"percent": h.get("percent", 0), "fps": h.get("fps", 0),
                         "eta_s": h.get("eta_s", 0), "phase": h.get("phase", ""),
@@ -424,6 +456,22 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
     return {"rows": rows,
             "counts": {st: sum(1 for r in rows if r["status"] == st)
                        for st in ("done", "running", "paused", "held", "queued", "missing")}}
+
+
+def kill_episode(cfg: dict, host: str) -> None:
+    """Stop the EPISODE, leaving any queue alone.
+
+    Used when the running episode is held: the machine must move on to the next
+    one, not stall. Finished chunks stay in scratch, so releasing the hold later
+    resumes the episode rather than restarting it - which is what makes this a
+    pause and not a discard.
+    """
+    h = all_hosts(cfg).get(host)
+    if not h:
+        return
+    ssh_to(h.get("ssh", host),
+           "pkill -f '[u]pscale-worker' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; "
+           "pkill -f '[r]sync .*upscale' ; true", timeout=20)
 
 
 def abort_host(cfg: dict, host: str) -> dict:
@@ -510,46 +558,192 @@ def host_running(h: dict, name: str) -> dict:
 
 
 # ----------------------------------------------------------------- actions ---
-def start_job(cfg: dict, host: str, paths: list[str], scratch: str) -> dict:
-    """Run the given files on a host, in order, one after another.
+# ------------------------------------------------------------------ driver ---
+# One sequencer per host, so the QUEUE is a queue rather than a fixed list fired
+# at a machine and forgotten.
+#
+# It exists because of what pause has to mean: holding the RUNNING episode has
+# to move the machine on to the next one, not stall it. A remote `for` loop
+# cannot do that - by the time you want to skip, the loop is already inside the
+# episode. So the server starts one episode at a time, watches it, and decides
+# what happens next.
+#
+# The episode itself is still launched detached on the host. If this service
+# restarts, the episode keeps going and nothing is lost; only the sequencing
+# stops, and pressing Start picks it up again. That is deliberate - a web
+# service restarting must never abandon a two-hour render, and must never
+# silently start new work either.
+_drivers: dict[str, "Driver"] = {}
+_drivers_lock = threading.Lock()
 
-    A file, not a range: the queue holds episodes now, and the worker's own
-    one-shot `run` takes exactly one source. LIB and ARCHIVE are set PER FILE,
-    because a selection can span shows and the worker uses LIB to work out both
-    where the output goes and where the original is archived.
 
-    setsid+nohup because this must outlive the ssh connection, the browser and
-    this service: it is a many-hour job, not a web request.
-    """
+class Driver(threading.Thread):
+    def __init__(self, cfg: dict, host: str, scratch: str):
+        super().__init__(daemon=True)
+        self.host, self.scratch = host, scratch
+        self.stop_after_current = False
+        self.current = ""
+        self.note = ""
+        self._cfg = cfg
+
+    # --- helpers ----------------------------------------------------------
+    def _h(self):
+        return all_hosts(load_config()).get(self.host) or {}
+
+    def _next_path(self) -> str:
+        """The next episode THIS machine should run.
+
+        Assigned to it, or unassigned - and an unassigned one is claimed before
+        it is returned, under the same lock that writes assignments, so two
+        machines racing the same queue cannot both take it.
+        """
+        cfg = load_config()
+        rows = queue_rows(cfg, [])["rows"]           # no host states: pure queue view
+        held, gone = held_for(), removed_for()
+        with _state_lock:
+            st = _state()
+            a = st.setdefault("assigned", {})
+            for r in rows:
+                p = r["path"]
+                if r["status"] != "queued" or p in held or p in gone:
+                    continue
+                owner = a.get(p)
+                if owner and owner != self.host:
+                    continue
+                if not owner:
+                    a[p] = self.host                 # claim
+                    _save_state(st)
+                return p
+        return ""
+
+    def _launch(self, path: str) -> bool:
+        h = self._h()
+        work = (h.get("scratch") or {}).get(self.scratch)
+        worker = h.get("worker") or "upscale-worker"
+        lib = library_root(Path(path))
+        env = (f"LIB={shlex.quote(str(lib))} "
+               f"ARCHIVE={shlex.quote(str(lib / '.upscale-originals'))} "
+               + (f"WORK={shlex.quote(work)} " if work else ""))
+        remote = (f"setsid nohup env {env}{shlex.quote(worker)} run {shlex.quote(path)} "
+                  f">> ~/upscale-ui.log 2>&1 < /dev/null & echo started")
+        rc, _, err = ssh_to(h.get("ssh", self.host), remote, timeout=25)
+        if rc != 0:
+            self.note = (err or f"ssh exited {rc}").strip()[:200]
+            return False
+        return True
+
+    def _kill_current(self):
+        h = self._h()
+        ssh_to(h.get("ssh", self.host),
+               "pkill -f '[u]pscale-worker' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; "
+               "pkill -f '[r]sync .*upscale' ; true", timeout=20)
+
+    # --- loop -------------------------------------------------------------
+    def _still_queued(self, path: str) -> bool:
+        return any(r["path"] == path and r["status"] == "queued"
+                   for r in queue_rows(load_config(), [])["rows"])
+
+    def run(self):
+        while True:
+            path = self._next_path()
+            if not path:
+                self.note = "nothing left to run"
+                break
+            self.current = path
+            if not self._launch(path):
+                break
+
+            # 1. WAIT FOR IT TO ACTUALLY START. Treating "not busy" as finished
+            #    is what turned this loop into a launch storm: a status blip
+            #    right after launch read as a completed episode, so the same
+            #    file was started again every few seconds - three workers ended
+            #    up on one episode, sharing a scratch dir.
+            started = False
+            for _ in range(30):                       # up to ~2 min
+                time.sleep(4)
+                st = host_status(self.host, self._h())
+                if st.get("state") in ("running", "working", "paused", "stopping"):
+                    started = True
+                    break
+                if path in held_for():
+                    break
+            if not started and path not in held_for():
+                self.note = f"{Path(path).name} never started - stopping rather than retrying"
+                self._kill_current()
+                break
+
+            # 2. Watch until it is genuinely finished.
+            quiet = 0
+            while True:
+                time.sleep(4)
+                st = host_status(self.host, self._h())
+                if not st.get("reachable"):
+                    continue                          # a blip is not an outcome
+                if path in held_for():
+                    self.note = f"skipped {Path(path).name}"
+                    self._kill_current()
+                    break
+                if st.get("state") in ("running", "working", "paused", "stopping"):
+                    quiet = 0
+                    continue
+                quiet += 1
+                if quiet >= 3:                        # ~12 s of genuine silence
+                    break
+
+            # 3. DONE IS DERIVED, NOT ASSUMED. If the worker stopped but the
+            #    episode is still queued, it failed - and relaunching it is the
+            #    storm again. Stop and say so.
+            if path not in held_for() and self._still_queued(path):
+                self.note = (f"{Path(path).name} stopped without finishing - "
+                             f"queue halted so it cannot loop on it")
+                break
+            self.current = ""
+            if self.stop_after_current:
+                self.note = "stopped after the current episode"
+                break
+        self.current = ""
+        with _drivers_lock:
+            if _drivers.get(self.host) is self:
+                _drivers.pop(self.host, None)
+
+
+def start_job(cfg: dict, host: str, scratch: str, paths: list[str] | None = None) -> dict:
     h = all_hosts(cfg).get(host)
     if not h:
         return {"ok": False, "error": f"unknown host {host!r}"}
-    if not paths:
-        return {"ok": False, "error": "nothing to run"}
-    work = (h.get("scratch") or {}).get(scratch)
-    if scratch and not work:
-        return {"ok": False, "error": f"unknown scratch {scratch!r} for {host}"}
+    if paths:
+        assign(paths, host)              # queue this selection into this machine
+    with _drivers_lock:
+        d = _drivers.get(host)
+        if d and d.is_alive():
+            return {"ok": False, "error": f"{host} already has a queue running"}
+        st = host_status(host, h)
+        if st.get("state") in ("running", "working", "paused", "stopping"):
+            return {"ok": False, "error": f"{host} is already on {st.get('episode') or 'a job'}"}
+        d = Driver(cfg, host, scratch)
+        _drivers[host] = d
+        d.start()
+    return {"ok": True, "host": host, "work": (h.get("scratch") or {}).get(scratch) or "(host default)"}
 
-    st = host_status(host, h)
-    if st.get("state") in ("running", "working", "paused", "stopping"):
-        return {"ok": False, "error": f"{host} is already on {st.get('episode') or 'a job'}"}
 
-    worker = h.get("worker") or "upscale-worker"
-    lines = []
-    for f in paths:
-        lib = library_root(Path(f))
-        lines.append(
-            f"LIB={shlex.quote(str(lib))} ARCHIVE={shlex.quote(str(lib / '.upscale-originals'))} "
-            + (f"WORK={shlex.quote(work)} " if work else "")
-            + f"{shlex.quote(worker)} run {shlex.quote(f)} || exit 1")
-    script = "; ".join(lines)
-    remote = (f"setsid nohup sh -c {shlex.quote(script)} "
-              f">> ~/upscale-ui.log 2>&1 < /dev/null & echo started")
-    rc, out, err = ssh_to(h.get("ssh", host), remote, timeout=25)
-    if rc != 0:
-        return {"ok": False, "error": (err or f"ssh exited {rc}").strip()[:300]}
-    return {"ok": True, "host": host, "count": len(paths),
-            "work": work or "(host default)"}
+def driver_state(host: str) -> dict:
+    d = _drivers.get(host)
+    if not d or not d.is_alive():
+        return {"queue_running": False, "queue_note": ""}
+    return {"queue_running": True, "queue_note": d.note,
+            "queue_stopping": d.stop_after_current,
+            "queue_current": Path(d.current).name if d.current else ""}
+
+
+def stop_driver(host: str, kill: bool = False) -> dict:
+    d = _drivers.get(host)
+    if not d or not d.is_alive():
+        return {"ok": True, "note": "no queue was running"}
+    d.stop_after_current = True
+    if kill:
+        d._kill_current()
+    return {"ok": True, "note": "queue will stop after the current episode" if not kill
+                                else "queue stopped and the current episode killed"}
 
 
 def control(cfg: dict, host: str, action: str) -> dict:
@@ -617,8 +811,7 @@ class Handler(BaseHTTPRequestHandler):
             out = []
             for name, h in hosts.items():
                 st = host_status(name, h)
-                if st.get("reachable"):
-                    st.update(host_running(h, name))
+                st.update(driver_state(name))
                 st["scratch"] = h.get("scratch", {})
                 st["default_scratch"] = h.get("default_scratch")
                 out.append(st)
@@ -630,8 +823,9 @@ class Handler(BaseHTTPRequestHandler):
             states = []
             for name, h in hosts.items():
                 st = host_status(name, h)
-                if st.get("reachable"):
-                    st.update(host_running(h, name))
+                st.update(driver_state(name))
+                st["scratch"] = h.get("scratch", {})
+                st["default_scratch"] = h.get("default_scratch")
                 states.append(st)
             qr = queue_rows(cfg, states)
             libs = {}
@@ -653,13 +847,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return self._json({"ok": False, "error": "bad JSON body"}, 400)
         if path == "/api/start":
-            paths = body.get("paths") or []
-            if not paths:
-                # Nothing selected: run everything queued, in table order, so the
-                # obvious click does the obvious thing.
-                cur = queue_rows(cfg, [host_status(n, h) for n, h in all_hosts(cfg).items()])
-                paths = [r["path"] for r in cur["rows"] if r["status"] == "queued"]
-            return self._json(start_job(cfg, body.get("host", ""), paths, body.get("scratch", "")))
+            # No path list: the driver re-reads the queue before every episode,
+            # so holds and deletions made WHILE it runs are honoured. Handing it
+            # a frozen list would make the buttons decorative again.
+            return self._json(start_job(cfg, body.get("host", ""), body.get("scratch", ""),
+                                        body.get("paths") or []))
         if path == "/api/hosts/probe":
             return self._json(probe_host((body.get("ssh") or "").strip()))
         if path == "/api/hosts/add":
@@ -679,20 +871,41 @@ class Handler(BaseHTTPRequestHandler):
                      "upscale": pr.get("upscale") or "upscale"}
             return self._json({"ok": True, "id": hid, "hosts": save_host(hid, entry),
                                "probe": pr})
+        if path == "/api/assign":
+            return self._json({"ok": True,
+                               "assigned": assign(body.get("paths") or [], body.get("host") or "")})
         if path == "/api/hosts/remove":
             return self._json({"ok": True, "hosts": forget_host((body.get("id") or "").strip())})
         if path == "/api/hold":
             paths = body.get("paths") or []
+            hold = bool(body.get("hold", True))
             if not paths:
                 return self._json({"ok": False, "error": "paths are required"}, 400)
-            # A RUNNING episode cannot be held - it is already on the GPU. qBit
-            # behaves the same way: pausing the active item stops it, which here
-            # means pausing its host.
-            return self._json({"ok": True,
-                               "held": sorted(mutate_set("held", paths, bool(body.get("hold", True))))})
-        if path in ("/api/pause", "/api/resume", "/api/stop"):
+            held = mutate_set("held", paths, hold)
+            skipped = []
+            if hold:
+                # Holding the episode a machine is ON means "move to the next
+                # one", so the episode has to actually stop. The driver would
+                # notice within a poll, but a host with no driver would sit there
+                # finishing an episode the user just paused.
+                for name, h in all_hosts(cfg).items():
+                    st = host_status(name, h)
+                    cur = st.get("episode") or ""
+                    if cur and any(Path(p).name == cur for p in paths):
+                        kill_episode(cfg, name)
+                        skipped.append(name)
+            return self._json({"ok": True, "held": sorted(held), "skipped": skipped})
+        if path in ("/api/pause", "/api/resume"):
             return self._json(control(cfg, body.get("host", ""), path.rsplit("/", 1)[1]))
+        if path == "/api/stop":
+            # Stop is the QUEUE's stop: finish the episode in flight, then stop.
+            # It also writes the pipeline's own flag, so an `upscale ep` run
+            # started outside this UI stops too.
+            host = body.get("host", "")
+            control(cfg, host, "stop")
+            return self._json({"ok": True, **stop_driver(host)})
         if path == "/api/abort":
+            stop_driver(body.get("host", ""), kill=False)   # stop sequencing first
             return self._json(abort_host(cfg, body.get("host", "")))
         if path == "/api/import":
             paths = [str(Path(x)) for x in (body.get("paths") or []) if x]

@@ -83,34 +83,26 @@
     if (d?.ok) { notice = `imported ${d.added} file${d.added > 1 ? "s" : ""}`; showImport = false; picked = new Set(); }
   }
 
-  // Hold means two different things depending on what is selected, because the
-  // pipeline has two different mechanisms:
-  //   a QUEUED episode is excluded from the run order (a file-level hold)
-  //   a RUNNING episode is on a GPU, so its HOST is paused - the worker stops
-  //     after the current chunk and keeps everything it has finished
-  // Doing only the first made the button dead on exactly the row a user is most
-  // likely to want to stop.
+  // Hold = "not this one, move on".
+  //
+  // On a QUEUED episode it drops out of the run order. On the RUNNING one the
+  // machine stops it and takes the next unheld episode - it does not stall,
+  // because stopping the whole queue is what the topbar Stop button is for.
+  // Finished chunks stay in scratch, so releasing later resumes rather than
+  // restarts.
   async function hold(on) {
-    const wantRun = on ? "running" : "paused";
-    const wantFile = on ? "queued" : "held";
-    const hostIds = [...new Set(sel.filter(r => r.status === wantRun && r.host).map(r => r.host))];
-    const files = sel.filter(r => r.status === wantFile).map(r => r.path);
-    if (!hostIds.length && !files.length) return;
-
+    const want = on ? ["queued", "running"] : ["held", "paused"];
+    const paths = sel.filter(r => want.includes(r.status)).map(r => r.path);
+    if (!paths.length) return;
     busy = on ? "hold" : "release";
     try {
-      for (const id of hostIds) {
-        await j(on ? "/api/pause" : "/api/resume", { method: "POST",
-          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ host: id }) });
-      }
-      if (files.length) {
-        await j("/api/hold", { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ paths: files, hold: on }) });
-      }
-      const bits = [];
-      if (hostIds.length) bits.push(`${on ? "paused" : "resumed"} ${hostIds.length} machine${hostIds.length > 1 ? "s" : ""}`);
-      if (files.length) bits.push(`${on ? "held" : "released"} ${files.length} episode${files.length > 1 ? "s" : ""}`);
-      notice = bits.join(" · ");
+      const d = await j("/api/hold", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths, hold: on }) });
+      notice = d.ok
+        ? `${on ? "held" : "released"} ${paths.length} episode${paths.length > 1 ? "s" : ""}`
+          + (d.skipped?.length ? ` — ${d.skipped.join(", ")} moving to the next` : "")
+        : `failed: ${d.error}`;
       await refresh();
     } catch (e) { notice = String(e); }
     finally { busy = ""; }
@@ -199,12 +191,14 @@
   {#each hosts as h}
     <span class="chip" class:down={!h.reachable} title={h.error || h.work || ""}>
       {h.label}<em>{h.reachable ? (h.phase && h.phase !== "idle" ? h.phase : h.state) : "unreachable"}</em>
+      {#if h.queue_running}<span class="qtag" title={h.queue_note || ""}>queue{h.queue_stopping ? " stopping" : ""}</span>{/if}
     </span>
   {/each}
 
   <button class="tb" onclick={() => (showStart = true)} disabled={!hosts.length || !!busy}>▶ Start</button>
-  <button class="tb" onclick={() => post("/api/stop", { host: runningHost?.id }, "stop")}
-          disabled={!runningHost || !!busy} title="Finish the current episode, then stop">■ Stop</button>
+  <button class="tb" onclick={() => post("/api/stop", { host: (runningHost || hosts[0])?.id }, "stop")}
+          disabled={!hosts.length || !!busy}
+          title="Stop the whole queue: finish the episode in flight, then stop">■ Stop</button>
   <button class="tb danger" onclick={abort} disabled={!runningHost || !!busy}
           title="Kill the current episode now">✕ Abort</button>
   <button class="tb" onclick={() => { showMachine = true; probe = null; }} title="Onboard a GPU machine">⚙ Machines</button>
@@ -223,7 +217,7 @@
     <button class="ghost" onclick={() => (selected = new Set())}>Clear</button>
     <span class="muted small">
       shift-click for a range · ctrl-click to add ·
-      hold pauses a running episode after the current chunk, and skips a queued one ·
+      hold skips an episode — the machine moves to the next one; use Stop for the whole queue ·
       delete removes from the queue, never from disk
     </span>
   </div>
@@ -249,8 +243,15 @@
         <td class="st"><span class="pill {r.status}">{r.status === "running" && r.phase ? r.phase : r.status}</span></td>
         <td class="pr">
           {#if r.status === "running" || r.status === "paused"}
-            {@const onEp = r.phase === "upscaling" || r.phase === "encoding"}
-            {@const val = onEp ? (r.percent ?? 0) : (r.phase_percent ?? 0)}
+            <!-- The EPISODE percentage wins whenever there is one. Preferring
+                 the phase percentage hid real progress: frame-counting and
+                 verifying have no percentage of their own, so a 39%-complete
+                 episode rendered as 0% and looked like lost work. The phase bar
+                 is only a fallback, for a first pass that genuinely has no
+                 episode progress yet (extracting frame 1 of 68,715). -->
+            {@const ep = r.percent ?? 0}
+            {@const val = ep > 0 ? ep : (r.phase_percent ?? 0)}
+            {@const onEp = ep > 0}
             <div class="bar2"><div class="fill {onEp ? '' : 'alt'}" style="width:{val}%"></div></div>
             <span class="pct">{val}%</span>
           {:else if r.status === "done"}<span class="muted">✓</span>
@@ -422,6 +423,8 @@
   .dev { width: 10rem; }
   .st { width: 7.5rem; } .pr { width: 11rem; } .rt { width: 5rem; } .et { width: 5rem; }
   .rt, .et { color: #8b93a7; font-variant-numeric: tabular-nums; }
+  .qtag { font-size: .68rem; background: #12351f; color: #6ee7a0;
+    padding: .05rem .4rem; border-radius: 999px; }
   .devtag { font-size: .74rem; background: #17273f; color: #7ab6f5; padding: .1rem .45rem; border-radius: 999px; }
   .pill { font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; padding: .1rem .4rem;
     border-radius: 999px; background: #232838; color: #aab; }
