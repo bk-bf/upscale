@@ -443,9 +443,26 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
                # before a GPU touches it.
                "device": (h.get("label") if h else host_labels.get(assigned_to, "")) or ""}
         if h:
+            # The two transfer phases can only be measured HERE: the other end
+            # of each is a file on this machine. The worker reports how many
+            # bytes it has; the server knows what the total should be.
+            pd, pt = h.get("phase_done", 0), h.get("phase_total", 0)
+            ph = h.get("phase", "")
+            if ph == "delivering":
+                part = next((x for x in p.parent.glob(f".{p.stem}*.part*")), None)
+                if part:
+                    pd = part.stat().st_size
+            elif ph == "fetching":
+                pd, pt = h.get("fetch_bytes", 0), (p.stat().st_size if p.exists() else 0)
+            pp = h.get("phase_percent", -1)
+            if pt and pd:
+                pp = min(100, int(pd * 100 / pt))
             row.update({"percent": h.get("percent", 0), "fps": h.get("fps", 0),
-                        "eta_s": h.get("eta_s", 0), "phase": h.get("phase", ""),
-                        "phase_percent": h.get("phase_percent", 0),
+                        "eta_s": h.get("eta_s", 0), "phase": ph,
+                        "phase_percent": pp, "phase_done": pd, "phase_total": pt,
+                        "phase_unit": h.get("phase_unit", ""),
+                        "phase_eta_s": h.get("phase_eta_s", 0),
+                        "phase_elapsed_s": h.get("phase_elapsed_s", 0),
                         "elapsed_s": h.get("elapsed_s", 0),
                         "frames_done": h.get("frames_done", 0),
                         "frames_total": h.get("frames_total", 0),
@@ -644,6 +661,25 @@ class Driver(threading.Thread):
                    for r in queue_rows(load_config(), [])["rows"])
 
     def run(self):
+        # ADOPT whatever is already running. This service restarting must not
+        # lock the queue until the episode in flight ends - the render survives
+        # a restart, so the sequencing has to be able to rejoin it.
+        st = host_status(self.host, self._h())
+        if st.get("state") in ("running", "working", "paused", "stopping"):
+            self.current = st.get("episode", "")
+            self.note = f"adopted {self.current}"
+            quiet = 0
+            while quiet < 3:
+                time.sleep(4)
+                st = host_status(self.host, self._h())
+                if not st.get("reachable"):
+                    continue
+                if st.get("state") in ("running", "working", "paused", "stopping"):
+                    quiet = 0
+                else:
+                    quiet += 1
+            self.current = ""
+
         while True:
             path = self._next_path()
             if not path:
@@ -717,9 +753,6 @@ def start_job(cfg: dict, host: str, scratch: str, paths: list[str] | None = None
         d = _drivers.get(host)
         if d and d.is_alive():
             return {"ok": False, "error": f"{host} already has a queue running"}
-        st = host_status(host, h)
-        if st.get("state") in ("running", "working", "paused", "stopping"):
-            return {"ok": False, "error": f"{host} is already on {st.get('episode') or 'a job'}"}
         d = Driver(cfg, host, scratch)
         _drivers[host] = d
         d.start()

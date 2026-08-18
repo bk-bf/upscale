@@ -170,6 +170,21 @@
   };
   const gb = (b) => b ? `${(b / 1073741824).toFixed(1)} GB` : "";
 
+  // The rate of the CURRENT phase, in that phase's own unit. fps for anything
+  // counting frames, MB/s for the two that move bytes, nothing for a phase with
+  // nothing to count.
+  function phaseRate(r) {
+    if (r.status !== "running" && r.status !== "paused") return "";
+    if (r.phase_unit === "bytes" && r.phase_elapsed_s > 0 && r.phase_done > 0)
+      return `${(r.phase_done / r.phase_elapsed_s / 1048576).toFixed(1)} MB/s`;
+    if (r.phase === "upscaling" && r.fps) return `${r.fps} fps`;
+    if (r.phase_unit === "frames" && r.phase_elapsed_s > 2 && r.phase_done > 0)
+      return `${(r.phase_done / r.phase_elapsed_s).toFixed(1)} fps`;
+    if (r.phase_unit === "chunks" && r.phase_total)
+      return `${r.phase_done}/${r.phase_total}`;
+    return "…";
+  }
+
   onMount(async () => { await refresh(); timer = setInterval(refresh, 3000); });
   onDestroy(() => clearInterval(timer));
 </script>
@@ -238,23 +253,24 @@
         <td class="st"><span class="pill {r.status}">{r.status === "running" && r.phase ? r.phase : r.status}</span></td>
         <td class="pr">
           {#if r.status === "running" || r.status === "paused"}
-            <!-- The EPISODE percentage wins whenever there is one. Preferring
-                 the phase percentage hid real progress: frame-counting and
-                 verifying have no percentage of their own, so a 39%-complete
-                 episode rendered as 0% and looked like lost work. The phase bar
-                 is only a fallback, for a first pass that genuinely has no
-                 episode progress yet (extracting frame 1 of 68,715). -->
-            {@const ep = r.percent ?? 0}
-            {@const val = ep > 0 ? ep : (r.phase_percent ?? 0)}
-            {@const onEp = ep > 0}
-            <div class="bar2"><div class="fill {onEp ? '' : 'alt'}" style="width:{val}%"></div></div>
-            <span class="pct">{val}%</span>
+            <!-- THE PHASE'S OWN BAR. Each phase measures a different thing, so
+                 an episode-level number cannot represent any of them - which is
+                 how a 39% episode sat at 39% through minutes of verifying and
+                 read as stuck. A phase with nothing to count says so instead of
+                 showing a zero. -->
+            {#if (r.phase_percent ?? -1) >= 0}
+              <div class="bar2"><div class="fill" style="width:{r.phase_percent}%"></div></div>
+              <span class="pct">{r.phase_percent}%</span>
+            {:else}
+              <div class="bar2"><div class="fill indet"></div></div>
+              <span class="pct">–</span>
+            {/if}
           {:else if r.status === "done"}<span class="muted">✓</span>
           {:else if r.status === "missing"}<span class="c-miss small">source moved</span>
           {:else}<span class="muted">{gb(r.size)}</span>{/if}
         </td>
-        <td class="rt">{r.fps ? `${r.fps} fps` : (r.status === "running" ? "…" : "")}</td>
-        <td class="et">{r.eta_s ? hhmm(r.eta_s) : (r.status === "running" ? "…" : "")}</td>
+        <td class="rt">{phaseRate(r)}</td>
+        <td class="et">{r.phase_eta_s ? hhmm(r.phase_eta_s) : (r.eta_s ? hhmm(r.eta_s) : (r.status === "running" ? "…" : ""))}</td>
       </tr>
     {:else}
       <tr><td colspan="8" class="muted pad">nothing imported — press + to pick episodes</td></tr>
@@ -427,6 +443,9 @@
   .fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #6ee7a0); transition: width .4s; }
   .fill.alt { background: linear-gradient(90deg, #7c5cff, #7ab6f5); }
   .pct { font-size: .75rem; color: #8b93a7; margin-left: .4rem; font-variant-numeric: tabular-nums; }
+  .fill.indet { width: 40%; background: linear-gradient(90deg, #232838, #7ab6f5, #232838);
+    animation: slide 1.4s ease-in-out infinite; }
+  @keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
   .scrim { position: fixed; inset: 0; background: #000a; z-index: 9; border: 0; padding: 0; }
   .modal { position: fixed; z-index: 10; top: 50%; left: 50%; transform: translate(-50%, -50%);
     width: min(620px, 94vw); background: #12151d; border: 1px solid #2b3244; border-radius: 12px;
