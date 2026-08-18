@@ -706,11 +706,6 @@ class Driver(threading.Thread):
         env = (f"LIB={shlex.quote(str(lib))} "
                f"ARCHIVE={shlex.quote(str(lib / '.upscale-originals'))} "
                + (f"WORK={shlex.quote(work)} " if work else ""))
-        # Night mode is per-episode, not global: it takes effect on the next
-        # episode rather than disturbing one already on the card.
-        if load_config().get("night_mode"):
-            for k, v in (h.get("night") or {}).items():
-                env += f"{k}={shlex.quote(str(v))} "
         cmd = f"env {env}{shlex.quote(worker)} {phase} {shlex.quote(path)}"
         remote = (cmd if wait else
                   f"setsid nohup sh -c {shlex.quote(cmd)} >> ~/upscale-ui.log 2>&1 < /dev/null & echo started")
@@ -1022,11 +1017,9 @@ class Handler(BaseHTTPRequestHandler):
                 libs.setdefault(r["library"], {"path": r["library"], "name": r["library_name"], "n": 0})
                 libs[r["library"]]["n"] += 1
             return self._json({**qr, "libraries": list(libs.values()),
-                               "hosts": states, "night_mode": bool(cfg.get("night_mode")),
-                               "ts": int(time.time())})
+                               "hosts": states, "ts": int(time.time())})
         if path == "/api/health":
             return self._json({"ok": True, "config": str(CONFIG_PATH),
-                               "night_mode": bool(cfg.get("night_mode")),
                                "error": cfg.get("_error")})
         return self._static(path)
 
@@ -1063,15 +1056,6 @@ class Handler(BaseHTTPRequestHandler):
                      "upscale": pr.get("upscale") or "upscale"}
             return self._json({"ok": True, "id": hid, "hosts": save_host(hid, entry),
                                "probe": pr})
-        if path == "/api/night":
-            on = bool(body.get("on"))
-            cfg_path = CONFIG_PATH
-            c = json.loads(cfg_path.read_text())
-            c["night_mode"] = on
-            tmp = cfg_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(c, indent=2))
-            tmp.replace(cfg_path)
-            return self._json({"ok": True, "night_mode": on})
         if path == "/api/assign":
             return self._json({"ok": True,
                                "assigned": assign(body.get("paths") or [], body.get("host") or "")})

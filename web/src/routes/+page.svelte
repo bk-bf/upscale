@@ -29,7 +29,6 @@
   let probing = $state(false);
 
   // start
-  let night = $state(false);
   let sHost = $state("");
   let sScratch = $state("");
 
@@ -47,7 +46,6 @@
       rows = d.rows || [];
       counts = d.counts || {};
       hosts = d.hosts || [];
-      night = !!d.night_mode;
       if (!sHost && hosts.length) { sHost = hosts[0].id; sScratch = hosts[0].default_scratch || ""; }
       error = "";
     } catch (e) { error = String(e); }
@@ -252,8 +250,6 @@
   <button class="tb" onclick={() => post("/api/stop", { host: (hosts.find(h => h.queue_running) || runningHost || hosts[0])?.id }, "stop")}
           disabled={!hosts.length || !!busy}
           title="Stop the whole queue: finish the episode in flight, then stop">■ Stop</button>
-  <button class="tb" class:on={night} onclick={() => post("/api/night", { on: !night }, night ? "day" : "night")}
-          title="Fewer workers and encoder threads from the next episode">{night ? "☾ Night" : "☀ Day"}</button>
   <button class="tb" onclick={() => { showMachine = true; probe = null; }} title="Onboard a GPU machine">⚙ Machines</button>
   <button class="add" onclick={() => { showImport = true; picked = new Set(); browse(); }} title="Import episodes">+</button>
 </nav>
@@ -445,7 +441,6 @@
     padding: .3rem .6rem; font: inherit; font-size: .8rem; cursor: pointer; }
   .tb:hover:not(:disabled) { background: #232838; }
   .tb:disabled, .selbar button:disabled { opacity: .4; cursor: not-allowed; }
-  .tb.on { background: #1e2a3f; border-color: #35507a; color: #9dc4f5; }
   .tb.danger, .selbar .danger { border-color: #5a2233; color: #f8899f; }
   .add { width: 2rem; height: 2rem; border-radius: 8px; background: #1d4ed8; color: #fff;
     border: 0; font-size: 1.2rem; line-height: 1; cursor: pointer; }
