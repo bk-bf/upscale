@@ -110,7 +110,7 @@
 
   async function del() {
     if (!selected.size) return;
-    if (!confirm(`Remove ${selected.size} episode(s) from the queue?\n\nThe source files are NOT deleted — they stay exactly where they are.`)) return;
+    if (!confirm(`Remove ${selected.size} from the queue?`)) return;
     await post("/api/remove", { paths: [...selected] }, "removed");
     selected = new Set();
   }
@@ -127,7 +127,7 @@
   async function abort() {
     const h = runningHost;
     if (!h) return;
-    if (!confirm(`Abort ${h.label} now?\n\nThe episode in flight is discarded. Finished chunks stay in scratch and a later run skips them, and delivery is atomic, so nothing half-written reaches the library.`)) return;
+    if (!confirm(`Abort ${h.label}?`)) return;
     await post("/api/abort", { host: h.id }, "abort");
   }
 
@@ -215,11 +215,6 @@
     <button onclick={() => hold(false)} disabled={!canRelease || !!busy}>▶ Release</button>
     <button class="danger" onclick={del} disabled={!!busy}>🗑 Delete</button>
     <button class="ghost" onclick={() => (selected = new Set())}>Clear</button>
-    <span class="muted small">
-      shift-click for a range · ctrl-click to add ·
-      hold skips an episode — the machine moves to the next one; use Stop for the whole queue ·
-      delete removes from the queue, never from disk
-    </span>
   </div>
 {/if}
 
@@ -329,11 +324,6 @@
         <input bind:value={mLabel} placeholder="desktop (RX 5700 XT)" />
       </label>
     </div>
-    <p class="muted small">
-      A tailnet alias works as-is. The machine is probed before it is saved — an entry that
-      cannot be reached is worse than none, because it becomes a broken panel nobody
-      remembers adding.
-    </p>
     <div class="row gap">
       <button class="ghost" onclick={doProbe} disabled={!mSsh || probing}>{probing ? "probing…" : "Test connection"}</button>
       <button class="primary" onclick={addMachine} disabled={!mSsh || !probe?.ok || !!busy}>Add machine</button>
@@ -368,9 +358,7 @@
       </label>
     </div>
     <p class="muted small">
-      {selected.size
-        ? `Runs the ${sel.filter(r => r.status === "queued").length} queued episode(s) in your selection, in order.`
-        : `Runs all ${counts.queued ?? 0} queued episodes, in table order. Held ones are skipped.`}
+      {selected.size ? sel.filter(r => r.status === "queued").length : (counts.queued ?? 0)} episodes
     </p>
     <div class="row gap">
       <button class="primary" onclick={start} disabled={!sHost || !!busy}>Start</button>
