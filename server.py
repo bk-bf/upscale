@@ -425,7 +425,14 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
         # Detected here rather than asked of the host, because the .part is
         # arriving on THIS machine - and if it is missed, the episode reads as
         # queued and the queue starts it a second time.
+        # A .part is only a delivery IN PROGRESS while it is being written.
+        # rsync leaves one behind after a failed or killed transfer as a resume
+        # point, and treating that as "delivering" for ever made the episode
+        # invisible to the queue: not outstanding, so never picked up, while
+        # nothing was actually uploading it.
         part = next((x for x in p.parent.glob(f".{p.stem}*.part*")), None)
+        if part and (time.time() - part.stat().st_mtime) > 120:
+            part = None
         if h:
             status = "paused" if h.get("state") == "paused" else "running"
         elif part and not archived:
@@ -471,7 +478,6 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
                 # The total is the finished file's size, which only the worker
                 # knows; the bytes delivered so far are in the .part, which only
                 # this machine can see. Neither side can draw this bar alone.
-                part = next((x for x in p.parent.glob(f".{p.stem}*.part*")), None)
                 if part:
                     pd = part.stat().st_size
                 pt = h.get("out_bytes") or pt
@@ -702,9 +708,10 @@ class Driver(threading.Thread):
                 self._xfer_cv.notify_all()
 
     def _wait_xfer(self, path: str, phase: str) -> bool:
-        """Block until this transfer has had its turn."""
+        """Block until this transfer has had its turn - or until Stop."""
         with self._xfer_cv:
-            while (path, phase) not in self._xfer_done and not self._shutdown:
+            while ((path, phase) not in self._xfer_done
+                   and not self._shutdown and not self.stop_after_current):
                 self._xfer_cv.wait(timeout=2)
         return (path, phase) in self._xfer_done
 
@@ -796,10 +803,27 @@ class Driver(threading.Thread):
             return 0
 
     def _kill_current(self):
+        """Stop the GPU work. NOT the transfers.
+
+        This used to pkill rsync too, so abandoning an episode on the card also
+        killed an unrelated upload of a FINISHED one - 443 MB of a delivery
+        thrown away because a different episode was being skipped. A transfer is
+        separate work and separately valuable.
+        """
         h = self._h()
         ssh_to(h.get("ssh", self.host),
-               "pkill -f '[u]pscale-worker' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; "
-               "pkill -f '[r]sync .*upscale' ; true", timeout=20)
+               "pkill -f '[u]pscale-worker process' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true",
+               timeout=20)
+
+    def _process_running(self, path: str) -> bool:
+        """Is a process phase already running for this episode anywhere?"""
+        h = self._h()
+        rc, out, _ = ssh_to(h.get("ssh", self.host),
+                            "ps -eo args= | grep -c \"[u]pscale-worker process\" || true", timeout=15)
+        try:
+            return int((out or "0").strip().splitlines()[-1]) > 0
+        except (ValueError, IndexError):
+            return False
 
     # --- loop -------------------------------------------------------------
     def _still_queued(self, path: str) -> bool:
@@ -876,6 +900,13 @@ class Driver(threading.Thread):
             # 3. START THE GPU, then immediately queue the next fetch alongside
             #    it. The transfer is free if it happens while the card works.
             self.note = f"processing {Path(path).name}"
+            # Never a second process phase on one machine. Two workers sharing a
+            # scratch dir corrupt each other's chunk - seen as
+            # "chunk 1 upscaled 1349 of 2000" - and the card cannot do two
+            # episodes at once anyway.
+            if self._process_running(path):
+                self.note = f"a process phase is already running; not starting {Path(path).name}"
+                break
             if not self._launch(path, "process"):
                 break
             nxt = self._next_path()
@@ -889,6 +920,8 @@ class Driver(threading.Thread):
             started, quiet = False, 0
             for _ in range(40):
                 time.sleep(4)
+                if self.stop_after_current:
+                    return
                 if self._gpu_busy():
                     started = True
                     break
@@ -901,12 +934,7 @@ class Driver(threading.Thread):
             while started:
                 time.sleep(4)
                 if self.stop_after_current:
-                    # Stop means the QUEUE stops. The episode on the card keeps
-                    # going and is still delivered - abandoning it would throw
-                    # away hours - but nothing new is taken, and the UI says so
-                    # the moment the button is pressed rather than at the next
-                    # episode boundary, which can be an hour away.
-                    self.note = "stopping: finishing the current episode"
+                    return               # the worker is paused; progress is kept
                 if path in held_for():
                     self.note = f"skipped {Path(path).name}"
                     self._kill_current()
@@ -994,6 +1022,7 @@ def start_job(cfg: dict, host: str, scratch: str, paths: list[str] | None = None
     h = all_hosts(cfg).get(host)
     if not h:
         return {"ok": False, "error": f"unknown host {host!r}"}
+    control(cfg, host, "resume")         # clear a pause left by Stop
     if paths:
         assign(paths, host)              # queue this selection into this machine
     with _drivers_lock:
@@ -1030,15 +1059,27 @@ def driver_state(host: str) -> dict:
 
 
 def stop_driver(host: str, kill: bool = False) -> dict:
+    """Stop NOW, and keep everything already earned.
+
+    "Finish the current episode, then stop" was indistinguishable from a broken
+    button: on a 25-minute episode the queue sat there saying "stopping" for
+    half an hour. So Stop pauses the worker instead - it holds after the current
+    CHUNK, seconds away, with every finished chunk still in scratch - and the
+    sequencer exits immediately. Start clears the pause and carries on from
+    where it stopped; nothing is re-upscaled.
+
+    A transfer in flight is left alone: that bandwidth is already spent.
+    """
     set_active(host, None)           # stop meaning stop, across restarts too
     d = _drivers.get(host)
+    cfg = load_config()
+    control(cfg, host, "pause")      # worker holds after the current chunk
     if not d or not d.is_alive():
-        return {"ok": True, "note": "no queue was running"}
+        return {"ok": True, "note": "queue stopped"}
     d.stop_after_current = True
     if kill:
         d._kill_current()
-    return {"ok": True, "note": "queue will stop after the current episode" if not kill
-                                else "queue stopped and the current episode killed"}
+    return {"ok": True, "note": "queue stopped; the episode is paused after its current chunk"}
 
 
 def control(cfg: dict, host: str, action: str) -> dict:
