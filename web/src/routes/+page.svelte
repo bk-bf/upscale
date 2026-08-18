@@ -83,7 +83,38 @@
     if (d?.ok) { notice = `imported ${d.added} file${d.added > 1 ? "s" : ""}`; showImport = false; picked = new Set(); }
   }
 
-  const hold = (on) => post("/api/hold", { paths: [...selected], hold: on }, on ? "held" : "released");
+  // Hold means two different things depending on what is selected, because the
+  // pipeline has two different mechanisms:
+  //   a QUEUED episode is excluded from the run order (a file-level hold)
+  //   a RUNNING episode is on a GPU, so its HOST is paused - the worker stops
+  //     after the current chunk and keeps everything it has finished
+  // Doing only the first made the button dead on exactly the row a user is most
+  // likely to want to stop.
+  async function hold(on) {
+    const wantRun = on ? "running" : "paused";
+    const wantFile = on ? "queued" : "held";
+    const hostIds = [...new Set(sel.filter(r => r.status === wantRun && r.host).map(r => r.host))];
+    const files = sel.filter(r => r.status === wantFile).map(r => r.path);
+    if (!hostIds.length && !files.length) return;
+
+    busy = on ? "hold" : "release";
+    try {
+      for (const id of hostIds) {
+        await j(on ? "/api/pause" : "/api/resume", { method: "POST",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ host: id }) });
+      }
+      if (files.length) {
+        await j("/api/hold", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ paths: files, hold: on }) });
+      }
+      const bits = [];
+      if (hostIds.length) bits.push(`${on ? "paused" : "resumed"} ${hostIds.length} machine${hostIds.length > 1 ? "s" : ""}`);
+      if (files.length) bits.push(`${on ? "held" : "released"} ${files.length} episode${files.length > 1 ? "s" : ""}`);
+      notice = bits.join(" · ");
+      await refresh();
+    } catch (e) { notice = String(e); }
+    finally { busy = ""; }
+  }
 
   async function del() {
     if (!selected.size) return;
@@ -134,8 +165,8 @@
   }
 
   const sel = $derived(rows.filter(r => selected.has(r.path)));
-  const canHold    = $derived(sel.some(r => r.status === "queued"));
-  const canRelease = $derived(sel.some(r => r.status === "held"));
+  const canHold    = $derived(sel.some(r => r.status === "queued" || r.status === "running"));
+  const canRelease = $derived(sel.some(r => r.status === "held" || r.status === "paused"));
   const runningHost = $derived(hosts.find(h => h.reachable && h.state !== "idle"));
   const selHost = $derived(hosts.find(h => h.id === sHost));
   const focusOnMount = (n) => n.focus();
@@ -190,7 +221,11 @@
     <button onclick={() => hold(false)} disabled={!canRelease || !!busy}>▶ Release</button>
     <button class="danger" onclick={del} disabled={!!busy}>🗑 Delete</button>
     <button class="ghost" onclick={() => (selected = new Set())}>Clear</button>
-    <span class="muted small">shift-click for a range · ctrl-click to add · delete removes from the queue, never from disk</span>
+    <span class="muted small">
+      shift-click for a range · ctrl-click to add ·
+      hold pauses a running episode after the current chunk, and skips a queued one ·
+      delete removes from the queue, never from disk
+    </span>
   </div>
 {/if}
 
