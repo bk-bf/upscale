@@ -160,9 +160,13 @@ done
 # "A Shinigami's Work" otherwise truncate the filename.
 find "$SEGDIR" -name 'seg_*.mkv' | sort |
   sed -e "s/'/'\\\\''/g" -e "s|^|file '|" -e "s|$|'|" > "$SEGDIR/list"
-# Video is rebuilt from frames and carries no audio; remux the original.
+# Video is rebuilt from frames and carries no audio, no subtitles and no fonts;
+# remux all of them off the original. Mapping only v+a here shipped every
+# subtitled episode with its ass track and ttf attachment discarded - see BUGS.md.
+# Keep every ? so a source without them still succeeds.
 ffmpeg -v error -nostdin -f concat -safe 0 -i "$SEGDIR/list" -i "$IN" \
-       -map 0:v:0 -map "1:a?" -c copy -f matroska "$OUT.part" -y
+       -map 0:v:0 -map "1:a?" -map "1:s?" -map "1:t?" \
+       -c copy -f matroska "$OUT.part" -y
 final=$(vframes "$OUT.part")
 [ "$final" = "$TOTAL" ] || die "FINAL MISMATCH: $final frames, source had $TOTAL"
 mv "$OUT.part" "$OUT"
