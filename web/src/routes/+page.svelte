@@ -126,6 +126,9 @@
     if (d?.ok) { notice = `started ${d.count} on ${d.label} (${d.work})`; showStart = false; }
   }
 
+  // No button: Stop covers the graceful case and Hold-on-running covers the
+  // per-episode one. Kept callable for a wedged host, where neither responds.
+  // eslint-disable-next-line no-unused-vars
   async function abort() {
     const h = runningHost;
     if (!h) return;
@@ -249,8 +252,6 @@
   <button class="tb" onclick={() => post("/api/stop", { host: (hosts.find(h => h.queue_running) || runningHost || hosts[0])?.id }, "stop")}
           disabled={!hosts.length || !!busy}
           title="Stop the whole queue: finish the episode in flight, then stop">■ Stop</button>
-  <button class="tb danger" onclick={abort} disabled={!runningHost || !!busy}
-          title="Kill the current episode now">✕ Abort</button>
   <button class="tb" class:on={night} onclick={() => post("/api/night", { on: !night }, night ? "day" : "night")}
           title="Fewer workers and encoder threads from the next episode">{night ? "☾ Night" : "☀ Day"}</button>
   <button class="tb" onclick={() => { showMachine = true; probe = null; }} title="Onboard a GPU machine">⚙ Machines</button>
