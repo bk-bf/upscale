@@ -19,6 +19,7 @@ set -uo pipefail
 RWORK=${RWORK:-/root/drive}
 GWORK=${GWORK:-/root/work}
 RSCRIPT=${RSCRIPT:-/root/bench/upscale-ep-rental.sh}
+RPHASE=${RPHASE:-}                 # e.g. `box` when RSCRIPT is upscale-worker
 LOG="$RWORK/guard.log"
 BEAT="$RWORK/guard.heartbeat"
 MISS="$RWORK/.guard-misses"
@@ -55,7 +56,7 @@ if [ -f "$RWORK/src.avi" ] && [ ! -f "$RWORK/out.mkv" ] && ! worker_running; the
     if flock -n 9 9>"$LOCK"; then
       if ! worker_running; then
         say "no worker but a source is waiting (miss $n) - relaunching"
-        cd "$RWORK" && setsid nohup bash "$RSCRIPT" "$RWORK/src.avi" "$RWORK/out.mkv" \
+        cd "$RWORK" && setsid nohup bash "$RSCRIPT" $RPHASE "$RWORK/src.avi" "$RWORK/out.mkv" \
           > "$RWORK/current.log" 2>&1 < /dev/null &
         sleep 8
         if worker_running; then say "relaunched"; printf '0' > "$MISS"

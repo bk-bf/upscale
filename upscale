@@ -117,7 +117,7 @@ say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$QLOG" >&2; }
 save_config(){
   : "${PROFILE:=}"
   local v tmp="$CONFIG.$$"
-  { for v in PARITY EPISODES ORDER PROFILE WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS IDLE LIMIT GPUHOST RWORK RGPUWORK RSCRIPT; do
+  { for v in PARITY EPISODES ORDER PROFILE WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS IDLE LIMIT GPUHOST RWORK RGPUWORK RSCRIPT RPHASE; do
       printf '%s=%q\n' "$v" "${!v}"
     done
     printf 'QUEUE_PID=%q\n' "$$"
@@ -133,7 +133,7 @@ load_config(){   # adopt the running queue's config; an explicit env var wins
     while IFS= read -r line; do
       k=${line%%=*}
       case "$k" in
-        PARITY|EPISODES|ORDER|PROFILE|WORKERS|CHUNK|LIB|ARCHIVE|REMOTE|WORK|DEFER|EPSTATE|MAX_FAILS|QUEUE_PID|GPUHOST|RWORK|RGPUWORK|RSCRIPT) ;;
+        PARITY|EPISODES|ORDER|PROFILE|WORKERS|CHUNK|LIB|ARCHIVE|REMOTE|WORK|DEFER|EPSTATE|MAX_FAILS|QUEUE_PID|GPUHOST|RWORK|RGPUWORK|RSCRIPT|RPHASE) ;;
         *) continue ;;
       esac
       if [ -n "${_from_env[$k]:-}" ]; then continue; fi
@@ -930,6 +930,11 @@ cmd_status(){                       # live view; Ctrl-C to leave
 #   GPUHOST   ssh destination of the worker, e.g. "-p 48726 root@1.2.3.4"
 #   RWORK     working directory on that box
 #   RSCRIPT   the per-episode script to invoke there
+#   RPHASE    subcommand to pass it, if it takes one. Point RSCRIPT at an
+#             installed `upscale-worker` and set RPHASE=box, and the box runs
+#             the SAME worker every other machine runs - no forked copy of the
+#             pipeline to keep in sync. Empty by default, which is the old
+#             contract: a bare script taking <in> <out>.
 #   POLL      seconds between progress polls
 #
 # Work selection is the SAME discover|select_todo pipeline as `run`, so a
@@ -939,6 +944,7 @@ GPUHOST=${GPUHOST:-}
 RWORK=${RWORK:-/root/upscale-work}
 RGPUWORK=${RGPUWORK:-/root/work}   # the worker's scratch root ON the box
 RSCRIPT=${RSCRIPT:-/root/bench/upscale-ep-rental.sh}
+RPHASE=${RPHASE:-}
 POLL=${POLL:-60}
 
 cdie(){ say "$*"; exit 1; }
@@ -1220,7 +1226,7 @@ cmd_collect(){
       # whether the job is running is answered by rworking below, not by the
       # exit status of the command that asked for it.
       timeout 30 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST \
-        "flock -n $RWORK/.launch.lock -c 'rm -f $RWORK/out.mkv; cd $RWORK && setsid nohup bash $RSCRIPT $RWORK/src.avi $RWORK/out.mkv \
+        "flock -n $RWORK/.launch.lock -c 'rm -f $RWORK/out.mkv; cd $RWORK && setsid nohup bash $RSCRIPT $RPHASE $RWORK/src.avi $RWORK/out.mkv \
          > $RWORK/current.log 2>&1 < /dev/null & echo ok'" >/dev/null 2>&1 || true
       sleep 10
       if rworking; then

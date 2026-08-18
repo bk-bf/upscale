@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# upscale-ep-rental — SUPERSEDED. Use `upscale-worker box <in> <out>` instead.
+#
+# This is a hand-copied fork of the local worker's `process` phase, and keeping
+# two copies of one pipeline in sync failed exactly the way it always does: the
+# final mux was fixed here and not there, and every subtitled episode shipped
+# with no subtitles. libexec/upscale-worker now has a `box` phase that does this
+# job with fetch and deliver turned off, so there is one worker for every
+# machine. This file is kept only until a rental exists to exercise `box`
+# against, and should then be deleted.
+#
 # upscale-ep-rental — the desktop's upscale-ep `process` phase, on the Vast.ai box.
 #
 #   upscale-ep-rental <local-src.avi> <out.mkv>

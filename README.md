@@ -192,14 +192,37 @@ GPUHOST='-p 48726 root@1.2.3.4' upscale --profile odd collect
 | `GPUHOST` | — | ssh destination of the worker (required) |
 | `RWORK` | `/root/upscale-work` | working directory on that box |
 | `RSCRIPT` | `/root/bench/upscale-ep-rental.sh` | per-episode script to invoke there |
+| `RPHASE` | — | subcommand to pass it, if it takes one |
 | `POLL` | `60` | seconds between progress polls |
 
-`RSCRIPT` is [`libexec/upscale-worker-remote`](libexec/upscale-worker-remote) — the same
-model and encode settings as the local worker, so both halves of a season come out
-identical, but tuned for a rented box: 4 workers rather than 8, because the instance was
-capped at 9.6 CPUs by its cgroup quota while `nproc` reported 20 (measured there:
-4 → 43.7 fps, 5 → 42.6, 6 → 21.9, 8 → 14.0 — past 5 workers CFS throttling collapses
-throughput). Copy it to the box once; `collect` invokes it per episode.
+**Use the ordinary worker.** Install `upscale` on the box like any other machine and
+point the collector at it:
+
+```bash
+RSCRIPT=/root/.local/libexec/upscale-worker RPHASE=box \
+GPUHOST='-p 48726 root@1.2.3.4' upscale --profile odd collect
+```
+
+`box` is the process-only phase: `fetch` and `deliver` become no-ops, so the worker does
+the GPU half and nothing else, and the **server** pushes the source in and pulls the
+result out. That is the only thing a rented box actually needs — it has no route back
+into a home network, which is why it cannot run the normal `run` phase. Everything else
+is identical to every other machine: same model, same encode settings, same chunking and
+resume, same frame assertions, same mux.
+
+```bash
+upscale-worker box /root/work/src.mkv /root/work/out.mkv
+```
+
+Tune it per box with the ordinary environment variables — the rented instance wanted
+`WORKERS=4` rather than 8, because it was capped at 9.6 CPUs by its cgroup quota while
+`nproc` reported 20 (measured there: 4 → 43.7 fps, 5 → 42.6, 6 → 21.9, 8 → 14.0; past
+5 workers CFS throttling collapses throughput).
+
+[`libexec/upscale-worker-remote`](libexec/upscale-worker-remote) is the **superseded**
+hand-copied fork that used to do this. It is kept only until a rental exists to exercise
+`box` against; a bug fixed in one and not the other is exactly how every Gintama episode
+shipped without subtitles (see [BUGS.md](BUGS.md)).
 
 `upscale --status` shows the collector's view — which episode is on the box, its chunk
 and frame progress, its GPU, and the push/pull transfer. The same command works **on the
