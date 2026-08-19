@@ -10,7 +10,8 @@
 #                          upscale device <name> <src> <dst> <range> [--ssh S]
 #                          upscale device --clear [name]
 #   upscale start <name> run a device, from its config file alone
-#   upscale stop  <name> stop a device
+#   upscale stop  <name> [--after]  stop now, or after the current episode
+#   upscale skip  <name> abandon the episode it is on; the queue takes the next
 #   upscale run          process everything outstanding, then idle for more
 #   upscale once         process outstanding work, then exit
 #   upscale collect      drive a remote GPU that cannot reach back:
@@ -485,10 +486,59 @@ epkey(){               # $1 = basename -> season*1000 + episode, 0 when unnumber
   printf '%s' "$(( 10#${s:-0} * 1000 + 10#${e:-0} ))"
 }
 
-epnum(){               # $1 = basename -> episode number, 0 when there is none
-  local n
-  n=$(printf '%s' "$1" | grep -oE 'S[0-9]+E[0-9]+' | head -1 | grep -oE 'E[0-9]+' | tr -d 'E') || n=''
-  printf '%s' "$((10#${n:-0}))"
+# ABSOLUTE episode numbers, so a range means the same thing here as on screen.
+#
+# SxxEyy gives the number WITHIN its season, so every season restarted at 1:
+# `--range 232-316` matched nothing while the UI displayed exactly those numbers.
+# The offset for a season is the sum of the highest episode number in each
+# earlier season - from episode numbers, not file counts, so a season with a
+# missing file does not shift everything after it.
+#
+# Computed ONCE and exported. epnum() is called as $(epnum ...) - a subshell -
+# so a memo held in a variable never survives, and the first attempt re-scanned
+# the entire library for every candidate and took minutes to list 273 episodes.
+abs_init(){
+  # Keyed by the library it was computed FROM. The value is exported so subshells
+  # can use it, which means a parent process computes it for one library and the
+  # child inherits it for another: `upscale start` built it from the saved config
+  # (Bleach) and handed it to a collector running on Gintama, whose ranges then
+  # matched nothing. A memo that outlives its input is not a memo.
+  case "${ABS_OFF_STR:-}" in
+    "${LIB:-}|"*) return 0 ;;
+    *) ABS_OFF_STR='' ;;
+  esac
+  local f b tag sn en k acc=0 out=''
+  declare -A _max=()
+  while IFS= read -r f; do
+    b=${f##*/}
+    tag=$(printf '%s' "$b" | grep -oiE 'S[0-9]+E[0-9]+' | head -1) || tag=''
+    [ -n "$tag" ] || continue
+    sn=${tag%%[Ee]*}; sn=$((10#$(printf '%s' "$sn" | tr -dc '0-9')))
+    en=${tag##*[Ee]};  en=$((10#$(printf '%s' "$en" | tr -dc '0-9')))
+    [ "$sn" -gt 0 ] || continue
+    [ "$en" -gt "${_max[$sn]:-0}" ] && _max[$sn]=$en
+  done < <( [ -d "${LIB:-}" ] && find "$LIB" -type f \( -iname '*.mkv' -o -iname '*.avi' \) 2>/dev/null )
+  for k in $(printf '%s\n' "${!_max[@]}" | sort -n); do
+    out="$out $k:$acc"
+    acc=$(( acc + _max[$k] ))
+  done
+  ABS_OFF_STR="${LIB:-}|$out "
+  export ABS_OFF_STR
+}
+
+epnum(){               # $1 = basename -> ABSOLUTE episode number, 0 when there is none
+  local tag sn en off
+  tag=$(printf '%s' "$1" | grep -oiE 'S[0-9]+E[0-9]+' | head -1) || tag=''
+  if [ -z "$tag" ]; then printf '0'; return 0; fi
+  sn=${tag%%[Ee]*}; sn=$((10#$(printf '%s' "$sn" | tr -dc '0-9')))
+  en=${tag##*[Ee]};  en=$((10#$(printf '%s' "$en" | tr -dc '0-9')))
+  # Pure string lookup: no subprocess, no rescan.
+  abs_init
+  case "${ABS_OFF_STR:-}" in
+    *" $sn:"*) off=${ABS_OFF_STR#*" $sn:"}; off=${off%% *} ;;
+    *)         off=0 ;;
+  esac
+  printf '%s' "$(( off + en ))"
 }
 
 
@@ -1214,6 +1264,23 @@ cmd_collect(){
         rsh "rm -f $RWORK/out.mkv $RWORK/src.avi $RWORK/episode" >/dev/null 2>&1 || true
         sleep 5; continue
       fi
+      if [ -z "$rsrc" ]; then
+        # discover HIDES an episode whose .part is fresh - and a fresh .part is
+        # exactly the state left behind when a pull is interrupted, so the one
+        # case where the box's episode must be findable is the one case discover
+        # will not show it. The collector then looped on "cannot map" while a
+        # finished 1.3 GB master sat on the box, twice, both times after a
+        # restart mid-pull. Look the source up by name instead of asking the
+        # selector that is deliberately ignoring it.
+        #
+        # No `head -1` on the pipeline: it closes the pipe, find takes SIGPIPE,
+        # and pipefail then fails the whole thing - the same trap that made this
+        # lookup come back empty elsewhere in this file. Read the list, take one.
+        local _byname=()
+        mapfile -t _byname < <(find "$ARCHIVE" "$LIB" -type f -name "$remote_ep.*" 2>/dev/null | sort) || true
+        rsrc="${_byname[0]:-}"
+        [ -n "$rsrc" ] && say "found '$remote_ep' by name (its .part hides it from discovery)"
+      fi
       if [ -n "$rsrc" ]; then
         src="$rsrc"; base=$(basename "${src%.*}")
         case "$src" in
@@ -1388,6 +1455,13 @@ cmd_collect(){
 #   upscale device --clear [name]         forget one device, or all of them
 #   upscale start <name>                  run it, from its file alone
 #   upscale stop  <name>                  stop it, one way
+# The device commands report failures with die(). The rest of this script uses
+# cdie(), which logs through say() - fine for the collector, wrong for a command
+# a human just typed. Without this every error path in `upscale device|start|stop`
+# died with "die: command not found", which is what happens when only the happy
+# path is ever exercised.
+die(){ printf '%s\n' "$*" >&2; exit 1; }
+
 DEVDIR=${DEVDIR:-$HOME/.upscale/devices}
 
 dev_file(){  printf '%s/%s.conf' "$DEVDIR" "$1"; }
@@ -1576,11 +1650,51 @@ cmd_start(){
   echo "started $n ($MODE, $RANGE $ORDER)"
 }
 
+cmd_skip(){
+  local n=${1:?upscale skip <device>}
+  dev_read "$n" || die "no such device: $n"
+  # Stop the EPISODE, not the device. The queue stays up and takes the next one,
+  # which is what "hold this episode" has to mean for a machine that is already
+  # mid-way through it. Finished chunks stay in scratch, so releasing the hold
+  # later resumes rather than restarts.
+  #
+  # Transfers are spared on purpose: a delivery in flight belongs to a DIFFERENT,
+  # already-finished episode, and killing it once threw away 443 MB of a
+  # completed upload because a different episode was being skipped.
+  local q="pkill -f '[u]pscale-worker process' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true"
+  if [ -n "$SSH" ]; then
+    # shellcheck disable=SC2086
+    timeout 25 ssh -o BatchMode=yes -o ControlPath=none $SSH "$q" >/dev/null 2>&1
+  else
+    eval "$q" >/dev/null 2>&1
+  fi
+  echo "skipped the current episode on $n"
+}
+
 cmd_stop(){
-  local n=${1:?upscale stop <device>}
+  local n=${1:?upscale stop <device>} after=0
+  case "${2:-}" in --after|--after-episode|--graceful) after=1 ;; esac
   dev_read "$n" || die "no such device: $n"
   local st; st=$(dev_state "$n"); mkdir -p "$st"
   : > "$st/stop"
+  if [ "$after" = 1 ]; then
+    # Let it finish what it is on. The run loop checks this flag between
+    # episodes, so nothing in flight is thrown away - which matters most for a
+    # machine 90% through an episode, where killing costs the whole thing.
+    # A LOCAL device keeps its queue state on the device, so the flag has to be
+    # written there, not here.
+    if [ "$MODE" = local ]; then
+      local q="mkdir -p \$HOME/.upscale/state/$n && : > \$HOME/.upscale/state/$n/stop"
+      if [ -n "$SSH" ]; then
+        # shellcheck disable=SC2086
+        timeout 25 ssh -o BatchMode=yes -o ControlPath=none $SSH "$q" >/dev/null 2>&1
+      else
+        eval "$q"
+      fi
+    fi
+    echo "$n will stop after the episode it is on (nothing killed)"
+    return 0
+  fi
   case "$MODE" in
     box)
       local p; p=$(dev_pid "$n" 2>/dev/null) && kill "$p" 2>/dev/null
@@ -1619,6 +1733,8 @@ cmd_stop(){
 }
 
 profiles_seed
+# Offsets before anything selects: epnum() runs in subshells and cannot build them.
+abs_init
 # --profile <name> may precede any command. PROFILE in the environment does the
 # same thing, so a systemd unit can select one with a single Environment= line
 # instead of a shell wrapper; the flag wins when both are given.
@@ -1703,7 +1819,8 @@ case "${1:-}" in
     exit 0 ;;
   device)          shift; cmd_device "$@"; exit $? ;;
   start)           shift; cmd_start "${1:-}"; exit $? ;;
-  stop)            shift; cmd_stop  "${1:-}"; exit $? ;;
+  stop)            shift; cmd_stop  "${1:-}" "${2:-}"; exit $? ;;
+  skip)            shift; cmd_skip  "${1:-}"; exit $? ;;
   run|--run)       MODE=run ;;
   collect)         MODE=run;  DOCOLLECT=1 ;;
   collect-once)    MODE=once; DOCOLLECT=1 ;;
