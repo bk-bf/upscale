@@ -127,18 +127,11 @@
       : rows.filter(r => r.status === "queued").map(r => r.path);
     if (!paths.length) { notice = "nothing queued to start"; return; }
     notice = `starting ${paths.length} on ${sHost}…`;
-    const d = await post("/api/start", { host: sHost, scratch: sScratch, paths }, "start");
-    if (d?.ok) { notice = `started ${d.count} on ${d.label} (${d.work})`; showStart = false; }
-  }
-
-  // No button: Stop covers the graceful case and Hold-on-running covers the
-  // per-episode one. Kept callable for a wedged host, where neither responds.
-  // eslint-disable-next-line no-unused-vars
-  async function abort() {
-    const h = runningHost;
-    if (!h) return;
-    if (!confirm(`Abort ${h.label}?`)) return;
-    await post("/api/abort", { host: h.id }, "abort");
+    // The endpoint runs `upscale start <device>` and returns what the command
+    // printed. It does not return a count or a scratch path any more, and
+    // inventing them here is what produced "started undefined ep in scratch".
+    const d = await post("/api/start", { host: sHost }, "start");
+    if (d?.ok) { notice = d.note || `started ${sHost}`; showStart = false; }
   }
 
   async function doProbe() {
