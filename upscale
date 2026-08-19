@@ -972,6 +972,24 @@ rworking(){
 dframes(){ ffprobe -v error -count_frames -select_streams v \
              -show_entries stream=nb_read_frames -of csv=p=0 "$1" 2>/dev/null; }
 
+# ...but the DELIVERED master is not a source. It is always our own x264, where
+# one packet is exactly one frame, so counting packets returns the same number
+# without decoding ~900 MB of 1920x1440 - which on this server takes MINUTES and
+# was being paid once per episode, after every pull, while the box sat idle.
+# Comparing decoded-source frames against delivered-master packets is exact in
+# both directions; it was comparing source PACKETS that rejected 33438 vs 33440.
+# Anything not h264/hevc falls back to the honest decode.
+oframes(){
+  local c
+  c=$(ffprobe -v error -select_streams v -show_entries stream=codec_name \
+        -of csv=p=0 "$1" 2>/dev/null) || c=''
+  case "$c" in
+    h264|hevc) ffprobe -v error -count_packets -select_streams v \
+                 -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null ;;
+    *)         dframes "$1" ;;
+  esac
+}
+
 # ------------------------------------------------- collect: status ----------
 # There is ONE status renderer, and it lives where the work is. Rather than
 # reimplement phase detection for the remote case - which produced a view stuck
@@ -1261,7 +1279,7 @@ cmd_collect(){
          ":$RWORK/out.mkv" "$dest/.$base.mkv.part"; then
       col_fail "$src" "$base" "pull failed"; sleep 20; continue
     fi
-    got=$(dframes "$dest/.$base.mkv.part") || got=0
+    got=$(oframes "$dest/.$base.mkv.part") || got=0
     want=$(dframes "$src") || want=0
     streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$dest/.$base.mkv.part" 2>/dev/null | tr '\n' ' ')
     # identity, not just shape - see ident_psnr above
@@ -1275,6 +1293,23 @@ cmd_collect(){
       sleep 20; continue
     fi
     if [ "$got" = "$want" ] && printf '%s' "$streams" | grep -q audio; then
+      # ARCHIVE FIRST, then publish. With SRC_EXT=mkv the source IS
+      # "$dest/$base.mkv" - the very path the master is about to take - so
+      # publishing first overwrote the only copy of the original, and the
+      # archive step below then archived the MASTER, leaving the library slot
+      # empty. The episode read as outstanding again and was re-upscaled from
+      # its own 1440p output. That destroyed the source of S07E51, which was
+      # only recoverable because the torrent was still seeding.
+      #
+      # Deferring the archive until "the replacement is verified in place" is
+      # right for .avi sources, where the two paths differ. Here the master is
+      # already verified - frames, streams and a PSNR identity check all passed
+      # above - so nothing is protected by waiting, and everything is at risk.
+      case "$src" in
+        "$ARCHIVE"/*) : ;;
+        *) mkdir -p "$ARCHIVE/$(dirname "${src#"$LIB"/}")"
+           mv -n "$src" "$ARCHIVE/${src#"$LIB"/}" && say "archived original" ;;
+      esac
       mv -f "$dest/.$base.mkv.part" "$dest/$base.mkv"
       say "delivered $base.mkv ($got frames, ${ident} dB, $(du -h "$dest/$base.mkv" | cut -f1))"
       # Give the new episode a real thumbnail. Jellyfin extracts one from the
@@ -1287,13 +1322,6 @@ cmd_collect(){
         ( upscale-artwork "$(printf '%s' "$base" | grep -oiE 'S[0-9]+E[0-9]+' | head -1)" \
             >/dev/null 2>&1 & ) || true
       fi
-      # A source still in the library was never archived, so it is the only copy;
-      # it is archived only now that its replacement is verified in place.
-      case "$src" in
-        "$ARCHIVE"/*) : ;;
-        *) mkdir -p "$ARCHIVE/$(dirname "${src#"$LIB"/}")"
-           mv -n "$src" "$ARCHIVE/${src#"$LIB"/}" && say "archived original" ;;
-      esac
       rsh "rm -f $RWORK/out.mkv $RWORK/src.avi" >/dev/null 2>&1 || true
     else
       col_fail "$src" "$base" "frames $got vs $want, streams: $streams"
