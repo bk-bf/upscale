@@ -157,15 +157,62 @@ def mutate_set(key: str, paths: list[str], add: bool) -> set[str]:
         return cur
 
 
-def all_hosts(cfg: dict) -> dict:
-    """Hosts from config.json plus any onboarded through the UI.
+DEVDIR = Path(os.environ.get("UPSCALE_DEVDIR", Path.home() / ".upscale" / "devices"))
+UPSCALE_BIN = os.environ.get("UPSCALE_BIN", str(Path.home() / ".local" / "bin" / "upscale"))
 
-    Onboarded ones live in the state file rather than config.json so that
-    adding a machine never rewrites a hand-written, commented config.
+
+def all_hosts(cfg: dict) -> dict:
+    """Every device, read from the ONE file per device that defines it.
+
+    This used to merge config.json with a second list of machines onboarded
+    through the UI, and neither knew what the CLI was actually running. A
+    machine's parity, direction, library and worker path could be stated in
+    three places at once and disagree - which is how a finished episode came to
+    be displayed as running on a machine that never owned it.
+
+    `upscale device <name> ...` writes these files and is the only writer. This
+    reads them and is not one. Nothing here invents an answer the CLI would
+    disagree with, because there is only one answer.
     """
-    merged = dict(cfg.get("hosts") or {})
-    merged.update(_state().get("hosts") or {})
-    return merged
+    out: dict = {}
+    if not DEVDIR.is_dir():
+        return out
+    for f in sorted(DEVDIR.glob("*.conf")):
+        d: dict = {}
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            try:                       # values are written with printf %q
+                v = " ".join(shlex.split(v))
+            except ValueError:
+                v = v.strip("'\"")
+            d[k.strip().lower()] = v
+        name = d.get("name") or f.stem
+        mode = d.get("mode") or "box"
+        out[name] = {"ssh": d.get("ssh", ""), "label": name,
+                     "episodes": d.get("range", "any"), "order": d.get("order", "forward"),
+                     "mode": mode, "push": mode == "box",
+                     "worker": d.get("worker") or "upscale-worker",
+                     "rwork": d.get("rwork") or "/root/work",
+                     "src": d.get("src", ""), "dst": d.get("dst", ""),
+                     "ext": d.get("ext", "mkv")}
+    return out
+
+
+def upscale_cmd(*args: str) -> dict:
+    """Run the CLI. The UI does not reimplement start/stop, it calls them.
+
+    Every control path in this file used to be a second implementation of
+    something the CLI already did - selecting, claiming, killing - and each one
+    drifted from the others. The button now does exactly what the command does,
+    because it IS the command.
+    """
+    rc, out, err = run([UPSCALE_BIN, *args], timeout=120)
+    ok = rc == 0
+    return {"ok": ok, "note": (out or "").strip()[-400:],
+            **({} if ok else {"error": ((err or out) or f"exit {rc}").strip()[-400:]})}
 
 
 def probe_host(ssh_target: str) -> dict:
@@ -387,6 +434,85 @@ def ep_num(name: str) -> int | None:
     return int(m.group(2)) if m else None
 
 
+def absolute_numbers(paths: list[str]) -> dict:
+    """Continuous episode numbers across seasons, per library.
+
+    `n` was the episode number WITHIN its season, so every season restarted at
+    1: seven different rows all displayed as "E9", and sorting by the column
+    interleaved all seven seasons. Harmless while one season was imported, a
+    real mess at 315 rows.
+
+    A season's offset is the sum of the HIGHEST episode number in each earlier
+    season of the same library - taken from episode numbers rather than file
+    counts, so a season with a missing file does not shift every number after
+    it. Libraries are kept apart so Bleach and Gintama cannot collide.
+    """
+    per: dict = {}
+    maxep: dict = {}
+    for path in paths:
+        pp = Path(path)
+        m = EP_RE.search(pp.name)
+        if not m:
+            continue
+        key = (str(library_root(pp)), int(m.group(1)))
+        ep = int(m.group(2))
+        per[path] = (key, ep)
+        if ep > maxep.get(key, 0):
+            maxep[key] = ep
+    offset = {k: sum(v for k2, v in maxep.items() if k2[0] == k[0] and k2[1] < k[1])
+              for k in maxep}
+    return {path: offset[key] + ep for path, (key, ep) in per.items()}
+
+
+def selects(h: dict) -> tuple[str, str]:
+    """A host's own selection rule: (episodes, order), same words the CLI uses."""
+    return ((h.get("episodes") or "any").lower(), (h.get("order") or "forward").lower())
+
+
+def device_map(cfg: dict, ns: list[int]) -> dict:
+    """Which machine owns each episode number, DERIVED from host config.
+
+    The device column used to be a stored map that had to be populated by hand,
+    and `_next_path` refused anything assigned elsewhere - so a stale entry did
+    not merely mislabel a row, it stopped the episode being run at all. The rule
+    the machines actually follow already lives in their config: a parity and a
+    direction. Deriving the column from that means it is right the moment a
+    machine is configured, and there is nothing to assign retroactively.
+
+    Where several machines match a parity, forward ones take the front of the
+    outstanding work and reverse ones the back; the boundary is the midpoint of
+    what is still outstanding, recomputed on every refresh rather than stored.
+    """
+    hosts = all_hosts(cfg)
+    if not hosts or not ns:
+        return {}
+    lo, hi = min(ns), max(ns)
+    mid = (lo + hi) / 2.0
+    out = {}
+    for n in ns:
+        cand = []
+        for hid, h in hosts.items():
+            eps, order = selects(h)
+            if eps == "even" and n % 2 != 0:
+                continue
+            if eps == "odd" and n % 2 == 0:
+                continue
+            cand.append((hid, order))
+        if not cand:
+            continue
+        if len(cand) > 1:
+            want = "reverse" if n > mid else "forward"
+            narrowed = [c for c in cand if c[1] == want]
+            # A parity-specific rule beats a catch-all: "even" names this episode,
+            # "any" merely fails to exclude it.
+            if not narrowed:
+                narrowed = [c for c in cand
+                            if selects(hosts[c[0]])[0] in ("odd", "even")] or cand
+            cand = narrowed
+        out[n] = cand[0][0]
+    return out
+
+
 def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
     """One row per imported FILE.
 
@@ -435,12 +561,36 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
     assigned = assignments()
     host_labels = {h.get("id", ""): h.get("label", "") for h in host_states}
     rows = []
-    for path in imports():
+    _paths = imports()
+    absn = absolute_numbers(_paths)
+    owner = device_map(cfg, sorted(set(absn.values())))
+    for path in _paths:
         p = Path(path)
-        n = ep_num(p.name)
+        n = absn.get(path) or ep_num(p.name)
         if path in gone:
             continue
-        h = driving.get(path) or running.get(p.name)
+        # Match on the stem as well as the filename. A PUSH host reports the
+        # episode STEM - the server pushed the source in under a fixed name, so
+        # what identifies it is the title without its extension - while this
+        # lookup used the filename WITH `.mkv`. Nothing ever matched, so the row
+        # read `queued` and carried no device while the box was demonstrably
+        # upscaling it. p.stem is used rather than splitting the reported name,
+        # because a title containing a full stop ("Mr. X") would lose its tail.
+        h = driving.get(path) or running.get(p.name) or running.get(p.stem)
+        # ASSIGNMENT AND CLAIM ARE ONE THING, not two. A host reports the episode
+        # from its job file, and that file still names the PREVIOUS episode until
+        # the next one finishes counting frames - so a machine that was killed
+        # mid-episode last night goes on claiming it for ever. E09 was finished
+        # and archived, yet showed as DELIVERING on the desktop, which had since
+        # moved to E28 and never owned E09 in the first place.
+        #
+        # So a claim only counts from the machine the episode BELONGS to. Where
+        # an episode is assigned, that assignment decides; an unassigned episode
+        # still trusts whoever claims it, which is what lets a queue adopt work
+        # nobody has spoken for.
+        _own = assigned.get(path) or owner.get(n or -1, "")
+        if h and _own and h.get("id") != _own:
+            h = None
         lib = library_root(p)
         arch = lib / ".upscale-originals"
         archived = arch.is_dir() and any(x.name == p.name for x in arch.rglob("*"))
@@ -481,7 +631,7 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
                # The device column answers "where will this run?", not only
                # "where is it running?" - an assigned episode has an answer long
                # before a GPU touches it.
-               "device": (h.get("label") if h else host_labels.get(assigned_to, "")) or ""}
+               "device": ""}   # filled in below, from the derived rule
         if status == "delivering" and not h:
             # A background delivery, measured entirely on this side: the .part
             # arriving here, against the size recorded when it was launched.
@@ -528,6 +678,12 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
         rows.append(row)
     rows.sort(key=lambda r: (r["library_name"].lower(), r["n"] is None,
                              r["n"] if r["n"] is not None else 0, r["name"]))
+    # Derive the device column from what each machine is configured to take.
+    for r in rows:
+        hid = assigned.get(r["path"]) or owner.get(r.get("n") or -1, "")
+        r["assigned"] = assigned.get(r["path"], "")
+        r["owner"] = hid
+        r["device"] = host_labels.get(hid, "") or hid or ""
     return {"rows": rows,
             "counts": {st: sum(1 for r in rows if r["status"] == st)
                        for st in ("done", "running", "paused", "held", "queued", "missing")}}
@@ -646,9 +802,26 @@ def outstanding(cfg: dict, lib_path: str) -> dict:
 
 # ------------------------------------------------------------------- hosts ---
 def host_status(name: str, h: dict) -> dict:
-    """Live state of one GPU host. An unreachable host says so."""
+    """Live state of one GPU host. An unreachable host says so.
+
+    A PUSH host (a rented box with no route home) runs the same worker and
+    reports the same JSON, so progress, fps and ETA need nothing special. The
+    one thing it cannot know is which episode it is working on: the server
+    pushed the source in under a fixed name, so the worker honestly reports
+    "src.avi". The real title is in <rwork>/episode, written by whatever pushed
+    it, and is read here in the SAME ssh round trip - a second one per poll,
+    per host, would be paid on every refresh for one string.
+    """
     worker = h.get("worker") or "upscale-worker"
-    rc, out, err = ssh_to(h.get("ssh", name), f"{shlex.quote(worker)} status --json", timeout=15)
+    cmd = f"{shlex.quote(worker)} status --json"
+    if h.get("push"):
+        rwork = h.get("rwork") or "/root/work"
+        cmd += f"; echo '---EPISODE---'; cat {shlex.quote(rwork)}/episode 2>/dev/null || true"
+    rc, out, err = ssh_to(h.get("ssh", name), cmd, timeout=15)
+    episode_override = ""
+    if "---EPISODE---" in out:
+        out, _, episode_override = out.partition("---EPISODE---")
+        episode_override = episode_override.strip()
     # `id` is the CONFIG key and is what actions are addressed to; the worker
     # also reports a `host`, which is the machine's own hostname. Merging the
     # worker's payload over a dict keyed "host" silently replaced the former
@@ -661,7 +834,9 @@ def host_status(name: str, h: dict) -> dict:
         data = json.loads(out.strip() or "{}")
     except json.JSONDecodeError:
         return {**base, "reachable": True, "error": "worker did not return JSON", "raw": out[:300]}
-    return {**base, "reachable": True, **data}
+    if episode_override:
+        data["episode"] = episode_override
+    return {**base, "reachable": True, "push": bool(h.get("push")), **data}
 
 
 def host_running(h: dict, name: str) -> dict:
@@ -791,105 +966,28 @@ class Driver(threading.Thread):
         return all_hosts(load_config()).get(self.host) or {}
 
     def _next_path(self) -> str:
-        """The next episode THIS machine should run.
+        """The next episode THIS machine should run, by the rule it is configured with.
 
-        Assigned to it, or unassigned - and an unassigned one is claimed before
-        it is returned, under the same lock that writes assignments, so two
-        machines racing the same queue cannot both take it.
+        This used to consult a stored assignment map and skip anything owned by
+        another machine - so a stale entry did not just mislabel a row, it stopped
+        the episode being processed by anyone. Ownership is now derived from the
+        host's own config (parity and direction), the same rule the CLI follows,
+        so it is correct without anything being assigned by hand. An explicit
+        assignment is still honoured where one exists, as a deliberate override.
         """
         cfg = load_config()
         rows = queue_rows(cfg, [])["rows"]           # no host states: pure queue view
         held, gone = held_for(), removed_for()
-        with _state_lock:
-            st = _state()
-            a = st.setdefault("assigned", {})
-            for r in rows:
-                p = r["path"]
-                if r["status"] != "queued" or p in held or p in gone:
-                    continue
-                owner = a.get(p)
-                if owner and owner != self.host:
-                    continue
-                if not owner:
-                    a[p] = self.host                 # claim
-                    _save_state(st)
-                return p
+        for r in rows:
+            p = r["path"]
+            if r["status"] != "queued" or p in held or p in gone:
+                continue
+            owner = r.get("assigned") or r.get("owner") or self.host
+            if owner != self.host:
+                continue
+            return p
         return ""
 
-    def _launch(self, path: str, phase: str = "run", wait: bool = False) -> bool:
-        """Run one PHASE of one episode on this host.
-
-        Phases are separate so they can overlap. The pipeline was always built
-        that way - the link is ~1 MB/s, so a ~1.5 GB delivery is ~25 minutes,
-        and running it between episodes leaves the GPU idle for every one of
-        them. Only `process` is exclusive; fetches and deliveries run alongside.
-        """
-        h = self._h()
-        work = (h.get("scratch") or {}).get(self.scratch)
-        worker = h.get("worker") or "upscale-worker"
-        lib = library_root(Path(path))
-        env = (f"LIB={shlex.quote(str(lib))} "
-               f"ARCHIVE={shlex.quote(str(lib / '.upscale-originals'))} "
-               + (f"WORK={shlex.quote(work)} " if work else ""))
-        cmd = f"env {env}{shlex.quote(worker)} {phase} {shlex.quote(path)}"
-        remote = (cmd if wait else
-                  f"setsid nohup sh -c {shlex.quote(cmd)} >> ~/upscale-ui.log 2>&1 < /dev/null & echo started")
-        rc, _, err = ssh_to(h.get("ssh", self.host), remote, timeout=(3600 if wait else 25))
-        if rc != 0:
-            self.note = f"{phase} failed: {(err or f'ssh exited {rc}').strip()[:160]}"
-            return False
-        return True
-
-    def _await_output(self, path: str, tries: int = 45) -> int:
-        """Wait for the finished file to appear before judging the episode.
-
-        The mux runs after the last chunk and takes minutes on a long episode,
-        and during it the output is still <name>.mkv.part. Looking once, right
-        after the GPU goes quiet, saw nothing and concluded the episode had
-        produced no output - which halted the queue and stranded a finished
-        964 MB render in scratch.
-        """
-        for _ in range(tries):
-            if self.stop_after_current or self._shutdown:
-                return 0             # Stop must not wait out three more minutes
-            n = self._out_size(path)
-            if n:
-                return n
-            time.sleep(4)
-        return 0
-
-    def _out_size(self, path: str) -> int:
-        """Size of the finished file, asked for once when a delivery starts.
-
-        The server can watch the .part arrive but has no idea what it is aiming
-        at; the desktop knows. Without this the upload has a bar and no total.
-        """
-        h = self._h()
-        base = Path(path).stem
-        work = (h.get("scratch") or {}).get(self.scratch) or ""
-        rc, out, _ = ssh_to(h.get("ssh", self.host),
-                            f"stat -c%s {shlex.quote(work)}/{shlex.quote(base)}/{shlex.quote(base)}.mkv 2>/dev/null || echo 0",
-                            timeout=15)
-        try:
-            return int(out.strip() or 0)
-        except ValueError:
-            return 0
-
-    def _kill_current(self):
-        """Stop the GPU work. NOT the transfers. See kill_gpu()."""
-        kill_gpu(load_config(), self.host)
-
-    def _process_running(self, path: str) -> bool:
-        """Is a process phase already running for this episode anywhere?"""
-        h = self._h()
-        rc, out, _ = ssh_to(h.get("ssh", self.host),
-                            "ps -eo args= | grep -c \"[u]pscale-worker process\" || true", timeout=15)
-        try:
-            return int((out or "0").strip().splitlines()[-1]) > 0
-        except (ValueError, IndexError):
-            return False
-
-    # --- loop -------------------------------------------------------------
     def _still_queued(self, path: str) -> bool:
         return any(r["path"] == path and r["status"] == "queued"
                    for r in queue_rows(load_config(), [])["rows"])
@@ -1109,6 +1207,15 @@ def start_job(cfg: dict, host: str, scratch: str, paths: list[str] | None = None
     h = all_hosts(cfg).get(host)
     if not h:
         return {"ok": False, "error": f"unknown host {host!r}"}
+    if h.get("push"):
+        # The Driver runs fetch and deliver ON the host. A push host has no
+        # route home, so both would fail there. Until the Driver learns to do
+        # those two server-side, this box is driven by `upscale collect` and
+        # Start here would only fight it. Say so instead of failing obscurely.
+        return {"ok": False, "error": (f"{h.get('label', host)} is a push host: it has no route back "
+                                       "to the server, so the queue cannot drive it yet. It is driven "
+                                       "by `upscale --profile rental collect` on the server; this panel "
+                                       "shows its live progress.")}
     control(cfg, host, "resume")         # clear a pause left by Stop
     if paths:
         assign(paths, host)              # queue this selection into this machine
@@ -1310,6 +1417,9 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return self._json({"ok": False, "error": "bad JSON body"}, 400)
         if path == "/api/start":
+            # One path: the button runs the same command a shell would.
+            return self._json(upscale_cmd("start", (body.get("host") or "").strip()))
+        if path == "/api/start-legacy":
             # No path list: the driver re-reads the queue before every episode,
             # so holds and deletions made WHILE it runs are honoured. Handing it
             # a frozen list would make the buttons decorative again.
@@ -1373,16 +1483,13 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/api/pause", "/api/resume"):
             return self._json(control(cfg, body.get("host", ""), path.rsplit("/", 1)[1]))
         if path == "/api/stop":
-            # Stop is immediate: the pipeline's own flag, then the GPU work
-            # itself, on every host. Finished chunks survive; Start resumes.
-            host = body.get("host", "")
-            r = stop_driver(host)               # incl. the pipeline's own flag
-            # Every host, not just one: Stop is the queue, and a second machine
-            # quietly carrying on is exactly the surprise this avoids.
-            for other in all_hosts(cfg):
-                if other != host:
-                    stop_driver(other)
-            return self._json({"ok": True, **r})
+            # Same: `upscale stop <device>` is the only way anything stops.
+            host = (body.get("host") or "").strip()
+            if host:
+                return self._json(upscale_cmd("stop", host))
+            res = [upscale_cmd("stop", h) for h in all_hosts(cfg)]
+            return self._json({"ok": all(r.get("ok") for r in res),
+                               "note": "; ".join(r.get("note", "") for r in res)})
         if path == "/api/abort":
             stop_driver(body.get("host", ""), kill=False)   # stop sequencing first
             return self._json(abort_host(cfg, body.get("host", "")))
