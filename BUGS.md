@@ -345,3 +345,49 @@ looks fine everywhere except in front of the person watching it.
 - **md5 is too sensitive for "is this corrupt?"** Two ffmpeg versions differ on every
   frame from IDCT rounding alone. Use a perceptual difference; the real corruption showed
   `mean 19.5` against `0.0` for benign version skew.
+
+## The one that ate its own source
+
+**Publishing an `.mkv` master destroyed the original it was made from, then
+re-upscaled the episode from its own output.**
+
+The collector's publish, in order:
+
+```bash
+mv -f "$dest/.$base.mkv.part" "$dest/$base.mkv"   # master into place
+...
+mv -n "$src" "$ARCHIVE/${src#"$LIB"/}"            # then archive the original
+```
+
+With `SRC_EXT=avi` those are two different paths and the order is deliberate: the
+source is the only copy until its replacement is verified in place, so it is
+archived last.
+
+With `SRC_EXT=mkv` they are **the same path**. `$src` *is* `$dest/$base.mkv`. So:
+
+1. the master overwrote the original — the only copy, gone;
+2. the archive step then moved the **master** into `.upscale-originals/`;
+3. the library slot was left empty, so `discover` saw the episode as outstanding;
+4. the collector selected it again and pushed its own 1440p master back to the
+   box as a source — `pushing source (1002 MB)`, against a real source of ~130 MB.
+
+Twenty seconds separated `delivered S07E51 (34525 frames, 45.12 dB, 1003M)` from
+`=== S07E51 ===` selecting it a second time.
+
+Every guard the pipeline has was satisfied: frame counts matched, streams were
+present, and the PSNR identity check passed at 45.12 dB — because the master
+genuinely *is* that episode. Nothing detects that a file is already finished
+work, only that it is the right episode.
+
+It destroyed the sources of **S01E10 and S07E51** before it was caught. Both were
+recoverable only because the complete-series torrent was still seeding. Nothing
+in the pipeline would have recovered them.
+
+**Fix:** archive the original *before* moving the master into place. Verification
+— frames, streams, PSNR identity — has already passed by that point, so deferring
+the archive protects nothing and risks the source.
+
+**The general shape:** an invariant that holds only because two paths differ by
+extension. `SRC_EXT` was added so `.mkv` sources work; it silently turned an
+ordering that was merely careful into one that was destructive. When a format
+assumption changes, re-check every place that relied on paths being distinct.
