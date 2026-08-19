@@ -1396,7 +1396,7 @@ dev_state(){ printf '%s/.upscale/state/%s' "$HOME" "$1"; }
 dev_read(){   # $1 = name -> NAME SSH MODE SRC DST RANGE ORDER WORKERS RWORK SERVER
   local f; f=$(dev_file "$1")
   [ -r "$f" ] || return 1
-  NAME=''; SSH=''; MODE=''; SRC=''; DST=''; RANGE=''; ORDER=''; WORKERS=''; RWORK=''; SERVER=''; EXT=''; WORKER=''
+  NAME=''; SSH=''; MODE=''; SRC=''; DST=''; RANGE=''; ORDER=''; WORKERS=''; RWORK=''; SERVER=''; EXT=''; WORKER=''; WORK=''
   # shellcheck disable=SC1090
   . "$f"
   NAME=${NAME:-$1}; MODE=${MODE:-box}; RANGE=${RANGE:-any}; ORDER=${ORDER:-forward}
@@ -1460,7 +1460,8 @@ cmd_device(){
       dev_read "$n" || continue
       printf '%-14s %-7s %-9s %-8s %-5s %s\n' "$n" "$MODE" "$RANGE" "$ORDER" "$EXT" \
              "$(dev_running "$n" && echo running || echo stopped)"
-      printf '%-14s %s -> %s%s\n' '' "$SRC" "$DST" \
+      printf '%-14s %s -> %s%s%s\n' '' "$SRC" "$DST" \
+             "$([ -n "$WORK" ] && printf '   scratch:%s' "$WORK")" \
              "$([ -n "$SSH" ] && printf '   [%s]' "$SSH")"
     done
     [ -n "$(dev_names)" ] || echo "no devices configured"
@@ -1478,7 +1479,7 @@ cmd_device(){
   local name=$1 src=${2:-} dst=${3:-} range=${4:-any}
   shift $(( $# < 4 ? $# : 4 ))
   [ -n "$src" ] || die "usage: upscale device <name> <src> <dst> <range> [--ssh S] [--mode box|local] [--order forward|reverse] [--workers N] [--server ALIAS]"
-  local ssh='' mode='' order=forward workers='' server='' rwork=/root/work ext=mkv
+  local ssh='' mode='' order=forward workers='' server='' rwork=/root/work ext=mkv work=''
   while [ $# -gt 0 ]; do
     case "$1" in
       --ssh)     ssh=$2;     shift 2 ;;
@@ -1488,6 +1489,7 @@ cmd_device(){
       --server)  server=$2;  shift 2 ;;
       --rwork)   rwork=$2;   shift 2 ;;
       --ext)     ext=$2;     shift 2 ;;
+      --work)    work=$2;    shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -1525,6 +1527,11 @@ ORDER=$(printf '%q' "$order")
 WORKERS=$(printf '%q' "$workers")
 RWORK=$(printf '%q' "$rwork")
 EXT=$(printf '%q' "$ext")
+# Scratch. The worker defaults to /mnt/scratch/upscale-ep, which on this desktop
+# is a DRAM-less SATA SSD; the frames for one episode are ~32 GB of PNGs written
+# and read back, and that drive collapses under it - 20 fps on NVMe became 14.
+# Where the scratch lives is a fact about the DEVICE, so it belongs here.
+WORK=$(printf '%q' "$work")
 WORKER=$(printf '%q' "$worker")
 SERVER=$(printf '%q' "${server:-ubuntu}")
 EOF
@@ -1545,7 +1552,7 @@ cmd_start(){
     box)
       [ -n "$SSH" ] || die "device $n is mode=box but has no --ssh target"
       # shellcheck disable=SC2086
-      setsid nohup env STATE="$st" LIB="$SRC" ARCHIVE="$SRC/.upscale-originals" \
+      setsid nohup env STATE="$st" LIB="$SRC" ARCHIVE="$SRC/.upscale-originals" ${WORK:+WORK="$WORK"} \
         REMOTE=local EPISODES="$RANGE" ORDER="$ORDER" SRC_EXT="$EXT" \
         RWORK="$RWORK" RSCRIPT=/root/box-run.sh RPHASE=box GPUHOST="$SSH" \
         "$0" collect >> "$st/collect.log" 2>&1 < /dev/null &
@@ -1553,7 +1560,7 @@ cmd_start(){
       ;;
     local)
       local remote_state="\$HOME/.upscale/state/$n"
-      local cmd="mkdir -p $remote_state && rm -f $remote_state/stop $remote_state/pause && cd \$HOME && setsid nohup env STATE=$remote_state REMOTE=$(printf '%q' "$SERVER") LIB=$(printf '%q' "$SRC") ARCHIVE=$(printf '%q' "$SRC/.upscale-originals") EPISODES=$(printf '%q' "$RANGE") ORDER=$(printf '%q' "$ORDER") SRC_EXT=$EXT${WORKERS:+ WORKERS=$WORKERS} \$HOME/.local/bin/upscale run >> $remote_state/run.log 2>&1 < /dev/null & echo \$!"
+      local cmd="mkdir -p $remote_state && rm -f $remote_state/stop $remote_state/pause && cd \$HOME && setsid nohup env STATE=$remote_state REMOTE=$(printf '%q' "$SERVER")${WORK:+ WORK=$(printf '%q' "$WORK")} LIB=$(printf '%q' "$SRC") ARCHIVE=$(printf '%q' "$SRC/.upscale-originals") EPISODES=$(printf '%q' "$RANGE") ORDER=$(printf '%q' "$ORDER") SRC_EXT=$EXT${WORKERS:+ WORKERS=$WORKERS} \$HOME/.local/bin/upscale run >> $remote_state/run.log 2>&1 < /dev/null & echo \$!"
       local rpid
       if [ -n "$SSH" ]; then
         # shellcheck disable=SC2086

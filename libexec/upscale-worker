@@ -180,7 +180,15 @@ cmd_status_json(){
     # the last few give a stable rate with no startup skew.
     local _segs_by_time _k _t_new _t_old _span
     if [ "${segs:-0}" -ge 2 ]; then
-      mapfile -t _segs_by_time < <(find "$SEGDIR" -name 'seg_*.mkv' -printf '%T@\n' 2>/dev/null | sort -n)
+      # ONLY segments written by THIS run. Segment mtimes survive a restart, so a
+      # resumed episode measured from a segment an earlier generation wrote - and
+      # the span then included every minute the machine was stopped. E28 reported
+      # 1.51 fps while demonstrably doing 21.7: its window reached back 65 minutes
+      # to a segment from before the last restart. Dead time is not slow time.
+      local _t0; _t0=$(cat "$STATE/started" 2>/dev/null) || _t0=0
+      case "$_t0" in ''|*[!0-9]*) _t0=0 ;; esac
+      mapfile -t _segs_by_time < <(find "$SEGDIR" -name 'seg_*.mkv' \
+        ${_t0:+-newermt "@$_t0"} -printf '%T@\n' 2>/dev/null | sort -n)
       _k=${#_segs_by_time[@]}
       if [ "$_k" -ge 2 ]; then
         local _use=4; [ "$_k" -lt "$_use" ] && _use=$_k
