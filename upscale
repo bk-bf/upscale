@@ -6,6 +6,11 @@
 #                          upscale ep 1
 #                          upscale ep 5-9
 #                          upscale ep 1 ubuntu:/mnt/media/tv/Bleach
+#   upscale device       list devices, or define one:
+#                          upscale device <name> <src> <dst> <range> [--ssh S]
+#                          upscale device --clear [name]
+#   upscale start <name> run a device, from its config file alone
+#   upscale stop  <name> stop a device
 #   upscale run          process everything outstanding, then idle for more
 #   upscale once         process outstanding work, then exit
 #   upscale collect      drive a remote GPU that cannot reach back:
@@ -96,6 +101,15 @@ if [ -z "$WORKER" ]; then
   unset _w
 fi
 [ -n "$WORKER" ] || WORKER=upscale-ep    # last resort: legacy name on $PATH
+
+# The worker keeps its job file in ITS state dir, and that dir is $EPSTATE - not
+# the queue's $STATE. Both are called STATE inside their own script, so invoking
+# the worker without saying which one it should use let it inherit the queue's,
+# and the worker then wrote its job somewhere nothing ever read. The desktop
+# reported the episode it had been killed on 15 hours earlier while visibly
+# upscaling a different one. Every call goes through here so the two cannot
+# drift apart again.
+worker(){ env STATE="$EPSTATE" "$WORKER" "$@"; }
 # Mirrors of the worker's defaults, so --status can report the configuration the
 # episodes actually run with. Deliberately plain shell vars: when the caller did
 # not export them, the worker still owns its own defaults.
@@ -1118,7 +1132,7 @@ cmd_collect(){
   rsh "mkdir -p $RWORK" >/dev/null 2>&1 || cdie "cannot reach the worker at $GPUHOST"
   say "collect: driving $GPUHOST (EPISODES=$EPISODES)"
 
-  local src base dest lsz rsz got want streams
+  local src base dest lsz rsz got want streams _lastwhy=
   while :; do
     if [ -f "$STOP" ]; then say "collect stopped"; break; fi
     while [ -f "$PAUSE" ]; do sleep 10; done
@@ -1131,13 +1145,26 @@ cmd_collect(){
     #
     # runnable() drops episodes that have already failed MAX_FAILS times, so a
     # bad one cannot be picked again and again for the rest of the night.
-    local _cand=()
-    mapfile -t _cand < <(discover 2>/dev/null | select_todo | runnable) || true
+    # Each stage is captured separately so the queue can say WHERE the work went.
+    # This branch used to sleep IDLE seconds in complete silence, so "nothing is
+    # outstanding", "the library path is wrong", "SRC_EXT does not match these
+    # files" and "everything is blacklisted" were one indistinguishable
+    # non-event. Diagnosing that cost an hour on SRC_EXT=avi against an .mkv
+    # library. A queue that decides to do nothing must say what it looked at.
+    local _all=() _sel=() _cand=() _why
+    mapfile -t _all  < <(discover 2>/dev/null) || true
+    mapfile -t _sel  < <(printf '%s\n' ${_all[@]+"${_all[@]}"} | select_todo) || true
+    mapfile -t _cand < <(printf '%s\n' ${_sel[@]+"${_sel[@]}"} | runnable) || true
     src="${_cand[0]:-}"
     if [ -z "$src" ]; then
-      if [ "$MODE" = once ]; then say "nothing outstanding"; break; fi
+      _why="nothing to run: discovered ${#_all[@]} source(s) under $LIB (SRC_EXT=$SRC_EXT), ${#_sel[@]} matched EPISODES=$EPISODES, ${#_cand[@]} runnable"
+      # Repeat only when the reason changes: an idle night stays readable, a
+      # change of cause is never swallowed.
+      if [ "${_lastwhy:-}" != "$_why" ]; then say "$_why"; _lastwhy=$_why; fi
+      if [ "$MODE" = once ]; then break; fi
       sleep "$IDLE"; continue
     fi
+    _lastwhy=
     base=$(basename "${src%.*}")
     case "$src" in
       "$ARCHIVE"/*) dest="$LIB/$(dirname "${src#"$ARCHIVE"/}")" ;;
@@ -1280,7 +1307,12 @@ cmd_collect(){
       col_fail "$src" "$base" "pull failed"; sleep 20; continue
     fi
     got=$(oframes "$dest/.$base.mkv.part") || got=0
-    want=$(dframes "$src") || want=0
+    # oframes, not dframes: it counts packets only for codecs where one packet is
+    # exactly one frame (h264/hevc) and falls back to the honest decode for
+    # anything else - which is what MPEG-4 ASP packed bitstream needs, and it is
+    # the only reason this was ever a full decode. On an HEVC source that decode
+    # cost minutes per episode, after every pull, while the box sat idle.
+    want=$(oframes "$src") || want=0
     streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$dest/.$base.mkv.part" 2>/dev/null | tr '\n' ' ')
     # identity, not just shape - see ident_psnr above
     ident=$(ident_psnr "$dest/.$base.mkv.part" "$src") || ident=0
@@ -1335,6 +1367,250 @@ cmd_collect(){
 }
 
 
+# ---------------------------------------------------------------- devices ---
+# ONE FILE PER DEVICE, and that file is the only thing that decides what the
+# device takes and how it is started or stopped.
+#
+# Ownership used to be answerable from nine places - a stored assignment map in
+# the UI, per-host UI config, each collector's environment, profile files, a
+# saved config per state dir, the worker's own job file, .upscaleignore, the
+# held/removed maps, and `ep <range>` - and any of them could disagree with the
+# rest. Starting and stopping had as many: the UI's own kill paths, --pause and
+# --stop flag files, and plain process kills. Every serious bug in this queue
+# came from two of those paths disagreeing: a stop button that did not stop, a
+# finished episode shown as running on a machine that never owned it, an
+# episode nobody would pick up because a stale entry said it belonged elsewhere.
+#
+#   upscale device                        list every device and what it takes
+#   upscale device <name> <src> <dst> <range> [--ssh S] [--mode box|local]
+#                                         [--order forward|reverse] [--workers N]
+#                                         [--server ALIAS]
+#   upscale device --clear [name]         forget one device, or all of them
+#   upscale start <name>                  run it, from its file alone
+#   upscale stop  <name>                  stop it, one way
+DEVDIR=${DEVDIR:-$HOME/.upscale/devices}
+
+dev_file(){  printf '%s/%s.conf' "$DEVDIR" "$1"; }
+dev_state(){ printf '%s/.upscale/state/%s' "$HOME" "$1"; }
+
+dev_read(){   # $1 = name -> NAME SSH MODE SRC DST RANGE ORDER WORKERS RWORK SERVER
+  local f; f=$(dev_file "$1")
+  [ -r "$f" ] || return 1
+  NAME=''; SSH=''; MODE=''; SRC=''; DST=''; RANGE=''; ORDER=''; WORKERS=''; RWORK=''; SERVER=''; EXT=''; WORKER=''
+  # shellcheck disable=SC1090
+  . "$f"
+  NAME=${NAME:-$1}; MODE=${MODE:-box}; RANGE=${RANGE:-any}; ORDER=${ORDER:-forward}
+  RWORK=${RWORK:-/root/work}; DST=${DST:-$SRC}; SERVER=${SERVER:-ubuntu}
+  # Source extension is a fact about THIS library, not an ambient default.
+  # SRC_EXT is set to 'avi' near the top of this script, so a caller writing
+  # ${SRC_EXT:-mkv} silently inherited 'avi' and discovered nothing at all in
+  # an .mkv library - a queue that looked healthy and did nothing.
+  EXT=${EXT:-mkv}
+  return 0
+}
+
+dev_names(){ [ -d "$DEVDIR" ] || return 0; find "$DEVDIR" -maxdepth 1 -name '*.conf' 2>/dev/null | sort | while read -r f; do basename "$f" .conf; done; }
+
+dev_pid(){    local p; p=$(cat "$(dev_state "$1")/pid" 2>/dev/null) || return 1
+              case "$p" in ''|*[!0-9]*) return 1 ;; esac
+              kill -0 "$p" 2>/dev/null || return 1; printf '%s' "$p"; }
+# A local device's queue runs ON that device, so a pidfile here proves nothing.
+# Asking the machine is the only honest answer, and a device that reports
+# "stopped" while it is demonstrably working is the exact class of lie this
+# whole change exists to remove.
+# How many upscale processes are ALIVE on the device right now.
+#
+# Counted with patterns that cannot match the counting command itself: `pgrep -f
+# upscale-worker` matches the ssh command line carrying it, so it never returns
+# zero and every check that used it silently believed the machine was busy.
+dev_busy(){
+  local n=$1
+  # Matched on the full command line, never on comm: the kernel truncates comm to
+  # 15 characters, so "realesrgan-ncnn-vulkan" is reported as "realesrgan-ncnn"
+  # and an exact match on the full name silently counts zero - leaving this blind
+  # to precisely the orphaned GPU processes it exists to find.
+  local q='echo $(( $(ps -eo args= | grep -c "[r]ealesrgan-ncnn-vulkan") + $(ps -eo args= | grep -c "[l]ibexec/upscale-worker") ))'
+  ( dev_read "$n" || exit 1
+    if [ -n "$SSH" ]; then
+      # shellcheck disable=SC2086
+      timeout 20 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 $SSH "$q" 2>/dev/null || echo 0
+    else
+      eval "$q"
+    fi ) | tail -1
+}
+
+dev_running(){
+  local n=$1
+  ( dev_read "$n" || exit 1
+    case "$MODE" in
+      local)
+        local q="pgrep -f '[u]pscale run' >/dev/null 2>&1"
+        if [ -n "$SSH" ]; then
+          # shellcheck disable=SC2086
+          timeout 20 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 $SSH "$q" 2>/dev/null
+        else eval "$q"; fi ;;
+      *) dev_pid "$n" >/dev/null 2>&1 ;;
+    esac )
+}
+
+cmd_device(){
+  if [ $# -eq 0 ]; then
+    local n
+    for n in $(dev_names); do
+      dev_read "$n" || continue
+      printf '%-14s %-7s %-9s %-8s %-5s %s\n' "$n" "$MODE" "$RANGE" "$ORDER" "$EXT" \
+             "$(dev_running "$n" && echo running || echo stopped)"
+      printf '%-14s %s -> %s%s\n' '' "$SRC" "$DST" \
+             "$([ -n "$SSH" ] && printf '   [%s]' "$SSH")"
+    done
+    [ -n "$(dev_names)" ] || echo "no devices configured"
+    return 0
+  fi
+  if [ "$1" = --clear ]; then
+    shift
+    if [ $# -eq 0 ]; then
+      local n; for n in $(dev_names); do cmd_stop "$n" >/dev/null 2>&1 || true; rm -f "$(dev_file "$n")"; echo "cleared $n"; done
+    else
+      cmd_stop "$1" >/dev/null 2>&1 || true; rm -f "$(dev_file "$1")"; echo "cleared $1"
+    fi
+    return 0
+  fi
+  local name=$1 src=${2:-} dst=${3:-} range=${4:-any}
+  shift $(( $# < 4 ? $# : 4 ))
+  [ -n "$src" ] || die "usage: upscale device <name> <src> <dst> <range> [--ssh S] [--mode box|local] [--order forward|reverse] [--workers N] [--server ALIAS]"
+  local ssh='' mode='' order=forward workers='' server='' rwork=/root/work ext=mkv
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ssh)     ssh=$2;     shift 2 ;;
+      --mode)    mode=$2;    shift 2 ;;
+      --order)   order=$2;   shift 2 ;;
+      --workers) workers=$2; shift 2 ;;
+      --server)  server=$2;  shift 2 ;;
+      --rwork)   rwork=$2;   shift 2 ;;
+      --ext)     ext=$2;     shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  # A device that cannot be reached is a device that will silently do nothing,
+  # so this is checked when it is written rather than when it next runs.
+  local worker=''
+  if [ -n "$ssh" ]; then
+    # shellcheck disable=SC2086
+    timeout 25 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=15 $ssh true 2>/dev/null \
+      || die "cannot reach $name over ssh: $ssh"
+    # Resolve the worker HERE, while we are already talking to the machine.
+    # ~/.local/bin is not on the PATH of a non-interactive ssh, so anything
+    # that asks for it later gets "command not found" and reports the device
+    # as broken. Recording the absolute path once removes that whole class.
+    # shellcheck disable=SC2086
+    worker=$(timeout 25 ssh -o BatchMode=yes -o ControlPath=none $ssh \
+      'command -v upscale-worker 2>/dev/null || ls "$HOME/.local/libexec/upscale-worker" 2>/dev/null' 2>/dev/null | head -1) || worker=''
+  else
+    worker=$(command -v upscale-worker 2>/dev/null || ls "$HOME/.local/libexec/upscale-worker" 2>/dev/null | head -1) || worker=''
+  fi
+  [ -n "$worker" ] || say "warning: no upscale-worker found on $name; install it there"
+  [ -n "$mode" ] || { if [ -z "$ssh" ]; then mode=local; else mode=box; fi; }
+  mkdir -p "$DEVDIR"
+  umask 077
+  cat > "$(dev_file "$name")" <<EOF
+# $name - written by \`upscale device\`. One file per device; this is the only
+# thing that decides what it takes. Edit or rewrite with the same command.
+NAME=$(printf '%q' "$name")
+SSH=$(printf '%q' "$ssh")
+MODE=$(printf '%q' "$mode")
+SRC=$(printf '%q' "$src")
+DST=$(printf '%q' "${dst:-$src}")
+RANGE=$(printf '%q' "$range")
+ORDER=$(printf '%q' "$order")
+WORKERS=$(printf '%q' "$workers")
+RWORK=$(printf '%q' "$rwork")
+EXT=$(printf '%q' "$ext")
+WORKER=$(printf '%q' "$worker")
+SERVER=$(printf '%q' "${server:-ubuntu}")
+EOF
+  echo "device $name: $range $order, $src -> ${dst:-$src}${ssh:+  [$ssh]}  (mode=$mode)"
+}
+
+cmd_start(){
+  local n=${1:?upscale start <device>}
+  dev_read "$n" || die "no such device: $n   (upscale device $n <src> <dst> <range>)"
+  local st; st=$(dev_state "$n"); mkdir -p "$st"
+  if dev_running "$n"; then echo "$n is already running"; return 0; fi
+  local _b; _b=$(dev_busy "$n"); case "$_b" in ''|*[!0-9]*) _b=0 ;; esac
+  if [ "$_b" -gt 0 ]; then
+    die "$n still has $_b upscale process(es) running; \`upscale stop $n\` first (starting now would put two generations on one GPU)"
+  fi
+  rm -f "$st/stop" "$st/pause"
+  case "$MODE" in
+    box)
+      [ -n "$SSH" ] || die "device $n is mode=box but has no --ssh target"
+      # shellcheck disable=SC2086
+      setsid nohup env STATE="$st" LIB="$SRC" ARCHIVE="$SRC/.upscale-originals" \
+        REMOTE=local EPISODES="$RANGE" ORDER="$ORDER" SRC_EXT="$EXT" \
+        RWORK="$RWORK" RSCRIPT=/root/box-run.sh RPHASE=box GPUHOST="$SSH" \
+        "$0" collect >> "$st/collect.log" 2>&1 < /dev/null &
+      echo $! > "$st/pid"
+      ;;
+    local)
+      local remote_state="\$HOME/.upscale/state/$n"
+      local cmd="mkdir -p $remote_state && rm -f $remote_state/stop $remote_state/pause && cd \$HOME && setsid nohup env STATE=$remote_state REMOTE=$(printf '%q' "$SERVER") LIB=$(printf '%q' "$SRC") ARCHIVE=$(printf '%q' "$SRC/.upscale-originals") EPISODES=$(printf '%q' "$RANGE") ORDER=$(printf '%q' "$ORDER") SRC_EXT=$EXT${WORKERS:+ WORKERS=$WORKERS} \$HOME/.local/bin/upscale run >> $remote_state/run.log 2>&1 < /dev/null & echo \$!"
+      local rpid
+      if [ -n "$SSH" ]; then
+        # shellcheck disable=SC2086
+        rpid=$(timeout 40 ssh -o BatchMode=yes -o ControlPath=none $SSH "$cmd" 2>/dev/null | tail -1) || rpid=''
+      else
+        rpid=$(eval "$cmd" | tail -1) || rpid=''
+      fi
+      [ -n "$rpid" ] || die "$n: the queue would not start"
+      printf '%s' "$rpid" > "$st/rpid"
+      ;;
+    *) die "device $n has unknown mode: $MODE" ;;
+  esac
+  echo "started $n ($MODE, $RANGE $ORDER)"
+}
+
+cmd_stop(){
+  local n=${1:?upscale stop <device>}
+  dev_read "$n" || die "no such device: $n"
+  local st; st=$(dev_state "$n"); mkdir -p "$st"
+  : > "$st/stop"
+  case "$MODE" in
+    box)
+      local p; p=$(dev_pid "$n" 2>/dev/null) && kill "$p" 2>/dev/null
+      rm -f "$st/pid"
+      # The GPU work, not the transfers: a killed rsync resumes from its .part,
+      # but killing an unrelated sync on that machine is a far worse surprise.
+      # shellcheck disable=SC2086
+      [ -n "$SSH" ] && timeout 25 ssh -o BatchMode=yes -o ControlPath=none $SSH \
+        "pkill -f '[u]pscale-worker process' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true" >/dev/null 2>&1
+      ;;
+    local)
+      local cmd="rm -f \$HOME/.upscale/state/$n/pid; touch \$HOME/.upscale/state/$n/stop; pkill -f '[u]pscale run' ; pkill -f '[u]pscale-worker' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true"
+      if [ -n "$SSH" ]; then
+        # shellcheck disable=SC2086
+        timeout 25 ssh -o BatchMode=yes -o ControlPath=none $SSH "$cmd" >/dev/null 2>&1
+      else
+        eval "$cmd" >/dev/null 2>&1
+      fi
+      rm -f "$st/rpid"
+      ;;
+  esac
+  # Do NOT return until the machine is quiet. Signalling and returning is how one
+  # desktop ended up running SEVEN worker generations at once: stop said it had
+  # stopped, start was issued immediately, and the orphaned realesrgan children
+  # of the previous run were still on the GPU. Throughput collapsed from ~20 fps
+  # to 13.8 and nothing reported a fault, because nothing was faulty - there were
+  # simply three of everything.
+  local _b _i=0
+  while [ "$_i" -lt 15 ]; do
+    _b=$(dev_busy "$n"); case "$_b" in ''|*[!0-9]*) _b=0 ;; esac
+    [ "$_b" -eq 0 ] && { echo "stopped $n"; return 0; }
+    sleep 2; _i=$((_i+1))
+  done
+  echo "stopped $n - WARNING: $_b process(es) still alive there; start will refuse until they exit" >&2
+  return 1
+}
+
 profiles_seed
 # --profile <name> may precede any command. PROFILE in the environment does the
 # same thing, so a systemd unit can select one with a single Environment= line
@@ -1379,7 +1655,10 @@ case "${1:-}" in
   # the episode in flight - it says "finish the current episode", and it was
   # throwing away fifteen minutes of GPU work and recording a failure for it.
   # --pause is the one that reaches into the running episode.
-  stop|--stop)     load_config; touch "$STOP"; echo "stopping after the current episode"; exit 0 ;;
+  # `--stop` only. The bare word belongs to `upscale stop <device>`, which is the
+  # one way to stop something; this flag remains for the legacy global queue and
+  # is what that command writes underneath.
+  --stop)          load_config; touch "$STOP"; echo "stopping after the current episode"; exit 0 ;;
   # One episode, one command — the thing you actually want when a single episode
   # is left over. It reuses the worker's own fetch+process+deliver and touches
   # NONE of the queue machinery: no profiles, no config snapshot, no state files,
@@ -1407,7 +1686,7 @@ case "${1:-}" in
       if [ -f "$STOP" ]; then echo "stopped before $(basename "${_src%.*}")"; break; fi
       ep_in_set "$(epnum "$(basename "${_src%.*}")")" "$RANGE" || continue
       echo "==> $(basename "${_src%.*}")"
-      "$WORKER" run "$_src" || { echo "FAILED: $_src" >&2; exit 1; }
+      worker run "$_src" || { echo "FAILED: $_src" >&2; exit 1; }
       _n=$((_n + 1))
     done
     if [ "$_n" -eq 0 ]; then
@@ -1415,6 +1694,9 @@ case "${1:-}" in
     fi
     echo "done: $_n episode(s)"
     exit 0 ;;
+  device)          shift; cmd_device "$@"; exit $? ;;
+  start)           shift; cmd_start "${1:-}"; exit $? ;;
+  stop)            shift; cmd_stop  "${1:-}"; exit $? ;;
   run|--run)       MODE=run ;;
   collect)         MODE=run;  DOCOLLECT=1 ;;
   collect-once)    MODE=once; DOCOLLECT=1 ;;
@@ -1474,7 +1756,7 @@ while :; do
   base=$(basename "${src%.*}")
   say "[$((done_n+1))] processing $base  (${#TODO[@]} outstanding)"
 
-  "$WORKER" fetch "$src"
+  worker fetch "$src"
 
   # next episode downloads while this one is on the GPU
   # Prefetch the next RUNNABLE episode, not TODO[1]. TODO[0] is often an episode
@@ -1484,12 +1766,12 @@ while :; do
   # Not silenced: this is the one background job whose failure costs GPU time.
   prefetch_pid=""
   if [ -n "${READY[1]:-}" ]; then
-    ( "$WORKER" fetch "${READY[1]}" 2>&1 | sed 's/^/  prefetch: /' >> "$QLOG" ) & prefetch_pid=$!
+    ( worker fetch "${READY[1]}" 2>&1 | sed 's/^/  prefetch: /' >> "$QLOG" ) & prefetch_pid=$!
     say "prefetching $(basename "${READY[1]%.*}" | cut -c1-42)"
   fi
 
   # A failing episode must not end the run.
-  if ! "$WORKER" process "$src"; then
+  if ! worker process "$src"; then
     fails=$(grep -cFx "$src" "$FAILED" 2>/dev/null) || fails=0
     fails=$((fails + 1))
     printf '%s\n' "$src" >> "$FAILED"
@@ -1500,7 +1782,7 @@ while :; do
   # the previous upload must finish before this one starts, so two transfers
   # never split a 2.2 MB/s link between them
   [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; }
-  ( "$WORKER" deliver "$src" || say "DELIVERY FAILED: $base" ) & deliver_pid=$!
+  ( worker deliver "$src" || say "DELIVERY FAILED: $base" ) & deliver_pid=$!
 
   [ -n "$prefetch_pid" ] && { wait "$prefetch_pid" 2>/dev/null || true; }
   done_n=$((done_n+1))
