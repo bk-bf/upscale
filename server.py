@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -670,6 +671,42 @@ def host_status(name: str, h: dict) -> dict:
     return {**base, "reachable": True, "push": bool(h.get("push")), **data}
 
 
+_DEVICE_TABLE_TTL = 3.0
+_device_table_lock = threading.Lock()
+_device_table: tuple[float, dict] = (0.0, {})
+
+
+def device_table() -> dict:
+    """Every device's running flag, from one `upscale device` call.
+
+    This is memoised for a few seconds because the command is not cheap: to
+    answer "is it running" for a local-mode device it ssh's to that device. It
+    used to be run once PER HOST, so N devices cost N ssh round trips per host
+    and N*N per poll - with four devices, one of them a rented box that had
+    been destroyed and could only answer by timing out, that was most of the
+    23s it took to draw the page.
+    """
+    global _device_table
+    now = time.monotonic()
+    with _device_table_lock:
+        ts, table = _device_table
+        if table and now - ts < _DEVICE_TABLE_TTL:
+            return table
+    rc, out, _ = run([UPSCALE_BIN, "device"], timeout=30)
+    table = {}
+    if rc == 0:
+        for line in (out or "").splitlines():
+            # continuation lines are indented and describe the line above
+            if not line[:1].strip():
+                continue
+            parts = line.split()
+            if parts:
+                table[parts[0]] = parts[-1] == "running"
+    with _device_table_lock:
+        _device_table = (now, table)
+    return table
+
+
 def driver_state(host: str) -> dict:
     """Is this device running, according to the CLI that starts and stops it?
 
@@ -678,14 +715,31 @@ def driver_state(host: str) -> dict:
     process would be inventing a second answer, which is the exact habit that
     made a finished episode display as running on a machine that never owned it.
     """
-    rc, out, _ = run([UPSCALE_BIN, "device"], timeout=30)
-    if rc != 0:
-        return {"queue_running": False, "queue_note": ""}
-    for line in (out or "").splitlines():
-        parts = line.split()
-        if parts and parts[0] == host:
-            return {"queue_running": parts[-1] == "running", "queue_note": ""}
-    return {"queue_running": False, "queue_note": ""}
+    return {"queue_running": device_table().get(host, False), "queue_note": ""}
+
+
+def host_states(cfg: dict) -> list[dict]:
+    """Live state of every device, polled concurrently.
+
+    These are independent ssh round trips to different machines. Done in a loop
+    the page waits for their sum, and one unreachable box puts its whole
+    connect timeout in front of every host after it.
+    """
+    hosts = all_hosts(cfg)
+    if not hosts:
+        return []
+    device_table()          # warm the memo once, not once per worker thread
+
+    def one(item):
+        name, h = item
+        st = host_status(name, h)
+        st.update(driver_state(name))
+        st["scratch"] = h.get("scratch", {})
+        st["default_scratch"] = h.get("default_scratch")
+        return st
+
+    with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as ex:
+        return list(ex.map(one, hosts.items()))
 
 
 def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
@@ -924,39 +978,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "lib is required"}, 400)
             return self._json(outstanding(cfg, lib))
         if path == "/api/hosts":
-            hosts = all_hosts(cfg)
-            out = []
-            for name, h in hosts.items():
-                st = host_status(name, h)
-                st.update(driver_state(name))
-                st["scratch"] = h.get("scratch", {})
-                st["default_scratch"] = h.get("default_scratch")
-                out.append(st)
-            return self._json({"hosts": out, "ts": int(time.time())})
+            snap = read_snapshot()
+            return self._json({"hosts": snap.get("hosts", []),
+                               "ts": snap.get("ts", int(time.time())),
+                               "age": snap.get("age", 0)})
         if path == "/api/browse":
             return self._json(browse(cfg, (q.get("q") or [""])[0]))
         if path == "/api/queue":
-            hosts = all_hosts(cfg)
-            states = []
-            for name, h in hosts.items():
-                st = host_status(name, h)
-                st.update(driver_state(name))
-                st["scratch"] = h.get("scratch", {})
-                st["default_scratch"] = h.get("default_scratch")
-                states.append(st)
-            qr = queue_rows(cfg, states)
-            libs = {}
-            for r in qr["rows"]:
-                libs.setdefault(r["library"], {"path": r["library"], "name": r["library_name"], "n": 0})
-                libs[r["library"]]["n"] += 1
-            return self._json({**qr, "libraries": list(libs.values()),
-                               "hosts": states, "ts": int(time.time())})
+            return self._json(read_snapshot())
         if path == "/api/health":
             return self._json({"ok": True, "config": str(CONFIG_PATH),
                                "error": cfg.get("_error")})
         return self._static(path)
 
     def do_POST(self):
+        try:
+            return self._do_post()
+        finally:
+            _snap_wake.set()
+
+    def _do_post(self):
         cfg = load_config()
         path = urlparse(self.path).path
         try:
@@ -1056,12 +1097,69 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, 404)
 
 
+SNAPSHOT_INTERVAL = 5.0
+_snap_lock = threading.Lock()
+_snapshot: dict = {}
+_snap_wake = threading.Event()
+_snap_ready = threading.Event()
+
+
+def collect_snapshot() -> dict:
+    """Everything the page draws, derived once."""
+    cfg = load_config()
+    states = host_states(cfg)
+    qr = queue_rows(cfg, states)
+    libs: dict = {}
+    for r in qr["rows"]:
+        libs.setdefault(r["library"], {"path": r["library"],
+                                       "name": r["library_name"], "n": 0})
+        libs[r["library"]]["n"] += 1
+    return {**qr, "libraries": list(libs.values()), "hosts": states,
+            "ts": int(time.time())}
+
+
+def snapshot_loop():
+    """One collector, however many clients.
+
+    Truth is still derived and nothing here is a job database - this is the
+    same derivation the request used to do inline, moved off the request so
+    that N polling browsers cause one ssh sweep instead of N, and so a sweep
+    that takes longer than the poll interval cannot pile up on itself.
+    """
+    while True:
+        try:
+            snap = collect_snapshot()
+            with _snap_lock:
+                global _snapshot
+                _snapshot = snap
+            _snap_ready.set()
+        except Exception as exc:                      # never kill the collector
+            print(f"snapshot failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            _snap_ready.set()
+        _snap_wake.wait(SNAPSHOT_INTERVAL)
+        _snap_wake.clear()
+
+
+def read_snapshot(wait: float = 20.0) -> dict:
+    """The last completed collection. Blocks only for the very first one."""
+    if not _snap_ready.is_set():
+        _snap_ready.wait(wait)
+    with _snap_lock:
+        snap = dict(_snapshot)
+    if snap:
+        snap["age"] = max(0, int(time.time()) - snap.get("ts", 0))
+    return snap
+
+
 def main():
     cfg = load_config()
     port = int(os.environ.get("UPSCALE_UI_PORT") or cfg.get("port") or 8790)
     bind = os.environ.get("UPSCALE_UI_BIND") or cfg.get("bind") or "127.0.0.1"
     srv = ThreadingHTTPServer((bind, port), Handler)
     srv.daemon_threads = True
+    threading.Thread(target=snapshot_loop, name="snapshot",
+                     daemon=True).start()
     print(f"upscale-ui on http://{bind}:{port}  (config: {CONFIG_PATH})", flush=True)
     if cfg.get("_error"):
         print(f"WARNING {cfg['_error']}", file=sys.stderr, flush=True)

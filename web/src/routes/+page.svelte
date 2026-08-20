@@ -534,4 +534,48 @@
   .muted { color: #8b93a7; } .small { font-size: .78rem; }
   .mono { font-family: ui-monospace, monospace; font-size: .76rem; }
   .pad { padding: 1.2rem .6rem; }
+
+  /* ---------------------------------------------------------------- phone ---
+     One column, and the table stops being a table. Fixed widths (.dev 10rem,
+     .pr 11rem, ...) add up to far more than a phone is wide, so the page used
+     to scroll sideways with the episode name clipped to nothing.
+
+     Rows become cards: the name is the heading, the small facts wrap
+     underneath it, and the progress bar takes the full width. thead goes to a
+     screen-reader-only box rather than display:none so sorting stays reachable
+     for anything that reads the header row. */
+  @media (max-width: 760px) {
+    thead { position: absolute; width: 1px; height: 1px; margin: -1px;
+      overflow: hidden; clip-path: inset(50%); }
+    table, tbody, tr, td { display: block; width: auto; }
+    tbody tr { border: 1px solid #232838; border-radius: 10px;
+      margin: .5rem .55rem; padding: .5rem .7rem; }
+    tbody tr:focus-visible { outline-offset: 2px; }
+    tbody td { padding: .1rem 0; border-bottom: 0; font-size: .85rem; }
+
+    /* the episode name is the card's heading, so let it wrap in full */
+    .name { max-width: none; white-space: normal; overflow: visible;
+      font-weight: 600; margin-bottom: .15rem; }
+
+    /* the small facts flow inline under it instead of each owning a column */
+    .num, .lib, .dev, .st, .rt, .et {
+      display: inline-flex; align-items: center; width: auto;
+      text-align: left; margin: .1rem .5rem .1rem 0; }
+
+    .pr { display: flex; align-items: center; gap: .4rem; margin-top: .2rem; }
+    .bar2 { flex: 1; width: auto; }
+    .pct { margin-left: 0; }
+
+    /* comfortable touch targets, and a top bar that stacks instead of clipping */
+    .topbar { padding: .5rem .55rem; gap: .45rem; }
+    .counts { flex-wrap: wrap; row-gap: .2rem; }
+    .spacer { flex-basis: 100%; height: 0; }
+    .tb, .selbar button, button.primary, .modal button.ghost { min-height: 2.25rem; }
+    .add { width: 2.4rem; height: 2.4rem; }
+
+    /* a modal centred on a short screen has to be able to scroll */
+    .modal, .modal.wide { width: calc(100vw - 1.2rem);
+      max-height: min(88vh, 100dvh - 2rem); overflow-y: auto; padding: .9rem; }
+    .form { grid-template-columns: 1fr; }
+  }
 </style>
