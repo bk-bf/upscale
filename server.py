@@ -24,6 +24,7 @@ import json
 import os
 import shlex
 import subprocess
+from fnmatch import fnmatch
 import sys
 import threading
 import time
@@ -742,6 +743,87 @@ def host_states(cfg: dict) -> list[dict]:
         return list(ex.map(one, hosts.items()))
 
 
+_ignore_lock = threading.Lock()
+_ignore_cache: dict = {}
+
+
+def ignore_patterns(lib: Path) -> list[str]:
+    """`<library>/.upscaleignore`, the same file the CLI's discovery reads.
+
+    Without this the page lists things the pipeline will never touch: the
+    set-aside directories hold files that still carry an SxxEyy and still sit
+    inside the library, so they read as episodes to anything that only looks at
+    names. Both sides must honour the same file or the page describes work that
+    is not going to happen.
+    """
+    f = lib / ".upscaleignore"
+    try:
+        mtime = f.stat().st_mtime
+    except OSError:
+        return []
+    key = str(f)
+    with _ignore_lock:
+        hit = _ignore_cache.get(key)
+        if hit and hit[0] == mtime:
+            return hit[1]
+    pats = []
+    try:
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                pats.append(line)
+    except OSError:
+        pats = []
+    with _ignore_lock:
+        _ignore_cache[key] = (mtime, pats)
+    return pats
+
+
+def _ignored(lib: Path, p: Path, pats: list[str]) -> bool:
+    # matched against the basename AND the library-relative path, as the CLI does
+    try:
+        rel = str(p.relative_to(lib))
+    except ValueError:
+        return False
+    return any(fnmatch(p.name, pat) or fnmatch(rel, pat) for pat in pats)
+
+
+def tracked_paths(cfg: dict) -> list[str]:
+    """Every episode the configured devices are responsible for.
+
+    One row per episode FILE in a device's library that falls inside that
+    device's range. A delivered episode is included because its master occupies
+    the source's own path - the archive is what says it is finished, and the
+    status rules below already read it.
+    """
+    seen: set = set()
+    out: list = []
+    for _name, h in all_hosts(cfg).items():
+        lib = Path(h.get("src") or "")
+        if not lib.is_dir():
+            continue
+        ext = (h.get("ext") or "mkv").lower().lstrip(".")
+        spec = (h.get("episodes") or "any").lower()
+        pats = ignore_patterns(lib)
+        arc = lib / ".upscale-originals"
+        every, live = [], []
+        for p in lib.rglob(f"*.{ext}"):
+            if _ignored(lib, p, pats):
+                continue
+            every.append(str(p))                 # numbering sees the archive too,
+            if arc not in p.parents:             # so offsets match the CLI's
+                live.append(p)
+        absn = absolute_numbers(every)
+        for p in live:
+            n = absn.get(str(p))
+            if n is None or not ep_in_set(n, spec):
+                continue
+            if str(p) not in seen:
+                seen.add(str(p))
+                out.append(str(p))
+    return out
+
+
 _prov_lock = threading.Lock()
 _prov_cache: dict = {}
 
@@ -816,7 +898,7 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
     assigned = assignments()
     host_labels = {h.get("id", ""): h.get("label", "") for h in host_states}
     rows = []
-    _paths = imports()
+    _paths = tracked_paths(cfg)
     absn = absolute_numbers(_paths)
     owner = device_map(cfg, sorted(set(absn.values())))
     for path in _paths:
