@@ -517,7 +517,12 @@ abs_init(){
     en=${tag##*[Ee]};  en=$((10#$(printf '%s' "$en" | tr -dc '0-9')))
     [ "$sn" -gt 0 ] || continue
     [ "$en" -gt "${_max[$sn]:-0}" ] && _max[$sn]=$en
-  done < <( [ -d "${LIB:-}" ] && find "$LIB" -type f \( -iname '*.mkv' -o -iname '*.avi' \) 2>/dev/null )
+  # Wherever the library lives, not wherever this happens to run. A local-mode
+  # device has the library on the SERVER: scanning its own disk found nothing,
+  # left every offset 0, and turned epnum into per-season numbering - so one
+  # machine read a range differently from every other, silently, and started
+  # working through seasons nobody had asked for.
+  done < <( lib_cmd "[ -d $(printf '%q' "${LIB:-}") ] && find $(printf '%q' "${LIB:-}") -type f \( -iname '*.mkv' -o -iname '*.avi' \) 2>/dev/null || true" 2>/dev/null )
   for k in $(printf '%s\n' "${!_max[@]}" | sort -n); do
     out="$out $k:$acc"
     acc=$(( acc + _max[$k] ))
