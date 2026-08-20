@@ -1518,7 +1518,19 @@ dev_running(){
   ( dev_read "$n" || exit 1
     case "$MODE" in
       local)
-        local q="pgrep -f '[u]pscale run' >/dev/null 2>&1"
+        # WHICH queue, not "is any queue running on that machine". Testing for
+        # `upscale run` on the host gave every local device on one machine the
+        # same answer: a device that had never been started once reported
+        # itself as running, and displayed the episode a DIFFERENT device was
+        # working on - which is exactly the kind of confident wrong answer this
+        # file exists to avoid. cmd_start exports STATE=$HOME/.upscale/state/
+        # <device> into the queue it launches, so that is what says whose it is.
+        local q
+        q='for p in $(pgrep -f "[u]pscale run" 2>/dev/null); do
+             tr "\0" "\n" < /proc/$p/environ 2>/dev/null |
+               grep -qx "STATE=$HOME/.upscale/state/'"$n"'" && exit 0
+           done
+           exit 1'
         if [ -n "$SSH" ]; then
           # shellcheck disable=SC2086
           timeout 20 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 $SSH "$q" 2>/dev/null
