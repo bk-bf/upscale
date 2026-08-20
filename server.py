@@ -742,6 +742,37 @@ def host_states(cfg: dict) -> list[dict]:
         return list(ex.map(one, hosts.items()))
 
 
+_prov_lock = threading.Lock()
+_prov_cache: dict = {}
+
+
+def provenance(lib: Path) -> dict:
+    """`<library>/.provenance.json` -> {relative path: source release filename}.
+
+    Optional, and absent for most libraries. Re-read only when the file's mtime
+    changes, because this is consulted once per row per collection.
+    """
+    f = lib / ".provenance.json"
+    try:
+        mtime = f.stat().st_mtime
+    except OSError:
+        return {}
+    key = str(f)
+    with _prov_lock:
+        hit = _prov_cache.get(key)
+        if hit and hit[0] == mtime:
+            return hit[1]
+    try:
+        data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
+        table = data.get("sources") if isinstance(data, dict) else None
+        table = table if isinstance(table, dict) else {}
+    except (OSError, ValueError):
+        table = {}
+    with _prov_lock:
+        _prov_cache[key] = (mtime, table)
+    return table
+
+
 def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
     """One row per imported FILE.
 
@@ -850,6 +881,11 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
         assigned_to = assigned.get(path, "")
         row = {"n": n, "name": p.name, "path": path, "status": status,
                "library": str(lib), "library_name": lib.name,
+               # What this was built FROM, when the library says so. Empty is a
+               # normal answer - it means nothing recorded a source for it, not
+               # that the file is wrong.
+               "source_name": provenance(lib).get(
+                   str(Path(path).relative_to(lib)) if str(path).startswith(str(lib)) else "", ""),
                "size": p.stat().st_size if p.exists() else 0,
                "assigned": assigned_to,
                # The device column answers "where will this run?", not only

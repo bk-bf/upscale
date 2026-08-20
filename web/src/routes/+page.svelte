@@ -288,8 +288,9 @@
           onclick={(e) => rowClick(e, i, r)}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); rowClick(e, i, r); } }}>
         <td class="num">{r.n ?? "–"}</td>
-        <td class="name" title={r.path}>
+        <td class="name" title={r.source_name ? `${r.path}\nfrom ${r.source_name}` : r.path}>
           <span class="fname">{r.name}</span>
+          {#if r.source_name}<span class="fsrc">← {r.source_name}</span>{/if}
           <span class="fpath">{dir(r.path)}</span>
         </td>
         <td class="lib">{r.library_name}</td>
@@ -477,9 +478,13 @@
   tbody tr:focus-visible { outline: 2px solid #3b82f6; outline-offset: -2px; }
   .num { width: 3rem; color: #8b93a7; text-align: right; font-variant-numeric: tabular-nums; }
   .name { max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .fname, .fpath { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .fpath { font-family: ui-monospace, monospace; font-size: .7rem; color: #6b7280;
+  .fname, .fsrc, .fpath { display: block; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  /* the release the file was built from - brighter than the directory, because
+     this is the line that is actually being checked */
+  .fsrc { font-family: ui-monospace, monospace; font-size: .72rem; color: #7ab6f5;
     margin-top: .1rem; }
+  .fpath { font-family: ui-monospace, monospace; font-size: .7rem; color: #6b7280; }
   .lib { width: 8rem; color: #8b93a7; }
   .dev { width: 10rem; }
   .st { width: 7.5rem; } .pr { width: 11rem; } .rt { width: 5rem; } .et { width: 5rem; }
@@ -565,8 +570,8 @@
     /* the episode name is the card's heading, so let it wrap in full */
     .name { max-width: none; white-space: normal; overflow: visible;
       font-weight: 600; margin-bottom: .15rem; }
-    .fname, .fpath { white-space: normal; overflow: visible; }
-    .fpath { font-weight: 400; overflow-wrap: anywhere; }
+    .fname, .fsrc, .fpath { white-space: normal; overflow: visible; }
+    .fsrc, .fpath { font-weight: 400; overflow-wrap: anywhere; }
 
     /* the small facts flow inline under it instead of each owning a column */
     .num, .lib, .dev, .st, .rt, .et {
