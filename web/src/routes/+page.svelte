@@ -198,6 +198,9 @@
     return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
   };
   const gb = (b) => b ? `${(b / 1073741824).toFixed(1)} GB` : "";
+  // The directory only: the basename is already the line above it, and
+  // repeating it doubles the width of the widest column for nothing.
+  const dir = (p) => (p || "").replace(/\/[^/]*$/, "");
 
   // The rate of the CURRENT phase, in that phase's own unit. fps for anything
   // counting frames, MB/s for the two that move bytes, nothing for a phase with
@@ -285,7 +288,10 @@
           onclick={(e) => rowClick(e, i, r)}
           onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); rowClick(e, i, r); } }}>
         <td class="num">{r.n ?? "–"}</td>
-        <td class="name" title={r.path}>{r.name}</td>
+        <td class="name" title={r.path}>
+          <span class="fname">{r.name}</span>
+          <span class="fpath">{dir(r.path)}</span>
+        </td>
         <td class="lib">{r.library_name}</td>
         <!-- Which GPU machine this episode is on. Blank when nothing is running
              it: guessing a device for queued work would be a promise no
@@ -471,6 +477,9 @@
   tbody tr:focus-visible { outline: 2px solid #3b82f6; outline-offset: -2px; }
   .num { width: 3rem; color: #8b93a7; text-align: right; font-variant-numeric: tabular-nums; }
   .name { max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fname, .fpath { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fpath { font-family: ui-monospace, monospace; font-size: .7rem; color: #6b7280;
+    margin-top: .1rem; }
   .lib { width: 8rem; color: #8b93a7; }
   .dev { width: 10rem; }
   .st { width: 7.5rem; } .pr { width: 11rem; } .rt { width: 5rem; } .et { width: 5rem; }
@@ -556,6 +565,8 @@
     /* the episode name is the card's heading, so let it wrap in full */
     .name { max-width: none; white-space: normal; overflow: visible;
       font-weight: 600; margin-bottom: .15rem; }
+    .fname, .fpath { white-space: normal; overflow: visible; }
+    .fpath { font-weight: 400; overflow-wrap: anywhere; }
 
     /* the small facts flow inline under it instead of each owning a column */
     .num, .lib, .dev, .st, .rt, .et {
