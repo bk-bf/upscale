@@ -798,6 +798,12 @@ def tracked_paths(cfg: dict) -> list[str]:
     """
     seen: set = set()
     out: list = []
+    # Numbering is built from the WHOLE library, never from the tracked subset:
+    # a season's offset is the sum of earlier seasons' highest episode, so if a
+    # device's range happens to exclude the last episode of season 1, season 2
+    # and everything after it shifts down by one - and the row then names the
+    # wrong release file as its source.
+    numbering: dict = {}
     for _name, h in all_hosts(cfg).items():
         lib = Path(h.get("src") or "")
         if not lib.is_dir():
@@ -821,34 +827,46 @@ def tracked_paths(cfg: dict) -> list[str]:
             if str(p) not in seen:
                 seen.add(str(p))
                 out.append(str(p))
-    return out
+        numbering.update(absn)
+    return out, numbering
 
 
 _prov_lock = threading.Lock()
 _prov_cache: dict = {}
 
+# "[BlueLobster] Gintama - 042 [480p].mkv" -> 42
+# "[BlueLobster] Gintama - 001+002 [480p].mkv" -> 1 and 2, for a library that
+# keeps a two-parter as one file.
+_REL_RE = __import__("re").compile(r"-\s(\d{3}(?:\+\d{3})*)\s\[")
 
-def provenance(lib: Path) -> dict:
-    """`<library>/.provenance.json` -> {relative path: source release filename}.
 
-    Optional, and absent for most libraries. Re-read only when the file's mtime
-    changes, because this is consulted once per row per collection.
+def source_index(lib: Path) -> dict:
+    """Absolute episode number -> the release file it was built from.
+
+    Read from the staging directory rather than from a manifest: the file that
+    fed an episode is still sitting there under its own release name, so this
+    is derived from the work and cannot fall out of date the way a
+    hand-maintained list does. Re-read when the directory changes.
     """
-    f = lib / ".provenance.json"
+    d = lib / ".splice-incoming" / "raw"
     try:
-        mtime = f.stat().st_mtime
+        mtime = d.stat().st_mtime
     except OSError:
         return {}
-    key = str(f)
+    key = str(d)
     with _prov_lock:
         hit = _prov_cache.get(key)
         if hit and hit[0] == mtime:
             return hit[1]
+    table: dict = {}
     try:
-        data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
-        table = data.get("sources") if isinstance(data, dict) else None
-        table = table if isinstance(table, dict) else {}
-    except (OSError, ValueError):
+        for f in d.iterdir():
+            m = _REL_RE.search(f.name)
+            if not m:
+                continue
+            for part in m.group(1).split("+"):
+                table[int(part)] = f.name
+    except OSError:
         table = {}
     with _prov_lock:
         _prov_cache[key] = (mtime, table)
@@ -898,8 +916,8 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
     assigned = assignments()
     host_labels = {h.get("id", ""): h.get("label", "") for h in host_states}
     rows = []
-    _paths = tracked_paths(cfg)
-    absn = absolute_numbers(_paths)
+    _paths, _numbering = tracked_paths(cfg)
+    absn = _numbering
     owner = device_map(cfg, sorted(set(absn.values())))
     for path in _paths:
         p = Path(path)
@@ -963,11 +981,9 @@ def queue_rows(cfg: dict, host_states: list[dict]) -> dict:
         assigned_to = assigned.get(path, "")
         row = {"n": n, "name": p.name, "path": path, "status": status,
                "library": str(lib), "library_name": lib.name,
-               # What this was built FROM, when the library says so. Empty is a
-               # normal answer - it means nothing recorded a source for it, not
-               # that the file is wrong.
-               "source_name": provenance(lib).get(
-                   str(Path(path).relative_to(lib)) if str(path).startswith(str(lib)) else "", ""),
+               # What this was built FROM. Empty is a normal answer: it means no
+               # release file for that episode is staged, not that anything is wrong.
+               "source_name": source_index(lib).get(n, ""),
                "size": p.stat().st_size if p.exists() else 0,
                "assigned": assigned_to,
                # The device column answers "where will this run?", not only
