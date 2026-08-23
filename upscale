@@ -195,17 +195,21 @@ run_one(){
   # what comes back from out-<name> is <name>.
   rsh "$dev" "mkdir -p $(printf %q "$rwork")" >/dev/null || return 1
 
-  # Is a worker ALREADY on this file? The worker is started detached, so it
-  # outlives the ssh that launched it and outlives this program. Restarting
-  # here without asking would push the source out from under a running decoder
-  # and start a second worker on the same frames.
+  # ONE FILE PER DEVICE. The worker is started detached, so it outlives the ssh
+  # that launched it and outlives this program: a driver killed mid-episode
+  # leaves it running. Starting anything here while that is true puts two
+  # workers on one GPU - which does not fail, it just halves the rate with
+  # nothing reporting a fault. It happened: 16 upscaler processes where there
+  # should have been 8.
   #
-  # It can be asked by name, because the file kept its name: the worker's
-  # command line carries it.
-  if rsh "$dev" "pgrep -af '[u]pscale-worker process' | grep -qF $(printf %q "$name")"; then
-    phase upscaling
-    say "[$nm] $name: already running there, waiting for it"
+  # So wait for the device to be free, whatever it is working on. Its work is
+  # not lost: the chunks are on its disk and whoever claims that file next
+  # resumes from them.
+  if rsh "$dev" "pgrep -f '[u]pscale-worker process' >/dev/null 2>&1"; then
+    phase waiting
+    say "[$nm] device is busy with work from an earlier run - waiting for it"
     rsh "$dev" "while pgrep -f '[u]pscale-worker process' >/dev/null 2>&1; do sleep 15; done" || true
+    say "[$nm] device free"
   fi
 
   if ! rsh "$dev" "test -s $(printf %q "$rwork/out-$name")" 2>/dev/null; then
