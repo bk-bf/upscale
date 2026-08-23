@@ -1570,7 +1570,7 @@ cmd_device(){
   local name=$1 src=${2:-} dst=${3:-} range=${4:-any}
   shift $(( $# < 4 ? $# : 4 ))
   [ -n "$src" ] || die "usage: upscale device <name> <src> <dst> <range> [--ssh S] [--mode box|local] [--order forward|reverse] [--workers N] [--server ALIAS]"
-  local ssh='' mode='' order=forward workers='' server='' rwork=/root/work ext=mkv work=''
+  local ssh='' mode='' order=forward workers='' server='' rwork=/root/work ext=mkv work='' verify=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --ssh)     ssh=$2;     shift 2 ;;
@@ -1580,6 +1580,7 @@ cmd_device(){
       --server)  server=$2;  shift 2 ;;
       --rwork)   rwork=$2;   shift 2 ;;
       --ext)     ext=$2;     shift 2 ;;
+      --no-verify) verify=0; shift ;;   # configure a machine that is not up yet
       --work)    work=$2;    shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
@@ -1587,7 +1588,7 @@ cmd_device(){
   # A device that cannot be reached is a device that will silently do nothing,
   # so this is checked when it is written rather than when it next runs.
   local worker=''
-  if [ -n "$ssh" ]; then
+  if [ -n "$ssh" ] && [ "$verify" = 1 ]; then
     # shellcheck disable=SC2086
     timeout 25 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=15 $ssh true 2>/dev/null \
       || die "cannot reach $name over ssh: $ssh"

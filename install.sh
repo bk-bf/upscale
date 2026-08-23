@@ -8,7 +8,7 @@
 #
 #   WITH_QUEUE_SERVICE=1 ./install.sh
 #
-# The watch and artwork units are NOT daemons - a timer and two oneshots - so
+# The watch unit is NOT a daemon - a timer and a oneshot - so
 # they are always installed. Nothing here is enabled by this script either way.
 set -euo pipefail
 PREFIX="${PREFIX:-$HOME/.local}"
@@ -31,12 +31,9 @@ inst libexec/upscale-worker             "$PREFIX/libexec/upscale-worker"
 inst libexec/upscale-worker-remote      "$PREFIX/libexec/upscale-worker-remote"
 inst libexec/upscale-watch              "$PREFIX/bin/upscale-watch"
 inst libexec/upscale-guard              "$PREFIX/bin/upscale-guard"
-inst libexec/upscale-artwork            "$PREFIX/bin/upscale-artwork"
 
 install -Dm644 upscale-watch.service   "$UNITS/upscale-watch.service"
 install -Dm644 upscale-watch.timer     "$UNITS/upscale-watch.timer"
-install -Dm644 upscale-artwork.service "$UNITS/upscale-artwork.service"
-install -Dm644 upscale-artwork.timer   "$UNITS/upscale-artwork.timer"
 
 if [ "${WITH_QUEUE_SERVICE:-0}" = 1 ]; then
   MODE=644 inst upscale.service         "$UNITS/upscale.service"
