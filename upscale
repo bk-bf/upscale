@@ -220,6 +220,12 @@ watcher(){ while [ ! -f "$STOP" ]; do snapshot; sleep 5; done; snapshot; }
 trap 'touch "$STOP"; say "stopping after the current file"' INT TERM
 
 say "$(sources | wc -l) file(s) in $SOURCE -> $TARGET, x$SIZE, ${#DEVICES[@]} device(s)"
+# The snapshot is only true while this process is alive. Left behind, it makes
+# the page report a run that ended - the same shape of bug as an abandoned
+# .part being read as a delivery in flight.
+cleanup(){ rm -f "$RUN/state.json"; }
+trap cleanup EXIT
+
 watcher &
 _watch=$!
 for d in "${DEVICES[@]}"; do device_loop "$d" & done
