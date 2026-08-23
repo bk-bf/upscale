@@ -50,6 +50,10 @@ usage: upscale --source DIR --target DIR --device SPEC [--device SPEC ...]
   --target DIR   results are written here under the same filename.
   --device SPEC  an ssh destination: "desktop", or "-p 31174 root@1.2.3.4".
                  Repeatable. Devices run in parallel, one file each.
+                 Write it as NAME=SPEC to give the machine a name, e.g.
+                 --device "rental=-p 31174 root@1.2.3.4" - the name is what
+                 appears in the log and on the page, so a rented box is not a
+                 row of digits.
   --size N       scale factor (default 2).
   --archive DIR  move each source here once its result is written, or
   --delete       delete it. One of the two is required: a source that stays a
@@ -67,7 +71,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --source)  SOURCE=${2:?}; shift 2 ;;
     --target)  TARGET=${2:?}; shift 2 ;;
-    --device)  DEVICES+=("${2:?}"); shift 2 ;;
+    --device)  DEVICES+=("${2:?}"); shift 2 ;;   # [NAME=]SPEC, split at use
     --size)    SIZE=${2:?}; shift 2 ;;
     --archive) ARCHIVE=${2:?}; shift 2 ;;
     --delete)  DELETE=1; shift ;;
@@ -113,6 +117,12 @@ sources(){
   done
 }
 
+# A device may be written NAME=SPEC. The name is a label only - it never
+# decides anything - but it travels with the command, so nothing has to keep a
+# registry to know that "rental" and "-p 31174 root@1.2.3.4" are the same box.
+dev_name(){ case "$1" in [A-Za-z0-9_.-]*=*) printf '%s' "${1%%=*}" ;; *) printf '%s' "$1" ;; esac; }
+dev_spec(){ case "$1" in [A-Za-z0-9_.-]*=*) printf '%s' "${1#*=}" ;; *) printf '%s' "$1" ;; esac; }
+
 key(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 # mkdir is atomic, so two devices asking for the same file cannot both win.
 claim(){   mkdir "$RUN/claim-$(key "$1")" 2>/dev/null; }
@@ -145,10 +155,11 @@ frames(){ ffprobe -v error -select_streams v:0 -count_packets \
 
 # ------------------------------------------------------------------- work ---
 run_one(){
-  local dev=$1 name=$2 st rwork out want got
-  st="$RUN/$(key "$dev")"; mkdir -p "$st"
+  local entry=$1 name=$2 dev nm st rwork out want got
+  dev=$(dev_spec "$entry"); nm=$(dev_name "$entry")
+  st="$RUN/$(key "$nm")"; mkdir -p "$st"
   rwork=$(rsh "$dev" 'printf %s "${UPSCALE_WORK:-$HOME/upscale-work}"' | tr -d '\r') || rwork=
-  [ -n "$rwork" ] || { say "[$dev] unreachable"; return 1; }
+  [ -n "$rwork" ] || { say "[$nm] unreachable"; return 1; }
   printf '%s' "$name" > "$st/file"
   phase(){ printf '%s' "$1" > "$st/phase"; }
 
@@ -157,65 +168,67 @@ run_one(){
   # what comes back from out-<name> is <name>.
   rsh "$dev" "mkdir -p $(printf %q "$rwork")" >/dev/null || return 1
   if ! rsh "$dev" "test -s $(printf %q "$rwork/out-$name")" 2>/dev/null; then
-    phase sending; say "[$dev] $name: sending"
-    push "$dev" "$SOURCE/$name" "$rwork/$name" || { say "[$dev] $name: send failed"; return 1; }
-    phase upscaling; say "[$dev] $name: upscaling"
+    phase sending; say "[$nm] $name: sending"
+    push "$dev" "$SOURCE/$name" "$rwork/$name" || { say "[$nm] $name: send failed"; return 1; }
+    phase upscaling; say "[$nm] $name: upscaling"
     # shellcheck disable=SC2086
     rsh "$dev" "cd $(printf %q "$rwork") && setsid nohup env \
           ${WORKERS:+WORKERS=$WORKERS} ${SCRATCH:+WORK=$(printf %q "$SCRATCH")} \
           ${MODEL:+MODEL=$MODEL} SCALE=$SIZE \
           \$HOME/$WORKER process $(printf %q "$rwork/$name") $(printf %q "$rwork/out-$name") \
           < /dev/null >> $(printf %q "$rwork/log") 2>&1" \
-      || { say "[$dev] $name: upscale failed (see $rwork/log on the device)"; return 1; }
+      || { say "[$nm] $name: upscale failed (see $rwork/log on the device)"; return 1; }
   else
-    say "[$dev] $name: result already on the device, collecting"
+    say "[$nm] $name: result already on the device, collecting"
   fi
 
-  phase retrieving; say "[$dev] $name: retrieving"
+  phase retrieving; say "[$nm] $name: retrieving"
   out="$TARGET/.$name.part"
-  pull "$dev" "$rwork/out-$name" "$out" || { say "[$dev] $name: retrieve failed"; return 1; }
+  pull "$dev" "$rwork/out-$name" "$out" || { say "[$nm] $name: retrieve failed"; return 1; }
 
   # The only check worth making. A truncated transfer is what actually goes
   # wrong, and frame count catches it exactly. WHICH episode this is was never
   # in question.
   want=$(frames "$SOURCE/$name"); got=$(frames "$out")
   if [ -z "$got" ] || [ "$want" != "$got" ]; then
-    say "[$dev] $name: $got frames, source has $want - left as .part, not published"
+    say "[$nm] $name: $got frames, source has $want - left as .part, not published"
     return 1
   fi
 
   mv -f "$out" "$TARGET/$name"
   rsh "$dev" "rm -f $(printf %q "$rwork/$name") $(printf %q "$rwork/out-$name")" >/dev/null 2>&1 || true
-  if [ "$DELETE" = 1 ]; then rm -f "$SOURCE/$name"; say "[$dev] $name: done, source deleted"
-  else mv -f "$SOURCE/$name" "$ARCHIVE/$name"; say "[$dev] $name: done, source archived"; fi
+  if [ "$DELETE" = 1 ]; then rm -f "$SOURCE/$name"; say "[$nm] $name: done, source deleted"
+  else mv -f "$SOURCE/$name" "$ARCHIVE/$name"; say "[$nm] $name: done, source archived"; fi
   rm -f "$st/file" "$st/phase"
 }
 
 # "What is left" is read from the source directory every time, so files added
 # while this runs are simply picked up.
 device_loop(){
-  local dev=$1 name
+  local entry=$1 nm name
+  nm=$(dev_name "$entry")
   while [ ! -f "$STOP" ]; do
-    name=$(next_source) || { say "[$dev] nothing left"; return 0; }
-    run_one "$dev" "$name" || say "[$dev] $name: left in place for a later run"
+    name=$(next_source) || { say "[$nm] nothing left"; return 0; }
+    run_one "$entry" "$name" || say "[$nm] $name: left in place for a later run"
     unclaim "$name"
   done
-  say "[$dev] stopped"
+  say "[$nm] stopped"
 }
 
 # A snapshot for whatever wants to watch: the web UI reads this rather than
 # being told, so there is no second place that decides what is running.
 snapshot(){
-  local d f ph first=1
+  local d f ph nm sp first=1
   { printf '{"source":"%s","target":"%s","size":%s,"devices":[' "$SOURCE" "$TARGET" "$SIZE"
     for d in "${DEVICES[@]}"; do
-      f=$(cat "$RUN/$(key "$d")/file" 2>/dev/null || true)
+      nm=$(dev_name "$d"); sp=$(dev_spec "$d")
+      f=$(cat "$RUN/$(key "$nm")/file" 2>/dev/null || true)
       # The DRIVER's phase, not the worker's. The worker only knows the GPU
       # part; sending and retrieving are this program's doing, and a worker
       # asked mid-push still reports whatever it last did.
-      ph=$(cat "$RUN/$(key "$d")/phase" 2>/dev/null || true)
+      ph=$(cat "$RUN/$(key "$nm")/phase" 2>/dev/null || true)
       [ "$first" = 1 ] || printf ','; first=0
-      printf '{"device":"%s","file":"%s","phase":"%s"}' "$d" "$f" "$ph"
+      printf '{"device":"%s","ssh":"%s","file":"%s","phase":"%s"}' "$nm" "$sp" "$f" "$ph"
     done
     printf '],"ts":%s}' "$(date +%s)"
   } > "$RUN/state.json.tmp" && mv -f "$RUN/state.json.tmp" "$RUN/state.json"
