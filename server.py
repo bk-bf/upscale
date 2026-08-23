@@ -315,7 +315,13 @@ def rows(st: dict, devices: list) -> list:
     the file a device says it has - and it says a name, because the name never
     left it.
     """
-    src, tgt = st.get("source"), st.get("target")
+    # Each device owns a source directory, so a file's device is simply which
+    # directory it is in. Nothing is assigned, guessed or claimed - reassigning
+    # an episode is moving it, and the column can never credit the wrong box.
+    lanes = [(d.get("device", ""), d.get("source", ""), d.get("target", ""))
+             for d in devices if d.get("source")]
+    if not lanes:
+        lanes = [("", st.get("source", ""), st.get("target", ""))]
     # The driver's claim says which row it is working on. The WORKER says what
     # the GPU is actually on, by name, from its own file. While the driver is
     # waiting for a busy device those are different files, and only the second
@@ -324,7 +330,7 @@ def rows(st: dict, devices: list) -> list:
     working = {d.get("episode"): d for d in devices if d.get("episode")}
     out, n = [], 0
 
-    def entry(path: Path, status: str):
+    def entry(path: Path, status: str, lsrc: str = "", ltgt: str = ""):
         nonlocal n
         n += 1
         d = busy.get(path.name)
@@ -344,25 +350,33 @@ def rows(st: dict, devices: list) -> list:
         base.pop("device", None); base.pop("ssh", None); base.pop("file", None)
         return {**base,
                 "n": n, "name": path.name, "path": str(path),
-                "library_name": Path(src).name if src else "",
+                "library_name": Path(lsrc).name if lsrc else "",
                 # Where it lands. A queued row sits in the source directory, so
                 # its own path never shows the destination.
-                "target_dir": tgt or "",
+                "target_dir": "",
                 "status": ("paused" if d.get("paused") else "running") if d else status,
                 "device": d["device"] if d else "",
                 "phase": d.get("phase", "") if d else "",
                 "percent": pct,
                 "size": path.stat().st_size if path.exists() else 0}
 
-    for base, status in ((src, "queued"), (tgt, "done")):
-        if not base:
-            continue
-        p = Path(base)
-        if not p.is_dir():
-            continue
-        for f in sorted(p.iterdir()):
-            if f.is_file() and not f.name.startswith("."):
-                out.append(entry(f, status))
+    seen = set()
+    for owner, lsrc, ltgt in lanes:
+        for base, status in ((lsrc, "queued"), (ltgt, "done")):
+            if not base or (base, status) in seen:
+                continue
+            seen.add((base, status))
+            p = Path(base)
+            if not p.is_dir():
+                continue
+            for f in sorted(p.iterdir()):
+                if f.is_file() and not f.name.startswith("."):
+                    r = entry(f, status, lsrc, ltgt)
+                    r["target_dir"] = ltgt
+                    # a queued file belongs to the device whose directory holds it
+                    if status == "queued" and not r.get("device"):
+                        r["device"] = owner
+                    out.append(r)
     return out
 
 
@@ -373,6 +387,7 @@ def collect() -> dict:
     # A device has a NAME and an ADDRESS, and they are not the same string.
     # Asking "rental" over ssh reaches nothing; the worker lives at its ssh spec.
     named = [(e.get("device", ""), e.get("ssh") or e.get("device", "")) for e in entries]
+    lanes = {e.get("device", ""): (e.get("source", ""), e.get("target", "")) for e in entries}
     expect = {e.get("device", ""): e.get("file", "") for e in entries}
     driver = {e.get("device", ""): e.get("phase", "") for e in entries}
     xfer = {e.get("device", ""): e.get("xfer", "") for e in entries}
@@ -381,7 +396,9 @@ def collect() -> dict:
         with ThreadPoolExecutor(max_workers=min(8, len(named))) as ex:
             devs = list(ex.map(
                 lambda nx: {**device_status(nx[1], expect.get(nx[0], "")),
-                            "device": nx[0], "ssh": nx[1]}, named))
+                            "device": nx[0], "ssh": nx[1],
+                            "source": lanes.get(nx[0], ("", ""))[0],
+                            "target": lanes.get(nx[0], ("", ""))[1]}, named))
         # What the driver is doing wins: it is the one moving the file, and a
         # worker asked during a push still reports its previous phase.
         for dv in devs:
