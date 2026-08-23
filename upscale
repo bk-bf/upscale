@@ -125,8 +125,24 @@ dev_spec(){ case "$1" in [A-Za-z0-9_.-]*=*) printf '%s' "${1#*=}" ;; *) printf '
 
 key(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 # mkdir is atomic, so two devices asking for the same file cannot both win.
-claim(){   mkdir "$RUN/claim-$(key "$1")" 2>/dev/null; }
-unclaim(){ rmdir "$RUN/claim-$(key "$1")" 2>/dev/null || true; }
+# The claim records WHO holds it, because a driver that is killed mid-file
+# would otherwise leave the claim behind for ever - and a claimed file is
+# skipped by every later run, so the episode simply disappears. Same shape as
+# an abandoned .part being read as a delivery in flight.
+claim(){   mkdir "$RUN/claim-$(key "$1")" 2>/dev/null && printf '%s' "$$" > "$RUN/claim-$(key "$1")/pid"; }
+unclaim(){ rm -rf "$RUN/claim-$(key "$1")" 2>/dev/null || true; }
+
+# Claims whose holder is gone are not claims.
+release_stale(){
+  local d owner
+  for d in "$RUN"/claim-*; do
+    [ -d "$d" ] || continue
+    owner=$(cat "$d/pid" 2>/dev/null || true)
+    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$d"
+    fi
+  done
+}
 
 next_source(){
   local b
@@ -265,11 +281,19 @@ watcher(){ while [ ! -f "$STOP" ]; do snapshot; sleep 5; done; snapshot; }
 
 trap 'touch "$STOP"; say "stopping after the current file"' INT TERM
 
+release_stale
 say "$(sources | wc -l) file(s) in $SOURCE -> $TARGET, x$SIZE, ${#DEVICES[@]} device(s)"
 # The snapshot is only true while this process is alive. Left behind, it makes
 # the page report a run that ended - the same shape of bug as an abandoned
 # .part being read as a delivery in flight.
-cleanup(){ rm -f "$RUN/state.json"; }
+cleanup(){
+  local d
+  rm -f "$RUN/state.json"
+  for d in "$RUN"/claim-*; do
+    [ -d "$d" ] && [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] && rm -rf "$d"
+  done
+  return 0
+}
 trap cleanup EXIT
 
 watcher &
