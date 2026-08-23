@@ -32,6 +32,7 @@ DIST = HERE / "web" / "dist"
 RUN = Path(os.environ.get("UPSCALE_STATE", Path.home() / ".upscale")) / "run"
 STATE_JSON = RUN / "state.json"
 WORKER = os.environ.get("UPSCALE_WORKER", ".local/libexec/upscale-worker")
+RUN_LOG = RUN / "run.log"
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
        "-o", "ControlPath=none"]
@@ -48,6 +49,102 @@ def run(cmd, timeout=30):
 
 def ssh_to(spec: str, cmd: str, timeout=20):
     return run(SSH + shlex.split(spec) + [cmd], timeout=timeout)
+
+
+def config() -> dict:
+    try:
+        return json.loads((HERE / "config.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+# ------------------------------------------------------------------ browse ---
+def browse_roots() -> list:
+    return [Path(p) for p in config().get("browse_roots", ["/mnt/media"])]
+
+
+def allowed(p: Path) -> bool:
+    try:
+        r = p.resolve()
+    except OSError:
+        return False
+    return any(r == root or root in r.parents for root in browse_roots())
+
+
+def browse(where: str) -> dict:
+    """Directories under the allowed roots, with a count of what is in them.
+
+    Nothing outside browse_roots is reachable, and only directories are listed -
+    a run takes a directory, not a file.
+    """
+    if not where:
+        return {"path": "", "up": "", "dirs": [
+            {"path": str(r), "name": str(r), "files": 0} for r in browse_roots()]}
+    p = Path(where)
+    if not allowed(p) or not p.is_dir():
+        return {"error": f"not reachable: {where}", "dirs": []}
+    dirs = []
+    try:
+        for d in sorted(p.iterdir()):
+            if d.is_dir() and not d.name.startswith("."):
+                try:
+                    n = sum(1 for f in d.iterdir() if f.is_file() and not f.name.startswith("."))
+                except OSError:
+                    n = 0
+                dirs.append({"path": str(d), "name": d.name, "files": n})
+    except OSError as exc:
+        return {"error": str(exc), "dirs": []}
+    up = str(p.parent) if allowed(p.parent) else ""
+    files = sum(1 for f in p.iterdir() if f.is_file() and not f.name.startswith("."))
+    return {"path": str(p), "up": up, "dirs": dirs, "files": files}
+
+
+# -------------------------------------------------------------------- start ---
+def start_run(body: dict) -> dict:
+    """Build an `upscale` command line and run it.
+
+    The page never decides anything the command would decide. It assembles
+    arguments and execs the binary - so what runs is what you would have typed,
+    and there is one implementation of the rules.
+    """
+    if state():
+        return {"ok": False, "error": "a run is already going"}
+    src, tgt = (body.get("source") or "").strip(), (body.get("target") or "").strip()
+    devices = [d.strip() for d in (body.get("devices") or []) if d and d.strip()]
+    if not src or not tgt:
+        return {"ok": False, "error": "source and target are required"}
+    if not devices:
+        return {"ok": False, "error": "at least one device is required"}
+    for d in (src, tgt):
+        if not allowed(Path(d)):
+            return {"ok": False, "error": f"not reachable: {d}"}
+    argv = [config().get("upscale_bin") or "upscale", "--source", src, "--target", tgt]
+    arch = (body.get("archive") or "").strip()
+    if body.get("delete"):
+        argv.append("--delete")
+    elif arch:
+        if not allowed(Path(arch)):
+            return {"ok": False, "error": f"not reachable: {arch}"}
+        argv += ["--archive", arch]
+    else:
+        return {"ok": False, "error": "choose --archive or --delete: a finished file has to stop being a source"}
+    for k, flag in (("size", "--size"), ("workers", "--workers"),
+                    ("scratch", "--scratch"), ("model", "--model")):
+        v = str(body.get(k) or "").strip()
+        if v:
+            argv += [flag, v]
+    for d in devices:
+        argv += ["--device", d]
+    RUN.mkdir(parents=True, exist_ok=True)
+    try:
+        log = open(RUN_LOG, "ab", buffering=0)
+        # No shell: every argument - including an ssh spec with spaces in it -
+        # is passed through as one word and never re-parsed.
+        subprocess.Popen(argv, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                         start_new_session=True, cwd=str(Path.home()))
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "command": " ".join(shlex.quote(a) for a in argv)}
 
 
 # ------------------------------------------------------------------- state ---
@@ -137,10 +234,16 @@ def collect() -> dict:
     st = state()
     specs = [d.get("device", "") for d in st.get("devices", [])]
     expect = {d.get("device", ""): d.get("file", "") for d in st.get("devices", [])}
+    driver = {d.get("device", ""): d.get("phase", "") for d in st.get("devices", [])}
     devices = []
     if specs:
         with ThreadPoolExecutor(max_workers=min(8, len(specs))) as ex:
             devices = list(ex.map(lambda s: device_status(s, expect.get(s, "")), specs))
+        # What the driver is doing wins: it is the one moving the file, and a
+        # worker asked during a push still reports its previous phase.
+        for dv in devices:
+            if driver.get(dv["device"]):
+                dv["phase"] = driver[dv["device"]]
     r = rows(st, devices)
     return {"source": st.get("source", ""), "target": st.get("target", ""),
             "size": st.get("size", 0), "running": bool(st),
@@ -221,6 +324,15 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/api/queue", "/api/hosts"):
             return self._json(snapshot())
+        if path == "/api/browse":
+            from urllib.parse import parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            return self._json(browse((q.get("path") or [""])[0]))
+        if path == "/api/log":
+            try:
+                return self._json({"log": RUN_LOG.read_text(errors="replace")[-8000:]})
+            except OSError:
+                return self._json({"log": ""})
         if path == "/api/health":
             return self._json({"ok": True, "state": str(STATE_JSON),
                                "running": bool(state())})
@@ -246,6 +358,14 @@ class Handler(BaseHTTPRequestHandler):
             if bad:
                 return self._json({"ok": False, "error": "; ".join(bad)}, 502)
             return self._json({"ok": True, "action": action, "devices": len(devs)})
+        if path == "/api/start":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except (ValueError, OSError) as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            r = start_run(body)
+            return self._json(r, 200 if r.get("ok") else 400)
         if path == "/api/stop":
             try:
                 (RUN / "stop").touch()
@@ -253,13 +373,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": str(exc)}, 500)
             return self._json({"ok": True, "note": "stopping after the current file"})
         return self._json({"error": "not found"}, 404)
-
-
-def config() -> dict:
-    try:
-        return json.loads((HERE / "config.json").read_text())
-    except (OSError, ValueError):
-        return {}
 
 
 def main():
