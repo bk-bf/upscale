@@ -281,41 +281,30 @@ def state() -> dict:
 
 
 def device_status(spec: str, expect: str) -> dict:
-    """What this device says about itself.
+    """What this device says about itself, PASSED THROUGH UNCHANGED.
 
-    An unreachable device is reported as unreachable. It is never rendered as
-    idle: an idle-looking panel for a box that is actually grinding is worse
-    than an error.
+    The worker already emits phase, phase_percent, phase_done, phase_total,
+    phase_unit, phase_elapsed_s, fps, eta_s and the rest. Renaming any of that
+    on the way past is how the page came to ask for fields nothing produced and
+    render a dash: the API answered correctly in a vocabulary only this file
+    spoke. There is one shape, and the worker defines it.
+
+    An unreachable device is reported as unreachable, never as idle.
     """
-    d = {"device": spec, "file": expect, "reachable": False, "phase": "",
-         "state": "", "paused": False, "percent": 0, "rate": "", "eta": "",
-         "done": 0, "total": 0, "unit": "", "fps": 0.0, "eta_s": 0}
+    d = {"device": spec, "ssh": spec, "file": expect, "reachable": False,
+         "phase": "", "state": "", "paused": False, "episode": "",
+         "percent": 0, "phase_percent": -1, "rate": "", "eta": ""}
     rc, out, _ = ssh_to(spec, f"$HOME/{WORKER} status", timeout=20)
     if rc != 0:
         return d
-    d["reachable"] = True
     try:
         j = json.loads(out.strip() or "{}")
     except ValueError:
         return d
-    d.update({k: j.get(k, d[k]) for k in
-              ("phase", "state", "done", "total", "unit", "fps", "eta_s") if k in j})
-    # The worker reports progress for the phase it is IN - extraction is
-    # minutes with no frame upscaled, and a bar pinned at 0% for all of it
-    # reads as stuck.
-    # Prefer the phase's own numbers, but the worker reports phase_total as 0
-    # during extraction, so the episode's frame count is the fallback rather
-    # than a bar stuck at nothing.
-    d["done"] = j.get("phase_done") or j.get("frames_done") or 0
-    d["total"] = j.get("phase_total") or j.get("frames_total") or 0
-    d["unit"] = j.get("phase_unit") or j.get("unit") or "frames"
-    if d["total"]:
-        d["percent"] = int(d["done"] * 100 / d["total"])
-    d["eta_s"] = j.get("phase_eta_s") or j.get("eta_s") or 0
+    d.update(j)                      # verbatim - no translation
+    d["reachable"] = True
+    d["file"] = expect
     d["paused"] = j.get("state") == "paused"
-    for a, b in (("frames_done", "done"), ("frames_total", "total")):
-        if a in j and not d[b]:
-            d[b] = j[a]
     return d
 
 
@@ -327,19 +316,34 @@ def rows(st: dict, devices: list) -> list:
     left it.
     """
     src, tgt = st.get("source"), st.get("target")
+    # The driver's claim says which row it is working on. The WORKER says what
+    # the GPU is actually on, by name, from its own file. While the driver is
+    # waiting for a busy device those are different files, and only the second
+    # one may lend a row its progress.
     busy = {d["file"]: d for d in devices if d.get("file")}
+    working = {d.get("episode"): d for d in devices if d.get("episode")}
     out, n = [], 0
 
     def entry(path: Path, status: str):
         nonlocal n
         n += 1
         d = busy.get(path.name)
+        w = working.get(path.name)
         pct = 0
+        if w and not d:
+            d = w                      # the GPU is on it, whoever claimed it
+        if d and w is None and d.get("phase") not in ("sending", "retrieving", "waiting"):
+            # claimed, but the device is busy with something else
+            d = {**d, "phase": "waiting", "done": 0, "total": 0, "percent": 0,
+                 "fps": 0, "eta_s": 0, "rate": "", "eta": ""}
         if d:
             # during a transfer the percentage is the transfer's; during the
             # upscale it is the worker's frame count
             pct = d.get("percent") or (int(d["done"] * 100 / d["total"]) if d.get("total") else 0)
-        return {"n": n, "name": path.name, "path": str(path),
+        base = dict(d) if d else {}
+        base.pop("device", None); base.pop("ssh", None); base.pop("file", None)
+        return {**base,
+                "n": n, "name": path.name, "path": str(path),
                 "library_name": Path(src).name if src else "",
                 # Where it lands. A queued row sits in the source directory, so
                 # its own path never shows the destination.
@@ -348,13 +352,6 @@ def rows(st: dict, devices: list) -> list:
                 "device": d["device"] if d else "",
                 "phase": d.get("phase", "") if d else "",
                 "percent": pct,
-                "done": d.get("done", 0) if d else 0,
-                "total": d.get("total", 0) if d else 0,
-                "unit": d.get("unit", "") if d else "",
-                "fps": d.get("fps", 0) if d else 0,
-                "rate": d.get("rate", "") if d else "",
-                "eta": d.get("eta", "") if d else "",
-                "eta_s": d.get("eta_s", 0) if d else 0,
                 "size": path.stat().st_size if path.exists() else 0}
 
     for base, status in ((src, "queued"), (tgt, "done")):
@@ -394,16 +391,30 @@ def collect() -> dict:
             dph = driver.get(dv["device"], "")
             if dph in ("sending", "retrieving") or not dv.get("phase"):
                 dv["phase"] = dph or dv.get("phase", "")
-            # A transfer reports its own percentage, rate and ETA. Without them
-            # "sending" for four minutes looks the same as "stuck".
+            # A transfer is a phase like any other, and it is described in the
+            # SAME vocabulary the worker uses - phase_percent, phase_done,
+            # phase_unit, phase_elapsed_s - so the page needs no special case
+            # and no second set of field names.
+            #
+            # rsync: "  199,185,400 100%   19.16MB/s    0:00:09"
             fields = (xfer.get(dv["device"]) or "").split()
+            done = pct = elapsed = 0
             for f in fields:
-                if f.endswith("%") and f[:-1].isdigit():
-                    dv["percent"] = int(f[:-1])
-                elif f.endswith("/s"):
-                    dv["rate"] = f
+                if f.replace(",", "").isdigit() and not done:
+                    done = int(f.replace(",", ""))
+                elif f.endswith("%") and f[:-1].isdigit():
+                    pct = int(f[:-1])
                 elif f.count(":") == 2:
-                    dv["eta"] = f
+                    h, m, sec = f.split(":")
+                    if h.isdigit():
+                        elapsed = int(h) * 3600 + int(m) * 60 + int(sec)
+            if fields:
+                dv["phase_percent"] = pct
+                dv["phase_done"] = done
+                dv["phase_total"] = int(done * 100 / pct) if pct else 0
+                dv["phase_unit"] = "bytes"
+                dv["phase_elapsed_s"] = elapsed
+                dv["percent"] = pct
     if not devs:
         # Nothing running: the machines are still worth showing, so the page can
         # manage them and start a run against one.
