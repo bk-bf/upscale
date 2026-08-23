@@ -310,6 +310,21 @@ def device_status(spec: str, expect: str) -> dict:
     return d
 
 
+EP_RE = __import__("re").compile(r"[Ss](\d+)[Ee](\d+)")
+
+
+def episode_key(name: str):
+    """(season, episode) from the filename, or None.
+
+    The number in the # column has to be a property of the EPISODE, not of the
+    listing. It used to be a running counter assigned while walking the source
+    directory and then the target, so a finished file was renumbered and sorted
+    to the back the moment it moved - the row jumped while you were reading it.
+    """
+    m = EP_RE.search(name)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def rows(st: dict, devices: list) -> list:
     """One row per file: what is in the source directory, then the target.
 
@@ -335,6 +350,7 @@ def rows(st: dict, devices: list) -> list:
     def entry(path: Path, status: str, lsrc: str = "", ltgt: str = ""):
         nonlocal n
         n += 1
+        ek = episode_key(path.name)
         d = busy.get(path.name)
         w = working.get(path.name)
         pct = 0
@@ -351,7 +367,9 @@ def rows(st: dict, devices: list) -> list:
         base = dict(d) if d else {}
         base.pop("device", None); base.pop("ssh", None); base.pop("file", None)
         return {**base,
-                "n": n, "name": path.name, "path": str(path),
+                "n": ek[1] if ek else n,
+                "_sort": ek or (99, 9999 + n),
+                "name": path.name, "path": str(path),
                 "library_name": Path(lsrc).name if lsrc else "",
                 # Where it lands. A queued row sits in the source directory, so
                 # its own path never shows the destination.
@@ -379,6 +397,11 @@ def rows(st: dict, devices: list) -> list:
                     if status == "queued" and not r.get("device"):
                         r["device"] = owner
                     out.append(r)
+    # Sorted by episode, so a file keeps its place when it moves from the
+    # source directory to the target one.
+    out.sort(key=lambda r: (r["_sort"], r["name"]))
+    for r in out:
+        r.pop("_sort", None)
     return out
 
 
