@@ -1,4 +1,27 @@
-# Bugs
+# BUGS.md
+
+**Most of what follows can no longer happen.** The 2026-08 rewrite removed the
+conditions rather than the symptoms, and each entry below is kept because the
+reasoning is worth reading, not because the failure is live.
+
+Gone by construction:
+
+- Anything about telling a source from a delivered output (`SRC_EXT`,
+  `archived_for`, "re-upscaled its own output", "archived the master as the
+  original") — sources and results are now in different directories.
+- Anything about identifying a returned episode (the PSNR check, "wrong
+  episode?", the 20 dB floor) — the file keeps its name the whole way.
+- Anything about ranges, parities or absolute episode numbers disagreeing
+  between machines — there are no ranges.
+- Anything about two collectors clobbering `src.avi` — files are claimed
+  atomically and travel under their own names.
+- Anything about `upscale --status` disagreeing with the queue — that renderer
+  is gone; the web UI reads the run's own snapshot.
+
+Still live: everything about the worker — chunking, resume, scratch, decoder
+behaviour, container timestamps.
+
+---
 
 Everything that went wrong building this, and what fixed it. Written down because
 most of these were silent — the pipeline reported success while producing damaged

@@ -1,1936 +1,228 @@
 #!/usr/bin/env bash
-# upscale — keep upscaling episodes until nothing is left. Self-healing.
+# upscale — send every file in a source directory to a GPU, scale it, write the
+# result to a target directory.
 #
-#   upscale ep R [LIB]   upscale just the episodes in range R and exit.
-#                        No queue, no profiles, no daemon loop.
-#                          upscale ep 1
-#                          upscale ep 5-9
-#                          upscale ep 1 ubuntu:/mnt/media/tv/Bleach
-#   upscale device       list devices, or define one:
-#                          upscale device <name> <src> <dst> <range> [--ssh S]
-#                          upscale device --clear [name]
-#   upscale start <name> run a device, from its config file alone
-#   upscale stop  <name> [--after]  stop now, or after the current episode
-#   upscale skip  <name> abandon the episode it is on; the queue takes the next
-#   upscale run          process everything outstanding, then idle for more
-#   upscale once         process outstanding work, then exit
-#   upscale collect      drive a remote GPU that cannot reach back:
-#                        push source, poll, pull result, verify, publish
-#                        (needs GPUHOST; run this on the SERVER)
-#   upscale --status     live progress bar, rate, ETA and log tail (Ctrl-C to exit)
-#                        piped/non-tty: prints once and exits
-#   upscale --pause      finish the current chunk, then hold
-#   upscale --resume     release a pause
-#   upscale --stop       finish the current episode, then exit
-#   upscale --list       show what is outstanding
-#   upscale --profile N  apply profile N (see --profiles), e.g.
-#                          upscale --profile even run
-#                          upscale --profile catchup --status
-#   upscale --profiles   list available profiles and stop
+#   upscale --source DIR --target DIR --device SPEC [--device SPEC ...]
+#           [--size N] [--archive DIR | --delete] [--workers N] [--scratch DIR]
 #
-# Bare words work too (`upscale status`, `upscale pause`, ...).
+# The whole design is one sentence: a source is a file in the source directory.
+# Take it, upscale it, write the result to the target directory, then move or
+# delete the original so it stops being a source.
 #
-# There is NO saved work list and no progress pointer, deliberately. The queue
-# asks the server what is outstanding every cycle:
+# The previous version kept sources and results in one tree and spent most of
+# itself undoing that. It needed SRC_EXT to guess which files were sources; an
+# archive lookup to tell a delivered master from its own source; ranges,
+# parities and absolute episode numbers to select a subset; .upscaleignore to
+# re-exclude what those wrongly included; and a picture-content identity check
+# because the transfer renamed every file to src.avi, so a returned result could
+# not be matched back by name. Each of those grew its own failures - re-upscaling
+# its own output, archiving a master as an "original", rejecting correct results
+# at 19.6 dB against a 20 dB threshold, two collectors swapping src.avi under
+# each other's running decoder.
 #
-#     an episode needs work  <=>  its source .avi exists
-#                                 AND the matching .mkv does not
+# None of them are decisions this program has to make any more:
+#   * what is a source      -> what is in --source
+#   * is this file finished -> it is in --target, or it is not
+#   * which file is this    -> it kept its name the entire way
+#   * what should I skip    -> move it out of --source
 #
-# So a power cut, a desktop reboot or a server reboot needs no recovery step:
-# whatever is unfinished is still unfinished, and whatever completed is visible
-# as a .mkv and is skipped. Partly-done episodes resume mid-way too, because
-# upscale-ep verifies and skips already-encoded chunks in /mnt/scratch.
-#
-# Ordering: sources already in the archive come first, sources still sitting in
-# the library come last. That is how the already-watched episode 1 is kept
-# visible in Jellyfin and processed at the very end.
-#
-# Transfers overlap compute across episodes - while episode N is on the GPU,
-# N+1 is downloading and N-1 is uploading. The link is only ~2.2 MB/s, so this
-# matters: overlapped it is free, serial it would add ~6 min per episode.
+# What is genuinely hard is kept: the upscale itself is chunked and resumable
+# (libexec/upscale-worker), because an episode is tens of thousands of frames
+# and a machine will be interrupted.
 set -euo pipefail
 
-# Which tunables the caller set explicitly. `upscale --status` runs in a
-# different shell from `PARITY=even upscale run`, so it adopts the queue's
-# recorded configuration (see save_config/load_config) for everything the caller
-# did NOT set here - otherwise it guesses, and a guess of PARITY=any made the
-# status view describe the whole season instead of this machine's half.
-declare -A _from_env=()
-for _v in PARITY EPISODES ORDER WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS; do
-  if [ -n "${!_v+x}" ]; then _from_env[$_v]=1; fi
-done
-unset _v
-
-REMOTE=${REMOTE:-ubuntu}
-LIB=${LIB:-/mnt/media/tv/Bleach}
-ARCHIVE=${ARCHIVE:-$LIB/.upscale-originals}
-WORK=${WORK:-/mnt/scratch/upscale-ep}   # must match the worker's scratch dir
-# EXPORTED, because the worker is a SEPARATE PROCESS carrying the same three
-# names with the same Bleach defaults. Without this, pointing the queue at
-# another library moved only half the pipeline: the worker still archived
-# against /mnt/media/tv/Bleach, so `rel=${SRC_REMOTE#"$LIB"/}` stripped nothing
-# and the original was moved to
-#   /mnt/media/tv/Bleach/.upscale-originals//mnt/media/tv/<other-show>/...
-# Marking them exported here also covers the reassignment `upscale ep` performs
-# when given a library argument.
-export REMOTE LIB ARCHIVE WORK
-LIMIT=${LIMIT:-0}                 # 0 = no limit; used to bound test runs
-IDLE=${IDLE:-300}                 # seconds to wait when there is no work
-STATE=${STATE:-$HOME/.upscale-queue}
-mkdir -p "$STATE"
-QLOG="$STATE/log"
-DEFER=${DEFER:-$STATE/defer}
-# PARITY=even|odd|any - splits the season between two machines so they cannot
-# collide on the same episode. Derived from the SxxEyy number in the filename.
-PARITY=${PARITY:-any}   # basenames listed here are processed LAST
-# The worker keeps its own state dir ($HOME/.upscale-ep) and its own job file.
-# Reading the queue's dir for the worker's job - or the reverse - has caused
-# several wrong-looking status frames; every path below says which one it means.
-EPSTATE=${EPSTATE:-$HOME/.upscale-ep}; FAILED="$STATE/failed"; MAX_FAILS=${MAX_FAILS:-3}; PAUSE="$STATE/pause"; STOP="$STATE/stop"
-# Resolve the worker BY PATH. install.sh puts it in libexec, but this script used
-# to call it as a bare `upscale-ep`, which fails two ways at once: a
-# non-interactive ssh session has no ~/.local/bin on $PATH (so `run` died with
-# "command not found"), and on a machine that still carries the pre-rename
-# worker, the bare name silently ran THAT one instead - the old parity-era copy
-# with no decoder cross-check and no PSNR delivery check.
-WORKER=${WORKER:-}
-if [ -z "$WORKER" ]; then
-  for _w in "$(dirname -- "$(readlink -f -- "$0")")/../libexec/upscale-worker" \
-            "$HOME/.local/libexec/upscale-worker"; do
-    if [ -x "$_w" ]; then WORKER=$_w; break; fi
-  done
-  unset _w
-fi
-[ -n "$WORKER" ] || WORKER=upscale-ep    # last resort: legacy name on $PATH
-
-# The worker keeps its job file in ITS state dir, and that dir is $EPSTATE - not
-# the queue's $STATE. Both are called STATE inside their own script, so invoking
-# the worker without saying which one it should use let it inherit the queue's,
-# and the worker then wrote its job somewhere nothing ever read. The desktop
-# reported the episode it had been killed on 15 hours earlier while visibly
-# upscaling a different one. Every call goes through here so the two cannot
-# drift apart again.
-worker(){ env STATE="$EPSTATE" "$WORKER" "$@"; }
-# Mirrors of the worker's defaults, so --status can report the configuration the
-# episodes actually run with. Deliberately plain shell vars: when the caller did
-# not export them, the worker still owns its own defaults.
-WORKERS=${WORKERS:-8}
-CHUNK=${CHUNK:-2000}
-# Which extensions are SOURCES. Comma or space separated; ".avi" for the DVD-era
-# rips this was built on, "mkv" for a show that arrives as h264/hevc already.
-#
-# Setting this to mkv makes sources and outputs share an extension, which the
-# discovery rule below has to handle explicitly - a delivered file is otherwise
-# indistinguishable from work still to do. See emit().
-SRC_EXT=${SRC_EXT:-avi}
-CONFIG="$STATE/config"
-say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$QLOG" >&2; }
-
-# The queue records what it is actually running with; the status view reads it
-# back. Sharing the state is the fix - the alternative, each side deriving the
-# configuration from its own environment, is what made them disagree.
-save_config(){
-  : "${PROFILE:=}"
-  local v tmp="$CONFIG.$$"
-  { for v in PARITY EPISODES ORDER PROFILE WORKERS CHUNK LIB ARCHIVE REMOTE WORK DEFER EPSTATE MAX_FAILS IDLE LIMIT GPUHOST RWORK RGPUWORK RSCRIPT RPHASE; do
-      printf '%s=%q\n' "$v" "${!v}"
-    done
-    printf 'QUEUE_PID=%q\n' "$$"
-  } > "$tmp" && mv -f "$tmp" "$CONFIG"
-}
-
-load_config(){   # adopt the running queue's config; an explicit env var wins
-  local f line k
-  # $STATE/env is the hand-written predecessor of $CONFIG and is still honoured,
-  # so a queue started before this file existed is still described correctly.
-  for f in "$STATE/env" "$CONFIG"; do
-    [ -r "$f" ] || continue
-    while IFS= read -r line; do
-      k=${line%%=*}
-      case "$k" in
-        PARITY|EPISODES|ORDER|PROFILE|WORKERS|CHUNK|LIB|ARCHIVE|REMOTE|WORK|DEFER|EPSTATE|MAX_FAILS|QUEUE_PID|GPUHOST|RWORK|RGPUWORK|RSCRIPT|RPHASE) ;;
-        *) continue ;;
-      esac
-      if [ -n "${_from_env[$k]:-}" ]; then continue; fi
-      eval "$k=${line#*=}" || true
-    done < "$f"
-  done
-  FAILED="$STATE/failed"
-  return 0
-}
-
-# The library is usually on another machine, but `collect` runs ON the server,
-# where it is local - and `ssh ubuntu` from the server does not resolve. REMOTE=
-# (empty) or `local` means "the library is on this host": same code path, no ssh.
-is_local(){ case "$REMOTE" in ''|local|localhost) return 0 ;; *) return 1 ;; esac; }
-lib_sh(){   # run a script (on stdin) wherever the library lives
-  if is_local; then bash -s; else ssh "$REMOTE" "bash -s"; fi
-}
-lib_cmd(){  # run one command string wherever the library lives
-  if is_local; then bash -c "$1"
-  else ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" "$1"; fi
-}
-
-# Ask the server what is outstanding. Archived sources first, library sources
-# last; both sorted, so the order is stable across restarts.
-discover(){
-  # Build the find expression for SRC_EXT here, in THIS shell, and interpolate
-  # it: %q quotes the globs so they reach find intact instead of being expanded
-  # by whichever shell runs the remote script.
-  local _e SRCFIND=''
-  for _e in ${SRC_EXT//,/ }; do
-    SRCFIND="$SRCFIND -o -iname $(printf '%q' "*.$_e")"
-  done
-  SRCFIND="\\( ${SRCFIND# -o } \\)"
-  lib_sh <<REMOTE_EOF
-set -euo pipefail
-lib=$(printf '%q' "$LIB"); arc=$(printf '%q' "$ARCHIVE")
-# Not everything with a video extension is an episode. Extras, batch files and
-# anything deliberately left alone have no output and never will, so without a
-# way to say so they read as outstanding for ever and the queue offers them on
-# every single cycle.
-#
-# \$LIB/.upscaleignore: one glob per line, '#' comments, blank lines ignored.
-# Matched against the basename AND against the path relative to the library or
-# the archive, so both "*.nfo.avi" and "Specials/*" work.
-ignored(){   # \$1 = source path
-  [ -f "\$lib/.upscaleignore" ] || return 1
-  local pat b rel
-  # Strip the ARCHIVE prefix first: it lives inside the library, so stripping
-  # \$lib first leaves ".upscale-originals/..." and every relative pattern misses.
-  b=\$(basename "\$1"); rel=\${1#"\$arc"/}; rel=\${rel#"\$lib"/}
-  while IFS= read -r pat || [ -n "\$pat" ]; do
-    case "\$pat" in ''|'#'*) continue ;; esac
-    case "\$b"   in \$pat) return 0 ;; esac
-    case "\$rel" in \$pat) return 0 ;; esac
-  done < "\$lib/.upscaleignore"
-  return 1
-}
-# Is there an ARCHIVED original for this identity? That is what tells a delivered
-# output apart from a source when the two share an extension - see emit().
-archived_for(){   # \$1 = SxxEyy (may be empty)   \$2 = basename without extension
-  [ -d "\$arc" ] || return 1
-  if [ -n "\$1" ]; then
-    find "\$arc" -type f -iname "*\$1*" 2>/dev/null | grep -q .
-  else
-    find "\$arc" -type f -name "\$2.*" 2>/dev/null | grep -q .
-  fi
-}
-emit(){ # \$1 = source path, \$2 = directory the .mkv belongs in, \$3 = arc|lib
-  if ignored "\$1"; then return 0; fi
-  base=\$(basename "\${1%.*}")
-  # When SRC_EXT includes mkv, a source and a delivered output look identical:
-  # same extension, same episode identity, same directory. Two rules separate
-  # them, and both are needed.
-  #
-  # 1. An output is not its own proof of completion. The match below must ignore
-  #    the candidate itself, or every mkv source reports "already done".
-  # 2. Once an episode is finished its ORIGINAL is in the archive. So a LIBRARY
-  #    file whose identity already has an archived source is the output, not
-  #    work - otherwise the queue re-upscales its own results for ever.
-  #
-  # Only for library candidates whose extension is the output extension; an .avi
-  # source is never confusable with an .mkv output.
-  ext=\$(printf '%s' "\${1##*.}" | tr 'A-Z' 'a-z')
-  if [ "\$3" = lib ] && [ "\$ext" = mkv ]; then
-    if archived_for "\$(printf '%s' "\$base" | grep -oiE 'S[0-9]+E[0-9]+' | head -1 || true)" "\$base"; then
-      return 0
-    fi
-  fi
-  # Match on EPISODE IDENTITY (SxxEyy), not on the exact filename.
-  #
-  # The delivered file does not keep the source's name. Sonarr re-detects the
-  # quality of the upscaled result and renames "... SDTV.mkv" to
-  # "... HDTV-720p.mkv", so an exact-name test says the episode is still missing
-  # and the queue upscales it again - for ever, every episode, silently.
-  # \`|| se=''\` is load-bearing, exactly as in epkey()/epnum(). grep exits 1 when
-  # the name carries no SxxEyy (the Specials batch file is one), and under
-  # \`set -euo pipefail\` a bare \`var=\$(cmd)\` adopts that status - killing the
-  # whole discovery subshell. One untagged file in the archive therefore made the
-  # entire library report "nothing outstanding", and the else-branch below that
-  # exists to handle specials was never reached.
-  se=\$(printf '%s' "\$base" | grep -oiE 'S[0-9]+E[0-9]+' | head -1) || se=''
-  if [ -n "\$se" ]; then
-    # ! -samefile "\$1": a candidate must not count as its own output.
-    if find "\$2" -maxdepth 1 -iname "*\$se*.mkv" ! -samefile "\$1" 2>/dev/null | grep -q .; then return 0; fi
-    # a delivery in flight for this episode, by identity, for the same reason
-    if find "\$2" -maxdepth 1 -iname ".*\$se*.mkv.part*" -newermt '30 minutes ago' 2>/dev/null | grep -q .; then
-      return 0
-    fi
-  else
-    # no SxxEyy (specials): fall back to the exact name. Same self-match caveat:
-    # with SRC_EXT=mkv the source IS "\$2/\$base.mkv".
-    if [ -f "\$2/\$base.mkv" ] && [ "\$2/\$base.mkv" != "\$1" ]; then return 0; fi
-    if find "\$2" -maxdepth 1 -name ".\$base.mkv.part*" -newermt '30 minutes ago' 2>/dev/null | grep -q .; then
-      return 0
-    fi
-  fi
-  printf '%s\n' "\$1"
-}
-# archived sources -> output goes back to the matching library folder
-if [ -d "\$arc" ]; then
-  find "\$arc" -type f $SRCFIND | sort | while read -r f; do
-    rel=\${f#"\$arc"/}; emit "\$f" "\$lib/\$(dirname "\$rel")" arc
-  done
-fi
-# sources still in the library -> output lands beside them
-find "\$lib" -type f $SRCFIND -not -path "\$lib/.*" | sort | while read -r f; do
-  emit "\$f" "\$(dirname "\$f")" lib
-done
-REMOTE_EOF
-}
-
-# Progress is read from upscale-ep's job file plus a live count of the frames
-# already upscaled in the current chunk, so the bar advances continuously
-# rather than jumping once per chunk.
-bar(){ local p=$1 w=${2:-34} f e i out=''
-  f=$(( p * w / 100 )); [ "$f" -lt 0 ] && f=0; [ "$f" -gt "$w" ] && f=$w
-  e=$(( w - f ))
-  for ((i=0;i<f;i++)); do out+='█'; done
-  for ((i=0;i<e;i++)); do out+='░'; done
-  printf '[%s]' "$out"
-}
-
-ms(){ local s=${1:-0}; [ "$s" -lt 0 ] && s=0; printf '%dm%02ds' "$((s/60))" "$((s%60))"; }
-
-# Host utilisation. Everything here is a local /proc or /sys read - a few
-# hundred microseconds per frame - so it is safe to sample every second.
-# Rate metrics (cpu, net) need two samples, so the first frame shows "-".
-_p_tot=0; _p_idle=0; _p_rx=0; _p_tx=0; _p_t=0
-NETIF=${NETIF:-$(ip route show default 2>/dev/null | awk '{print $5; exit}')}
-# `|| GPUBUSY=""` is load-bearing. Under `set -e` a bare `var=$(cmd)` adopts the
-# command's exit status, and the glob matches nothing on a machine with no GPU -
-# so the whole script exited 2 here, before printing anything at all. That is
-# precisely the machine `collect` is meant to run on: the server.
-GPUBUSY=$(ls /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | head -1) || GPUBUSY=""
-# AMD exposes utilisation through sysfs; NVIDIA does not, and the rented boxes
-# are NVIDIA - so the status showed "gpu -%" on the machine doing the work.
-NVSMI=$(command -v nvidia-smi 2>/dev/null) || NVSMI=""
-GPUDIR=${GPUBUSY%/gpu_busy_percent}
-
-resources(){
-  local tot idle dt didle cpu='-' ram gpu='-' vram='' rx tx now drx='' dtx=''
-  read -r _ a b c d e f g h _ < /proc/stat
-  tot=$((a+b+c+d+e+f+g+h)); idle=$((d+e))
-  if [ "$_p_tot" -gt 0 ]; then
-    dt=$((tot-_p_tot)); didle=$((idle-_p_idle))
-    [ "$dt" -gt 0 ] && cpu=$(( (dt-didle)*100/dt ))
-  fi
-  _p_tot=$tot; _p_idle=$idle
-
-  ram=$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{printf "%.1f/%.1fG", (t-a)/1048576, t/1048576}' /proc/meminfo)
-  if [ -n "$GPUBUSY" ] && [ -r "$GPUBUSY" ]; then
-    gpu=$(cat "$GPUBUSY" 2>/dev/null) || gpu='-'
-  elif [ -n "$NVSMI" ]; then
-    gpu=$("$NVSMI" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1) || gpu='-'
-  fi
-  if [ -r "$GPUDIR/mem_info_vram_used" ]; then
-    vram=$(awk -v u="$(cat "$GPUDIR/mem_info_vram_used")" -v t="$(cat "$GPUDIR/mem_info_vram_total")" \
-      'BEGIN{printf "  vram %.1f/%.1fG", u/1073741824, t/1073741824}')
-  fi
-
-  now=$(date +%s%N)
-  if [ -n "$NETIF" ] && [ -r "/sys/class/net/$NETIF/statistics/rx_bytes" ]; then
-    rx=$(cat "/sys/class/net/$NETIF/statistics/rx_bytes")
-    tx=$(cat "/sys/class/net/$NETIF/statistics/tx_bytes")
-    if [ "$_p_t" -gt 0 ]; then
-      drx=$(awk -v x="$((rx-_p_rx))" -v s="$(( (now-_p_t)/1000000 ))" 'BEGIN{printf "%.1f", (s>0)?x*8/s/1000:0}')
-      dtx=$(awk -v x="$((tx-_p_tx))" -v s="$(( (now-_p_t)/1000000 ))" 'BEGIN{printf "%.1f", (s>0)?x*8/s/1000:0}')
-    fi
-    _p_rx=$rx; _p_tx=$tx; _p_t=$now
-  fi
-  printf 'cpu %3s%%   ram %s   gpu %3s%%%s   net %s v %s ^ Mbit/s\033[K\n' \
-    "$cpu" "$ram" "$gpu" "$vram" "${drx:--}" "${dtx:--}"
-}
-
-# --- transfers ---------------------------------------------------------------
-# The worker downloads to $WORK/<base>/src.part and uploads to a hidden
-# .<base>.mkv.part beside the destination (rsync may add its own .<name>.XXXXXX
-# temp on top of that). Both remote lookups are ssh round-trips, so they run on
-# a poll schedule, never per frame.
-
-# Am I the GPU box rather than a queue? On the box the transfers still exist -
-# the collector pushes a source in and pulls a result out - but they are in
-# different places and belong to the other end. Without this the box drew no
-# transfer bars at all, because it was being asked the queue's questions ("which
-# file is MY rsync sending, and how big is it on the server?") and had no answer.
-is_box(){ [ -z "${GPUHOST:-}" ] && [ -n "${RWORK:-}" ] && [ -d "${RWORK:-/nonexistent}" ]; }
-
-download_part(){       # the local partial of the source being fetched, if any
-  if is_box; then
-    # ONLY the partial. rsync renames .src.avi.XXXXXX to src.avi the moment the
-    # push completes, so matching the finished name too left a "download" on
-    # screen for the entire episode after the transfer had ended.
-    find "$RWORK" -maxdepth 1 -name '.src.avi.*' -type f \
-         -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
-    return 0
-  fi
-  # rsync writes .src.part.XXXXXX while the transfer runs and only renames it to
-  # src.part when it is interrupted, so looking for 'src.part' alone meant the
-  # download line was missing for the whole of a healthy download.
-  find "$WORK" -maxdepth 2 \( -name 'src.part' -o -name '.src.part.*' \) -type f \
-       -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
-}
-
-fetch_target(){        # $1 = base name -> remote size of the source being fetched
-  # The box cannot see the library, so it cannot know how big the incoming file
-  # is - the collector writes it down when it starts pushing.
-  if is_box; then cat "$RWORK/srcsize" 2>/dev/null; return 0; fi
-  lib_cmd "find $(printf '%q' "$LIB") -name $(printf '%q' "$1.avi") -printf '%s\n' 2>/dev/null | head -1" 2>/dev/null
-}
-
-worker_src(){          # the source the per-episode worker is processing, if any
-  # Used before the worker has written its job file, so the episode has a name
-  # on screen while its frames are still being counted. The worker's own name is
-  # not hard-coded: the last .avi argument on its command line is the source.
-  local pid a last
-  for pid in $(pgrep -f '(upscale-ep|upscale-worker|upscale) process' 2>/dev/null || true); do
-    [ -r "/proc/$pid/cmdline" ] || continue
-    last=''
-    while IFS= read -r -d '' a; do
-      case "$a" in *.avi) last=$a ;; esac
-    done < "/proc/$pid/cmdline" || true
-    if [ -n "$last" ]; then printf '%s\n' "$last"; return 0; fi
-  done
-  return 0
-}
-
-upload_file(){         # the local .mkv rsync is delivering right now, if any
-  if is_box; then [ -f "$RWORK/out.mkv" ] && printf '%s\n' "$RWORK/out.mkv"; return 0; fi
-  local pid a
-  for pid in $(pgrep -x rsync 2>/dev/null || true); do
-    [ -r "/proc/$pid/cmdline" ] || continue
-    while IFS= read -r -d '' a; do
-      case "$a" in
-        *.mkv) if [ -f "$a" ]; then printf '%s\n' "$a"; return 0; fi ;;
-      esac
-    done < "/proc/$pid/cmdline" || true
-  done
-  # rsync between retries, or just about to start: deliveries are serialised, so
-  # the oldest finished episode still in $WORK is the one on its way out.
-  find "$WORK" -maxdepth 2 -name '*.mkv' -not -name '.*' -type f -printf '%T@ %p\n' 2>/dev/null |
-    sort -n | head -1 | cut -d' ' -f2-
-}
-
-upload_size(){         # $1 = base name -> size of ITS remote partial, or nothing
-  # On the box the receiver is the server, and how much of the file has ARRIVED
-  # there is not knowable from here. Rather than invent a percentage, the box
-  # reports the result as ready-and-being-collected; the true two-sided bar is
-  # in the collector's own view, which is the only place both numbers exist.
-  if is_box; then return 0; fi
-  # Matching by name is the point. Taking whatever `find -name '.*.mkv.part*'`
-  # printed first picked up partials left behind by interrupted deliveries of
-  # OTHER episodes, which is where "106%  487/457 MB" came from.
-  #
-  # Two files can match: the worker's own .BASE.mkv.part and, while rsync is
-  # actually running, its .BASE.mkv.part.XXXXXX temp. The one being written now
-  # is the freshly modified one - and it is the only one that reflects progress,
-  # because a resumed transfer keeps the old (larger) partial as its basis file.
-  lib_cmd "find $(printf '%q' "$LIB") \\( -name $(printf '%q' ".$1.mkv.part*") -o -name $(printf '%q' "..$1.mkv.part*") \\) -printf '%T@ %s\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2" 2>/dev/null
-}
-
-# Transfer rate, elapsed and ETA, keyed on the file so a new transfer starts a
-# fresh measurement instead of inheriting the previous one's rate.
-#
-# This MUST be called as a plain command and read back from $XFER. The previous
-# version was called from "$(xfer_eta ...)" inside printf's arguments - a
-# subshell - so every sample it recorded was thrown away when the subshell
-# exited and the line never left "measuring". (The same trap is documented for
-# render below; it applies to anything that keeps state between frames.)
-# The rate is the average since the first sample of this file, so it survives
-# the upload byte count only refreshing once per poll.
-declare -A _xf_key=() _xf_t0=() _xf_b0=() _xf_tl=() _xf_bl=() _xf_rate=() _xf_eta=()
-XFER=''
-xfer_eta(){   # $1=dl|up  $2=key  $3=bytes now  $4=total  -> sets $XFER
-  local w=$1 key=$2 now=$3 tot=$4 t dt db left el rc eta
-  t=$(date +%s)
-  if [ "${_xf_key[$w]:-}" != "$key" ]; then           # new file: start over
-    _xf_key[$w]=$key; _xf_t0[$w]=$t; _xf_b0[$w]=$now
-    _xf_tl[$w]=$t;    _xf_bl[$w]=$now; _xf_rate[$w]=''; _xf_eta[$w]=0
-    XFER='   measuring'; return 0
-  fi
-  # Measure between the moments the byte count MOVED. The upload figure only
-  # refreshes on the transfer poll, so averaging up to "now" would make the rate
-  # sag between polls and jump back on each one.
-  if [ "$now" != "${_xf_bl[$w]}" ]; then _xf_bl[$w]=$now; _xf_tl[$w]=$t; fi
-  dt=$(( ${_xf_tl[$w]} - ${_xf_t0[$w]} )); db=$(( ${_xf_bl[$w]} - ${_xf_b0[$w]} ))
-  if [ "$dt" -ge 2 ] && [ "$db" -gt 0 ]; then
-    left=$(( tot - now )); if [ "$left" -lt 0 ]; then left=0; fi
-    _xf_rate[$w]=$(( db * 100 / dt / 1048576 ))       # hundredths of a MB/s
-    _xf_eta[$w]=$(( left * dt / db ))                 # seconds, integer maths
-  fi
-  if [ -z "${_xf_rate[$w]}" ]; then XFER='   measuring'; return 0; fi
-  # elapsed is wall clock, so it keeps ticking between polls
-  el=$(( t - ${_xf_t0[$w]} )); rc=${_xf_rate[$w]}; eta=${_xf_eta[$w]}
-  printf -v XFER '   %d.%02d MB/s  elapsed %dm%02ds  eta %dm%02ds' \
-    "$(( rc / 100 ))" "$(( rc % 100 ))" "$(( el / 60 ))" "$(( el % 60 ))" \
-    "$(( eta / 60 ))" "$(( eta % 60 ))"
-  return 0
-}
-
-# --- candidate selection ------------------------------------------------------
-# ONE implementation of "what would the run loop do", used by the run loop, by
-# --list and by --status. When these were separate copies they drifted, and the
-# status view started counting - and offering - episodes this machine will never
-# touch.
-# Sort key for ORDER, NOT for EPISODES matching. epnum() is per-season on
-# purpose - "even" means even episode number within its season - but ordering
-# across a multi-season library needs the season too, or S04E28 sorts above
-# S05E01 and "start from the back" starts in the middle.
-epkey(){               # $1 = basename -> season*1000 + episode, 0 when unnumbered
-  local se s e
-  se=$(printf '%s' "$1" | grep -oiE 'S[0-9]+E[0-9]+' | head -1) || se=''
-  if [ -z "$se" ]; then printf '0'; return 0; fi
-  s=$(printf '%s' "$se" | sed -E 's/^[Ss]0*([0-9]+)[Ee].*/\1/')
-  e=$(printf '%s' "$se" | sed -E 's/.*[Ee]0*([0-9]+)$/\1/')
-  printf '%s' "$(( 10#${s:-0} * 1000 + 10#${e:-0} ))"
-}
-
-# ABSOLUTE episode numbers, so a range means the same thing here as on screen.
-#
-# SxxEyy gives the number WITHIN its season, so every season restarted at 1:
-# `--range 232-316` matched nothing while the UI displayed exactly those numbers.
-# The offset for a season is the sum of the highest episode number in each
-# earlier season - from episode numbers, not file counts, so a season with a
-# missing file does not shift everything after it.
-#
-# Computed ONCE and exported. epnum() is called as $(epnum ...) - a subshell -
-# so a memo held in a variable never survives, and the first attempt re-scanned
-# the entire library for every candidate and took minutes to list 273 episodes.
-abs_init(){
-  # Keyed by the library it was computed FROM. The value is exported so subshells
-  # can use it, which means a parent process computes it for one library and the
-  # child inherits it for another: `upscale start` built it from the saved config
-  # (Bleach) and handed it to a collector running on Gintama, whose ranges then
-  # matched nothing. A memo that outlives its input is not a memo.
-  case "${ABS_OFF_STR:-}" in
-    "${LIB:-}|"*) return 0 ;;
-    *) ABS_OFF_STR='' ;;
-  esac
-  local f b tag sn en k acc=0 out=''
-  declare -A _max=()
-  while IFS= read -r f; do
-    b=${f##*/}
-    tag=$(printf '%s' "$b" | grep -oiE 'S[0-9]+E[0-9]+' | head -1) || tag=''
-    [ -n "$tag" ] || continue
-    sn=${tag%%[Ee]*}; sn=$((10#$(printf '%s' "$sn" | tr -dc '0-9')))
-    en=${tag##*[Ee]};  en=$((10#$(printf '%s' "$en" | tr -dc '0-9')))
-    [ "$sn" -gt 0 ] || continue
-    [ "$en" -gt "${_max[$sn]:-0}" ] && _max[$sn]=$en
-  # Wherever the library lives, not wherever this happens to run. A local-mode
-  # device has the library on the SERVER: scanning its own disk found nothing,
-  # left every offset 0, and turned epnum into per-season numbering - so one
-  # machine read a range differently from every other, silently, and started
-  # working through seasons nobody had asked for.
-  done < <( lib_cmd "[ -d $(printf '%q' "${LIB:-}") ] && find $(printf '%q' "${LIB:-}") -type f \( -iname '*.mkv' -o -iname '*.avi' \) 2>/dev/null || true" 2>/dev/null )
-  for k in $(printf '%s\n' "${!_max[@]}" | sort -n); do
-    out="$out $k:$acc"
-    acc=$(( acc + _max[$k] ))
-  done
-  ABS_OFF_STR="${LIB:-}|$out "
-  export ABS_OFF_STR
-}
-
-epnum(){               # $1 = basename -> ABSOLUTE episode number, 0 when there is none
-  local tag sn en off
-  tag=$(printf '%s' "$1" | grep -oiE 'S[0-9]+E[0-9]+' | head -1) || tag=''
-  if [ -z "$tag" ]; then printf '0'; return 0; fi
-  sn=${tag%%[Ee]*}; sn=$((10#$(printf '%s' "$sn" | tr -dc '0-9')))
-  en=${tag##*[Ee]};  en=$((10#$(printf '%s' "$en" | tr -dc '0-9')))
-  # Pure string lookup: no subprocess, no rescan.
-  abs_init
-  case "${ABS_OFF_STR:-}" in
-    *" $sn:"*) off=${ABS_OFF_STR#*" $sn:"}; off=${off%% *} ;;
-    *)         off=0 ;;
-  esac
-  printf '%s' "$(( off + en ))"
-}
-
-
-PROFILE=${PROFILE:-}
-PROFILE_DIR=${PROFILE_DIR:-$STATE/profiles}
-EPISODES=${EPISODES:-${PARITY:-any}}      # PARITY kept as an alias for back-compat
-
-# Does episode number $1 belong to the set $2?
-#   any | even | odd | 3 | 9-12 | 20- | -9 | any comma-separated mix
-# Terms compose as AND across kinds: "odd,1-10" is odd AND within 1-10, so a
-# profile can say "the odd half, but only the first ten" without new syntax.
-ep_in_set(){
-  local n=$1 set=$2 term kindmatch=1 rangeseen=0 rangematch=0
-  if [ -z "$set" ] || [ "$set" = any ]; then return 0; fi
-  local IFS=,
-  for term in $set; do
-    case "$term" in
-      any)  ;;
-      even) if [ $((n % 2)) -ne 0 ]; then kindmatch=0; fi ;;
-      odd)  if [ $((n % 2)) -eq 0 ]; then kindmatch=0; fi ;;
-      *-*)  rangeseen=1
-            local lo=${term%-*} hi=${term#*-}
-            lo=${lo:-0}; hi=${hi:-999999}
-            if [ "$n" -ge "$((10#$lo))" ] && [ "$n" -le "$((10#$hi))" ]; then rangematch=1; fi ;;
-      ''|*[!0-9]*) ;;                       # ignore junk rather than matching everything
-      *)    rangeseen=1
-            if [ "$n" -eq "$((10#$term))" ]; then rangematch=1; fi ;;
-    esac
-  done
-  if [ "$kindmatch" -eq 0 ]; then return 1; fi
-  if [ "$rangeseen" -eq 1 ] && [ "$rangematch" -eq 0 ]; then return 1; fi
-  return 0
-}
-
-load_profile(){        # $1 = profile name; sets EPISODES/WORKERS/... from its file
-  local f="$PROFILE_DIR/$1.conf"
-  if [ ! -f "$f" ]; then
-    printf 'upscale: no such profile "%s"\n\navailable:\n' "$1" >&2
-    ls -1 "$PROFILE_DIR" 2>/dev/null | sed 's/\.conf$/  /;s/^/  /' >&2 || true
-    exit 1
-  fi
-  # shellcheck disable=SC1090
-  . "$f"
-  # A profile is an explicit choice, so it must outrank the configuration the
-  # running queue recorded. Without this, load_config() overwrote REMOTE=local
-  # from the profile with the saved `ubuntu` and every lookup went back down an
-  # ssh hop that does not resolve from the server.
-  local _k
-  while IFS= read -r _k; do
-    [ -n "$_k" ] && _from_env[$_k]=1
-  done < <(sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p' "$f")
-  EPISODES=${EPISODES:-any}
-}
-
-profiles_seed(){       # create the obvious ones on first use
-  mkdir -p "$PROFILE_DIR"
-  [ -f "$PROFILE_DIR/all.conf" ]  || printf '%s\n' \
-    '# Every episode, lowest number first. Pair this with a machine running' \
-    '# "backwards" and the two converge on the middle, with the next episode to' \
-    '# watch always coming from this one.' \
-    'EPISODES=any' 'ORDER=forward' > "$PROFILE_DIR/all.conf"
-  [ -f "$PROFILE_DIR/backwards.conf" ] || printf '%s\n' \
-    '# Every episode, HIGHEST first - the other end of a two-machine split.' \
-    '# Preferred over even/odd: if this machine stalls, the sequence the viewer' \
-    '# is actually watching keeps advancing, instead of gaining a permanent hole.' \
-    'EPISODES=any' 'ORDER=reverse' > "$PROFILE_DIR/backwards.conf"
-  [ -f "$PROFILE_DIR/even.conf" ] || printf '%s\n' \
-    '# Even half. Splits throughput evenly but NOT sequentially: a stall here' \
-    '# leaves gaps the other machine will never fill. Prefer all/backwards.' \
-    'EPISODES=even' > "$PROFILE_DIR/even.conf"
-  [ -f "$PROFILE_DIR/odd.conf" ]  || printf '%s\n' \
-    '# Odd half - see the caveat in even.conf.' 'EPISODES=odd' > "$PROFILE_DIR/odd.conf"
-}
-
-# ORDER=forward starts at the lowest-numbered outstanding episode; ORDER=reverse
-# starts at the highest. Two machines pointed at the SAME set (EPISODES=any) but
-# opposite orders converge on the middle from both ends, which keeps the next
-# episode to watch always coming from the forward one - unlike an even/odd split,
-# where a stalled machine leaves a permanent hole in the sequence.
-ORDER=${ORDER:-forward}
-
-select_todo(){         # stdin: discovered sources -> this machine's half, in the
-  local c cb n late=() early=()  # order the run loop takes them (deferred last)
-  while IFS= read -r c; do
-    if [ -z "$c" ]; then continue; fi
-    cb=$(basename "${c%.*}")
-    if [ "${EPISODES:-any}" != any ]; then
-      n=$(epnum "$cb") || n=0
-      if [ "$n" -eq 0 ]; then continue; fi              # unnumbered: skip
-      if ! ep_in_set "$n" "$EPISODES"; then continue; fi
-    fi
-    # Watch order beats disk order: anything listed in $DEFER (already watched,
-    # or known-bad and being redone) is pushed to the back. -f treats each DEFER
-    # line as a pattern to look for IN the basename, which is the direction that
-    # lets a short prefix match a long episode title.
-    if [ -s "$DEFER" ] && printf '%s' "$cb" | grep -qFf "$DEFER" 2>/dev/null
-      then late+=("$c"); else early+=("$c"); fi
-  done
-  # Reverse means HIGHEST EPISODE NUMBER first, not "the list backwards". The
-  # discovered order is archive-then-library, and episode 1 is deliberately the
-  # one left in the library - so simply reversing the list handed the reverse
-  # queue episode 1, the single episode it must never take.
-  #
-  # Deferred episodes stay last in both directions: they are already watched or
-  # being redone, and must never displace the episode a queue is racing towards.
-  emit_ordered(){       # $@ = paths, ordered by episode number descending
-    local x
-    for x in "$@"; do
-      [ -n "$x" ] || continue
-      printf '%s\t%s\n' "$(epkey "$(basename "${x%.*}")" || echo 0)" "$x"
-    done | sort -k1,1rn -s | cut -f2-
-  }
-  if [ "$ORDER" = reverse ]; then
-    if [ "${#early[@]}" -gt 0 ]; then emit_ordered "${early[@]}"; fi
-    if [ "${#late[@]}" -gt 0 ];  then emit_ordered "${late[@]}"; fi
-  else
-    if [ "${#early[@]}" -gt 0 ]; then printf '%s\n' "${early[@]}"; fi
-    if [ "${#late[@]}" -gt 0 ];  then printf '%s\n' "${late[@]}"; fi
-  fi
-  # A function's status is its LAST command, and that last `if` test is false
-  # whenever nothing is deferred - so this returned 1 on a perfectly good run,
-  # `upscale --list` exited 1 under set -e, and anything checking that exit code
-  # concluded the queue was broken.
-  return 0
-}
-
-runnable(){            # stdin: candidates -> the ones the run loop would start
-  local c cb fc
-  while IFS= read -r c; do
-    if [ -z "$c" ]; then continue; fi
-    cb=$(basename "${c%.*}")
-    # Already processed and merely awaiting upload. Still "outstanding" from the
-    # server's point of view, but re-selecting it would spin instead of starting
-    # the next episode, losing the transfer overlap.
-    if [ -f "$WORK/$cb/$cb.mkv" ]; then continue; fi
-    fc=$(grep -cFx "$c" "$FAILED" 2>/dev/null) || fc=0
-    if [ "${fc:-0}" -ge "$MAX_FAILS" ]; then continue; fi
-    printf '%s\n' "$c"
-  done
-  return 0          # same trap: the loop's last test must not become the status
-}
-
-# --- one place decides what a status line looks like -------------------------
-# The local view and the collector view describe different machines but are the
-# same tool, and they drifted into looking like two different programs. Every
-# line in both goes through these, so the columns line up and a change to the
-# style lands in both at once.
-line_title(){ printf '\033[1m%s\033[0m\033[K\n' "$1"; }
-line_prog(){   # label pct done total unit
-  printf '%-8s %s %3d%%   %s/%s %s\033[K\n' "$1" "$(bar "$2" 20)" "$2" "$3" "$4" "${5:-frames}"
-}
-line_note(){ printf '         %s\033[K\n' "$1"; }        # the detail under a bar
-line_kv(){   printf '%-8s %s\033[K\n' "$1" "$2"; }
-
-render(){
-  # Everything the network poll gathered arrives in globals: OUTSTANDING, RUNQ,
-  # FETCHTOTAL, UPFILE, UPLOAD. The job file is the WORKER's ($EPSTATE), not the
-  # queue's ($STATE); the two have been confused before.
-  local n=${OUTSTANDING:-?} JOB="$EPSTATE/job"
-
-  # What is the pipeline actually doing? Processing is only one of four states;
-  # reporting "idle" while a 400 MB upload is in flight is what this fixes.
-  # An upload and a fetch overlap by design, so they are tested independently -
-  # as an elif, a simultaneous download was simply never reported.
-  local act=""
-  if pgrep -f 'realesrgan-ncnn-vulkan|upscale-ep process|upscale _process' >/dev/null 2>&1; then act=processing; fi
-  if is_box; then
-    # On the box the transfers are the other end's: the collector pushes a source
-    # IN and pulls a result OUT. Calling an incoming push "uploading" - which is
-    # what the queue's wording did here - describes the opposite of what is
-    # happening, on the machine where it is easiest to misread.
-    if pgrep -f '[r]sync --server.*avi' >/dev/null 2>&1; then act="${act:+$act + }receiving source"; fi
-    if pgrep -f '[r]sync --server.*mkv' >/dev/null 2>&1; then act="${act:+$act + }sending result"; fi
-  else
-    if pgrep -f '[r]sync .*mkv' >/dev/null 2>&1; then act="${act:+$act + }uploading"; fi
-    if pgrep -f '[r]sync .*avi' >/dev/null 2>&1; then act="${act:+$act + }fetching"; fi
-  fi
-  if [ -z "$act" ]; then
-    if pgrep -f '[u]pscale run|[u]pscale once' >/dev/null 2>&1
-      then act="waiting for work"; else act="not running"; fi
-  fi
-
-  # --- download -------------------------------------------------------------
-  local part psz tsz pc
-  part=$(download_part) || part=''
-  if [ -n "$part" ]; then
-    psz=$(stat -c%s "$part" 2>/dev/null) || psz=0; tsz=${FETCHTOTAL:-0}
-    if [ "$tsz" -gt 0 ]; then
-      pc=$(( psz*100/tsz )); if [ "$pc" -gt 100 ]; then pc=100; fi
-      xfer_eta dl "$part" "$psz" "$tsz"
-      # never report more than the whole file, however the sizes were sampled
-      if [ "$psz" -gt "$tsz" ]; then psz=$tsz; fi
-      printf 'download %s %3d%%   %s/%s MB%s\033[K\n' "$(bar "$pc" 20)" \
-        "$pc" "$((psz/1048576))" "$((tsz/1048576))" "$XFER"
-    else
-      printf 'download %s MB so far   %s\033[K\n' "$((psz/1048576))" \
-        "$(if is_box; then cat "$RWORK/episode" 2>/dev/null | cut -c1-40
-           else basename "$(dirname "$part")" | cut -c1-28; fi)"
-    fi
-  fi
-
-  # --- the episode on this machine ------------------------------------------
-  # An episode passes through four phases and only ONE of them is upscaling:
-  #   1 counting frames + decoder cross-check   (no job file yet, a few seconds)
-  #   2 extracting the source to PNGs           (~2 min, GPU idle)
-  #   3 upscaling, chunk by chunk               (the GPU work)
-  #   4 encoding / muxing the result
-  # Phase 2 used to render as "upscale [░░░░] 0%  0/33435 frames, 0.0 fps" with
-  # the GPU at 0% for two minutes, which reads as a hang. Each phase now says
-  # what it is doing, with a bar wherever the progress is countable.
-  #
-  # Scoped so the job file's values cannot leak into the next frame: without
-  # this, SRC survived the job being deleted and "next" kept excluding an
-  # episode that had already finished.
-  local SRC='' TOTAL=0 CHUNK="${CHUNK:-2000}" SEGDIR='' UPDIR='' PID='' DONE=0
-  local wsrc=''
-  wsrc=$(worker_src) || wsrc=''
-  if [ -f "$JOB" ]; then
-    # shellcheck disable=SC1090
-    . "$JOB"
-    # A finished episode's work directory has been cleaned, so every count-based
-    # measure reads zero. Without this the bar sat at 0% with 0.0 fps for the
-    # whole delivery - which looks exactly like a hang, and was reported as one.
-    if [ "${DONE:-0}" = 1 ]; then
-      line_title "$(basename "${SRC%.*}")"
-      line_prog upscale 100 "${TOTAL:-0}" "${TOTAL:-0}"
-      line_note "finished - the result is being collected"
-    else
-    local segs=0 inflight=0 df pct chunks el fps eta fdir extracted=0 phase=upscale t0 fmt gpu_busy=0
-    if pgrep -f realesrgan-ncnn-vulkan >/dev/null 2>&1; then gpu_busy=1; fi
-    # a job file can outlive its work dir (cleaned up, or a killed run); treat a
-    # missing SEGDIR as no progress rather than reporting a stale 100%
-    if [ -d "$SEGDIR" ]; then
-      segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
-      local up="${UPDIR:-$WORK/$(basename "${SRC%.*}")/up}"
-      [ -d "$up" ] && inflight=$(find "$up" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l)
-      [ "$inflight" -ge "$CHUNK" ] && inflight=0
-      df=$(( segs * CHUNK + inflight )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
-      [ "${_hw_src:-}" = "$SRC" ] || { _hw_src="$SRC"; _hw=0; }
-      [ "$df" -lt "${_hw:-0}" ] && df=$_hw || _hw=$df
-    else
-      df=0
-    fi
-    chunks=$(( (TOTAL + CHUNK - 1) / CHUNK )); pct=$(( TOTAL ? df*100/TOTAL : 0 ))
-    line_title "$(basename "${SRC%.*}")"
-
-    # The job file is written BEFORE the source is decoded, so "job exists" does
-    # not mean "upscaling". Nothing upscaled yet + no upscaler running + the
-    # frames directory still filling = extraction. Counting 33k PNGs is a single
-    # readdir and only happens in this phase, never during the GPU work.
-    fdir="$(dirname "$SEGDIR")/frames"
-    if [ "$df" -eq 0 ] && [ "$gpu_busy" -eq 0 ] && [ -d "$fdir" ]; then
-      extracted=$(find "$fdir" -maxdepth 1 -name '*.png' -type f 2>/dev/null | wc -l) || extracted=0
-      if [ "$extracted" -lt "$TOTAL" ]; then phase=extract; fi
-    fi
-
-    if [ "$phase" = extract ]; then
-      pct=$(( TOTAL ? extracted*100/TOTAL : 0 ))
-      line_prog extract "$pct" "$extracted" "$TOTAL"
-      # extraction begins when the job file is written, so its mtime is this
-      # phase's start - correct even when --status is opened halfway through
-      t0=$(stat -c%Y "$JOB" 2>/dev/null) || t0=0
-      el=$(( $(date +%s) - ${t0:-0} )); [ "$el" -lt 0 ] && el=0
-      fps=$(awk -v f="$extracted" -v e="$el" 'BEGIN{printf "%.1f", (e>0)?f/e:0}') || fps=0
-      eta=$(awk -v r="$((TOTAL-extracted))" -v v="$fps" 'BEGIN{printf "%d", (v>0)?r/v:0}') || eta=0
-      line_note "$(printf 'decoding source   %s fps   elapsed %s   eta %s' \
-        "$fps" "$(ms "$el")" "$(ms "$eta")")"
-    else
-      line_prog upscale "$pct" "$df" "$TOTAL"
-      # Measure the GPU from when EXTRACTION ENDED, not from when the episode
-      # started: the frames directory's mtime is the moment its last PNG was
-      # written. Including the ~2 min extraction understated fps for the whole
-      # episode. A resumed episode whose frames were already extracted has an
-      # older directory than $EPSTATE/started, hence the max().
-      t0=$(cat "$EPSTATE/started" 2>/dev/null) || t0=0
-      fmt=$(stat -c%Y "$fdir" 2>/dev/null) || fmt=0
-      if [ "${fmt:-0}" -gt "${t0:-0}" ]; then t0=$fmt; fi
-      el=$(( $(date +%s) - ${t0:-0} )); [ "$el" -lt 0 ] && el=0
-      fps=$(awk -v f="$df" -v e="$el" 'BEGIN{printf "%.1f", (e>0)?f/e:0}') || fps=0
-      eta=$(awk -v r="$((TOTAL-df))" -v v="$fps" 'BEGIN{printf "%d", (v>0)?r/v:0}') || eta=0
-      # Phase 4: the GPU is idle and ffmpeg is running - the last chunk's encode,
-      # or the concat/mux of the finished episode.
-      local stage=''
-      if [ "$gpu_busy" -eq 0 ] && pgrep -x ffmpeg >/dev/null 2>&1; then
-        if [ "$df" -ge "$TOTAL" ]; then stage='   encoding final cut'; else stage='   encoding chunk'; fi
-      fi
-      line_note "$(printf 'chunk %d/%d   %s fps   elapsed %s   eta %s%s' \
-        "$(( segs < chunks ? segs+1 : chunks ))" "$chunks" "$fps" \
-        "$(ms "$el")" "$(ms "$eta")" "$stage")"
-    fi
-    fi
-  else
-    # Phase 1: no job file yet. The worker is counting the source's frames and
-    # cross-checking the decoders, which showed as nothing at all before.
-    # On the box the source is always called src.avi; the collector leaves the
-    # real title in $RWORK/episode, and using it means the screen is never blank
-    # while an episode is starting or being collected.
-    if is_box && [ -s "$RWORK/episode" ]; then
-      line_title "$(cat "$RWORK/episode" 2>/dev/null)"
-    elif [ -n "$wsrc" ]; then
-      line_title "$(basename "${wsrc%.*}")"
-      # the cross-check is the only ffmpeg that decodes single frames; matching
-      # plain "ffmpeg" would also catch the background chunk encoder
-      if pgrep -f 'ffmpeg .*-frames:v 1' >/dev/null 2>&1; then
-        printf 'prepare  decoder cross-check ...\033[K\n'
-      elif pgrep -x ffprobe >/dev/null 2>&1; then
-        printf 'prepare  counting source frames ...\033[K\n'
-      else
-        printf 'prepare  starting episode ...\033[K\n'
-      fi
-    fi
-  fi
-
-  # --- upload ---------------------------------------------------------------
-  # $UPFILE is the local .mkv being delivered and $UPLOAD the size of ITS remote
-  # partial - both sampled together, so the two halves of the percentage always
-  # describe the same episode. Clamped, because rsync's temp file can briefly
-  # exceed the source it is copying.
-  local usz upc
-  if [ -n "${UPFILE:-}" ] && [ "${UPLOAD:-0}" -gt 0 ]; then
-    usz=$(stat -c%s "$UPFILE" 2>/dev/null) || usz=0
-    if [ "$usz" -gt 0 ]; then
-      upc=$(( UPLOAD*100/usz )); if [ "$upc" -gt 100 ]; then upc=100; fi
-      xfer_eta up "$UPFILE" "$UPLOAD" "$usz"
-      local sent=$UPLOAD; if [ "$sent" -gt "$usz" ]; then sent=$usz; fi
-      printf 'upload   %s %3d%%   %s/%s MB%s\033[K\n' "$(bar "$upc" 20)" "$upc" \
-        "$((sent/1048576))" "$((usz/1048576))" "$XFER"
-      printf '         %s\033[K\n' "$(basename "${UPFILE%.*}" | cut -c1-60)"
-    fi
-  fi
-
-  # The box's half of the delivery: the file is finished and the server is
-  # collecting it. No percentage - see upload_size() - but silence during a
-  # four-minute transfer reads as a hang, which is what it looked like.
-  # poll_xfer normalises an unknown size to 0, not to empty - testing for empty
-  # meant this line never appeared at all.
-  if is_box && [ -n "${UPFILE:-}" ] && [ "${UPLOAD:-0}" -eq 0 ]; then
-    local osz; osz=$(stat -c%s "$UPFILE" 2>/dev/null) || osz=0
-    if [ "$osz" -gt 0 ]; then
-      if pgrep -f '[r]sync --server' >/dev/null 2>&1; then
-        printf 'deliver  %s MB being collected by the server\033[K\n' "$((osz/1048576))"
-      else
-        printf 'deliver  %s MB ready, waiting to be collected\033[K\n' "$((osz/1048576))"
-      fi
-    fi
-  fi
-
-  # Name what runs next: the first candidate the run loop would genuinely start,
-  # from the same runnable() list it uses, minus the episode already on the GPU.
-  # If nothing qualifies, say so - that is the explanation for why an upload is
-  # not overlapping any compute.
-  local nx='' cand cur=''
-  # $SRC comes from the job file, which does not exist yet during phase 1 - fall
-  # back to the worker's command line so the episode just starting is not also
-  # offered as the next one
-  if   [ -n "$SRC"  ]; then cur=$(basename "${SRC%.*}")
-  elif [ -n "$wsrc" ]; then cur=$(basename "${wsrc%.*}"); fi
-  while IFS= read -r cand; do
-    if [ -z "$cand" ]; then continue; fi
-    cand=$(basename "${cand%.*}")
-    if [ "$cand" = "$cur" ]; then continue; fi
-    nx="$cand"; break
-  done <<< "${RUNQ:-}"
-  printf 'state   %s   |   queue %s outstanding' "$act" "$n"
-  if [ "${PARITY:-any}" != any ]; then printf ' (%s half)' "$PARITY"; fi
-  printf '\033[K\n'
-  if [ -n "$nx" ]; then
-    printf 'next    %s\033[K\n' "$(printf '%s' "$nx" | cut -c1-60)"
-  elif pgrep -f '[u]pscale run|[u]pscale once' >/dev/null 2>&1; then
-    printf 'next    (none queued - nothing to overlap with)\033[K\n'
-  else
-    printf 'next    (queue not running)\033[K\n'
-  fi
-  resources
-}
-
-# --- status polling -----------------------------------------------------------
-# Both pollers assign to globals and MUST be called as plain commands, for the
-# same reason render is: state kept in a subshell is state thrown away.
-# `var=$(fn)` adopts fn's exit status, which under set -e kills the whole view,
-# so every capture below has an explicit fallback.
-OUTSTANDING='?'; RUNQ=''; UPFILE=''; UPLOAD=0; FETCHTOTAL=0; _ft_key=''
-
-poll_queue(){          # what is outstanding for THIS machine (one ssh, slow)
-  local raw todo
-  if raw=$(discover 2>/dev/null); then
-    todo=$(printf '%s\n' "$raw" | select_todo) || todo=''
-    OUTSTANDING=$(printf '%s' "$todo" | grep -c .) || OUTSTANDING=0
-    RUNQ=$(printf '%s\n' "$todo" | runnable) || RUNQ=''
-  fi                   # ssh down: keep the last known figures rather than "0"
-  return 0
-}
-
-poll_xfer(){           # in-flight transfer sizes (one ssh while uploading)
-  local part base
-  UPFILE=$(upload_file) || UPFILE=''
-  if [ -n "$UPFILE" ]; then
-    UPLOAD=$(upload_size "$(basename "${UPFILE%.*}")") || UPLOAD=0
-    UPLOAD=${UPLOAD:-0}
-  else
-    UPLOAD=0
-  fi
-  # the source size never changes, so it is fetched once per download, not per
-  # poll - and reset when the download moves on to another episode
-  part=$(download_part) || part=''
-  if [ -n "$part" ]; then
-    base=$(basename "$(dirname "$part")")
-    if [ "$base" != "$_ft_key" ]; then
-      _ft_key=$base
-      FETCHTOTAL=$(fetch_target "$base") || FETCHTOTAL=0
-      FETCHTOTAL=${FETCHTOTAL:-0}
-    fi
-  else
-    _ft_key=''; FETCHTOTAL=0
-  fi
-  return 0
-}
-
-cmd_status(){                       # live view; Ctrl-C to leave
-  load_config                       # report on the queue that is actually running
-  # piped or scripted: prime the rate counters, then print one frame and stop.
-  # A single frame cannot measure a rate; use a pty for that.
-  if [ ! -t 1 ]; then
-    resources >/dev/null 2>&1; sleep 0.3
-    poll_queue; poll_xfer; render; return 0
-  fi
-  trap 'printf "\033[?25h\033[J\n"; exit 0' INT TERM
-  printf '\033[?25l\033[2J'        # hide cursor, clear once at entry only
-  local last=0 lastx=0 now
-  while :; do
-    now=$(date +%s)
-    # the outstanding count changes once per episode, so poll it rarely; the
-    # transfer sizes move constantly and are one cheap find each
-    if [ $(( now - last  )) -ge "${DISCOVER_EVERY:-20}" ]; then poll_queue; last=$now; fi
-    if [ $(( now - lastx )) -ge "${XFER_EVERY:-5}" ];     then poll_xfer;  lastx=$now; fi
-    # render runs in THIS shell, not $(...): a subshell would discard the
-    # previous cpu/net sample and both would read as "-" on every frame.
-    printf '\033[H'
-    render
-    printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
-    sleep "${INTERVAL:-1}"
-  done
-}
-
-
-# --------------------------------------------------------------- collect ----
-# `upscale collect` runs on the SERVER and drives a remote GPU that cannot reach
-# back into this network - CGNAT, no public inbound, not on the tailnet. So it
-# cannot fetch its own work or deliver its results, and rather than granting it
-# a route in, every step here is server-initiated: push source, poll, pull
-# result, verify, publish.
-#
-#   GPUHOST   ssh destination of the worker, e.g. "-p 48726 root@1.2.3.4"
-#   RWORK     working directory on that box
-#   RSCRIPT   the per-episode script to invoke there
-#   RPHASE    subcommand to pass it, if it takes one. Point RSCRIPT at an
-#             installed `upscale-worker` and set RPHASE=box, and the box runs
-#             the SAME worker every other machine runs - no forked copy of the
-#             pipeline to keep in sync. Empty by default, which is the old
-#             contract: a bare script taking <in> <out>.
-#   POLL      seconds between progress polls
-#
-# Work selection is the SAME discover|select_todo pipeline as `run`, so a
-# collector and a local queue can share one library without colliding, provided
-# their EPISODES sets do not overlap (even/odd is the usual split).
-GPUHOST=${GPUHOST:-}
-RWORK=${RWORK:-/root/upscale-work}
-RGPUWORK=${RGPUWORK:-/root/work}   # the worker's scratch root ON the box
-RSCRIPT=${RSCRIPT:-/root/bench/upscale-ep-rental.sh}
-RPHASE=${RPHASE:-}
-POLL=${POLL:-60}
-
-cdie(){ say "$*"; exit 1; }
-# Every remote call is bounded. A hung ssh here does not fail loudly - it just
-# never returns, and the collector sits in do_wait forever while the GPU box
-# finishes an episode nobody ever collects.
-rsh(){ timeout "${SSHTMO:-90}" ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST "$@"; }
-
-# Is the per-episode worker running on the box right now?
-#
-# The bracket around the first character is load-bearing. `pgrep -f foo.sh` sent
-# over ssh matches the remote `bash -c pgrep -f foo.sh ...` that is asking the
-# question, so this returned true whether or not anything was running - the
-# collector "adopted" a job that had finished twelve minutes earlier and never
-# launched the next episode. `[f]oo.sh` appears in the asking process's command
-# line but does not match itself as a regex.
-rworking(){
-  local b; b=$(basename "$RSCRIPT")
-  rsh "pgrep -f '[${b:0:1}]${b:1}' >/dev/null" >/dev/null 2>&1
-}
-
-# Decoded frame count. NOT packet count: a DivX packed-bitstream AVI carries two
-# frames in some packets and emits skip packets, so packets and frames differ by
-# a handful - comparing those rejected a perfectly good episode (33438 vs 33440).
-dframes(){ ffprobe -v error -count_frames -select_streams v \
-             -show_entries stream=nb_read_frames -of csv=p=0 "$1" 2>/dev/null; }
-
-# ...but the DELIVERED master is not a source. It is always our own x264, where
-# one packet is exactly one frame, so counting packets returns the same number
-# without decoding ~900 MB of 1920x1440 - which on this server takes MINUTES and
-# was being paid once per episode, after every pull, while the box sat idle.
-# Comparing decoded-source frames against delivered-master packets is exact in
-# both directions; it was comparing source PACKETS that rejected 33438 vs 33440.
-# Anything not h264/hevc falls back to the honest decode.
-oframes(){
-  local c
-  c=$(ffprobe -v error -select_streams v -show_entries stream=codec_name \
-        -of csv=p=0 "$1" 2>/dev/null) || c=''
-  case "$c" in
-    h264|hevc) ffprobe -v error -count_packets -select_streams v \
-                 -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null ;;
-    *)         dframes "$1" ;;
-  esac
-}
-
-# ------------------------------------------------- collect: status ----------
-# There is ONE status renderer, and it lives where the work is. Rather than
-# reimplement phase detection for the remote case - which produced a view stuck
-# at 0% and "starting" for an entire extraction - the collector runs the box's
-# own `upscale --status` and prints what it says, then adds the two things only
-# this side knows: the transfer in flight and the queue behind it.
-#
-# The box can answer because its worker writes the same job file the local
-# worker does, so `upscale --status` there takes the ordinary code path.
-box_status(){
-  timeout "${SSHTMO:-45}" ssh -o BatchMode=yes -o ConnectTimeout=20 \
-    ${STATUS_MUX:+-o ControlPath="$STATUS_MUX"} ${STATUS_MUX:--o ControlPath=none} \
-    $GPUHOST "EPSTATE=/root/.upscale-ep WORK=/root/work REMOTE=local upscale --status" 2>/dev/null
-}
-
-cmd_collect_status(){
-  local tty=0; [ -t 1 ] && tty=1
-  [ "$tty" = 1 ] && printf '\033[?25l\033[2J'
-  [ "$tty" = 1 ] && status_mux_open
-  trap 'status_mux_close; printf "\033[?25h\033[J\n"; exit 0' INT TERM
-  local out ep n nxt part psz outb pct
-  while :; do
-    out=$(box_status) || out=''
-    ep=$(sed -nE 's/^.*=== (.*) ===$/\1/p' "$QLOG" 2>/dev/null | tail -1) || ep=''
-    # discover walks the whole library and changes once an episode
-    if [ "$(( ${_dsc_at:-0} + 60 ))" -lt "$(date +%s)" ]; then
-      _dsc_at=$(date +%s)
-      _dsc_n=$(discover 2>/dev/null | select_todo 2>/dev/null | runnable 2>/dev/null | wc -l) || _dsc_n=0
-      _dsc_nxt=$(discover 2>/dev/null | select_todo 2>/dev/null | runnable 2>/dev/null | sed -n 2p) || _dsc_nxt=''
-    fi
-    n=${_dsc_n:-0}; nxt=${_dsc_nxt:-}
-
-    [ "$tty" = 1 ] && printf '\033[H'
-    if [ -n "$out" ]; then
-      printf '%s\n' "$out" | sed '/^(live/d;/^$/d;/queue ? outstanding/d;/next    (queue not running)/d'
-    else
-      line_title "${ep:-(no episode)}"
-      line_note "box unreachable"
-    fi
-
-    # the pull, matched by episode so it cannot show the other machine's upload
-    part=''
-    [ -n "$ep" ] && part=$(find "$LIB" -name ".$ep.mkv.part*" -type f -printf '%T@ %p\n' 2>/dev/null |
-                             sort -n | tail -1 | cut -d' ' -f2-)
-    if [ -n "$part" ]; then
-      psz=$(stat -c%s "$part" 2>/dev/null) || psz=0
-      outb=$(timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=15 \
-               ${STATUS_MUX:+-o ControlPath="$STATUS_MUX"} ${STATUS_MUX:--o ControlPath=none} \
-               $GPUHOST "stat -c%s ${RWORK}/out.mkv 2>/dev/null || echo 0" 2>/dev/null) || outb=0
-      if [ "${outb:-0}" -gt 0 ]; then
-        [ "$psz" -gt "$outb" ] && psz=$outb
-        pct=$(( psz*100/outb ))
-        xfer_eta dl "$part" "$psz" "$outb"
-        line_prog pull "$pct" "$((psz/1048576))" "$((outb/1048576))" "MB$XFER"
-      fi
-    fi
-    [ "${n:-0}" -gt 0 ] && line_kv queue "$n outstanding for this collector"
-    [ -n "$nxt" ] && line_kv next "$(basename "${nxt%.*}" | cut -c1-58)"
-    if [ "$tty" = 1 ]; then
-      printf '\033[K\n(live - Ctrl-C to exit)\033[K\033[J'
-      sleep "${STATUS_EVERY:-3}"
-    else
-      break
-    fi
-  done
-}
-
-# An episode that fails is retried, but not for ever. Without this the collector
-# re-selects the SAME episode every cycle - it is still outstanding, so it is
-# still the best candidate - and one bad episode holds the whole night, ending
-# with nothing delivered. Same file and same limit as the local queue, so
-# `--list` and `--status` already know about it.
-col_fail(){            # $1 = source path, $2 = basename, $3 = reason
-  local n
-  printf '%s\n' "$1" >> "$FAILED"
-  n=$(grep -cFx "$1" "$FAILED" 2>/dev/null) || n=0
-  say "FAILED ($n/$MAX_FAILS): $2 - $3"
-  if [ "$n" -ge "$MAX_FAILS" ]; then
-    say "giving up on $2 for this run; moving to the next episode"
-  fi
-}
-
-# Is the delivered file actually THIS episode? Counting cannot answer that.
-#
-# A frame count, a byte size and a duration all say "is this the right shape",
-# never "is this the right thing". A wrong episode of the same series has the
-# same shape - S01E18, S02E02, S02E05 and S02E15 all decode to exactly 33435
-# frames - and one was published-but-for-a-two-frame coincidence.
-#
-# Five single frames, decoded from each file, downscaled to the source's size and
-# compared. Measured on real pairs here:
-#     wrong episode          13.6 dB
-#     correct episodes       29.4  31.9  32.6  35.9  38.1 dB
-# so 20 dB sits with ~9 dB of margin under the worst correct pair and ~6 dB over
-# the worst wrong one. Best-of-five, because a single sample can land on motion
-# where an upscale legitimately differs from its source.
-#
-# Cost is a couple of seconds per episode against a 25-minute render.
-IDENT_MIN_DB=${IDENT_MIN_DB:-20}
-ident_psnr(){          # $1 delivered  $2 source -> best-of-N dB
-  local t best=0 p w h tmp dur; local -a times; tmp=$(mktemp -d) || { printf '0'; return 0; }
-  read -r w h < <(ffprobe -v error -select_streams v -show_entries stream=width,height \
-                    -of csv=p=0 "$2" 2>/dev/null | tr ',' ' ') || true
-  [ -n "${w:-}" ] || { rm -rf "$tmp"; printf '0'; return 0; }
-  # Fractions of the duration, not fixed timestamps - a fixed set scores 0 on
-  # any episode shorter than the largest timestamp, which reads as "wrong
-  # episode" and refuses a correct delivery.
-  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$2" 2>/dev/null) || dur=0
-  mapfile -t times < <(awk -v d="${dur:-0}" 'BEGIN{ if (d <= 0) d = 0;
-      split("10 25 45 65 85", q, " "); for (i = 1; i <= 5; i++) printf "%.2f\n", d * q[i] / 100 }')
-  for t in "${times[@]}"; do
-    ffmpeg -v error -ss "$t" -i "$1" -frames:v 1 "$tmp/a.png" -y 2>/dev/null || continue
-    ffmpeg -v error -ss "$t" -i "$2" -frames:v 1 "$tmp/b.png" -y 2>/dev/null || continue
-    # NOT -v error here: the psnr filter reports at info level, and -v error
-    # hides the very line being parsed - which silently scored everything 0.
-    p=$(ffmpeg -hide_banner -i "$tmp/a.png" -i "$tmp/b.png" \
-         -lavfi "[0:v]scale=$w:$h,format=gray[a];[1:v]format=gray[b];[a][b]psnr" \
-         -f null - 2>&1 | grep -oE 'average:[0-9.]+' | head -1 | cut -d: -f2) || p=0
-    awk -v a="${p:-0}" -v b="$best" 'BEGIN{exit !(a>b)}' && best=$p
-  done
-  rm -rf "$tmp"; printf '%s' "${best:-0}"
-}
-
-cmd_collect(){
-  [ -n "$GPUHOST" ] || cdie "set GPUHOST, e.g. GPUHOST='-p 48726 root@1.2.3.4'"
-  rsh "mkdir -p $RWORK" >/dev/null 2>&1 || cdie "cannot reach the worker at $GPUHOST"
-  say "collect: driving $GPUHOST (EPISODES=$EPISODES)"
-
-  local src base dest lsz rsz got want streams _lastwhy=
-  while :; do
-    if [ -f "$STOP" ]; then say "collect stopped"; break; fi
-    while [ -f "$PAUSE" ]; do sleep 10; done
-
-    # NO `head -1` here. head closes the pipe as soon as it has its line, discover
-    # takes SIGPIPE mid-write, and under `set -o pipefail` the whole pipeline
-    # reports failure - so src came back empty, the collector concluded there was
-    # nothing outstanding, and slept 300s in a loop while a finished 518 MB
-    # result sat on the box uncollected. Read the list, then take the first of it.
-    #
-    # runnable() drops episodes that have already failed MAX_FAILS times, so a
-    # bad one cannot be picked again and again for the rest of the night.
-    # Each stage is captured separately so the queue can say WHERE the work went.
-    # This branch used to sleep IDLE seconds in complete silence, so "nothing is
-    # outstanding", "the library path is wrong", "SRC_EXT does not match these
-    # files" and "everything is blacklisted" were one indistinguishable
-    # non-event. Diagnosing that cost an hour on SRC_EXT=avi against an .mkv
-    # library. A queue that decides to do nothing must say what it looked at.
-    local _all=() _sel=() _cand=() _why
-    mapfile -t _all  < <(discover 2>/dev/null) || true
-    mapfile -t _sel  < <(printf '%s\n' ${_all[@]+"${_all[@]}"} | select_todo) || true
-    mapfile -t _cand < <(printf '%s\n' ${_sel[@]+"${_sel[@]}"} | runnable) || true
-    src="${_cand[0]:-}"
-    if [ -z "$src" ]; then
-      _why="nothing to run: discovered ${#_all[@]} source(s) under $LIB (SRC_EXT=$SRC_EXT), ${#_sel[@]} matched EPISODES=$EPISODES, ${#_cand[@]} runnable"
-      # Repeat only when the reason changes: an idle night stays readable, a
-      # change of cause is never swallowed.
-      if [ "${_lastwhy:-}" != "$_why" ]; then say "$_why"; _lastwhy=$_why; fi
-      if [ "$MODE" = once ]; then break; fi
-      sleep "$IDLE"; continue
-    fi
-    _lastwhy=
-    base=$(basename "${src%.*}")
-    case "$src" in
-      "$ARCHIVE"/*) dest="$LIB/$(dirname "${src#"$ARCHIVE"/}")" ;;
-      *)            dest=$(dirname "$src") ;;
-    esac
-    say "=== $base ==="
-
-    # Push the source, size-verified. A truncated upload would otherwise be
-    # upscaled into a short episode, with nothing anywhere reporting an error.
-    # ---------------------------------------------------------------------
-    # WHAT IS THE BOX ALREADY DOING?  This must come BEFORE the push.
-    #
-    # A restarted collector re-runs discover|select_todo from scratch and can
-    # legitimately pick a DIFFERENT episode than the one in flight. It then
-    # pushed its source over $RWORK/src.avi - the running job's input - and
-    # afterwards "adopted" that job because rworking() only asks whether the
-    # worker is running, never WHICH episode it is running.
-    #
-    # The worker had already extracted its frames, so the video stayed the old
-    # episode while the final mux took audio from the new src.avi. The result
-    # was S01E02's video with S02E19's audio, presented as S02E19. It was caught
-    # only because the two happen to differ by 2 frames; S01E18, S02E02, S02E05
-    # and S02E15 all count exactly 33435, so the near miss was luck.
-    remote_ep=$(rsh "cat $RWORK/episode 2>/dev/null" 2>/dev/null | tr -d '\r') || remote_ep=''
-    remote_busy=0
-    if rsh "test -f $RWORK/out.mkv" 2>/dev/null || rworking; then remote_busy=1; fi
-    if [ "$remote_busy" = 1 ] && [ -n "$remote_ep" ] && [ "$remote_ep" != "$base" ]; then
-      # The box is mid-episode on something else. Its work belongs to IT, not to
-      # whatever this instance picked. Collect that instead of clobbering it.
-      say "box is on '$remote_ep', not '$base' - switching to it"
-      # NO `head -1`: it closes the pipe, discover takes SIGPIPE, and pipefail
-      # then fails the whole pipeline - so the lookup came back empty and the
-      # collector waited for ever next to a finished result. Same trap as the
-      # selection path; second time in this file.
-      local _m=()
-      mapfile -t _m < <(discover 2>/dev/null | select_todo | grep -F "$remote_ep") || true
-      rsrc="${_m[0]:-}"
-      # ...but not for ever. Switching to the box's episode bypassed runnable(),
-      # which is what applies MAX_FAILS - so a permanently failing episode was
-      # re-selected every cycle and the counter climbed to 12/3 while the queue
-      # made no progress at all. Past the limit, discard the remote result and
-      # let normal selection move on.
-      local _rfails=0
-      _rfails=$(grep -cFx "$rsrc" "$FAILED" 2>/dev/null) || _rfails=0
-      if [ -n "$rsrc" ] && [ "${_rfails:-0}" -ge "$MAX_FAILS" ]; then
-        say "$remote_ep has failed ${_rfails}x - discarding its remote result and moving on"
-        rsh "rm -f $RWORK/out.mkv $RWORK/src.avi $RWORK/episode" >/dev/null 2>&1 || true
-        sleep 5; continue
-      fi
-      if [ -z "$rsrc" ]; then
-        # discover HIDES an episode whose .part is fresh - and a fresh .part is
-        # exactly the state left behind when a pull is interrupted, so the one
-        # case where the box's episode must be findable is the one case discover
-        # will not show it. The collector then looped on "cannot map" while a
-        # finished 1.3 GB master sat on the box, twice, both times after a
-        # restart mid-pull. Look the source up by name instead of asking the
-        # selector that is deliberately ignoring it.
-        #
-        # No `head -1` on the pipeline: it closes the pipe, find takes SIGPIPE,
-        # and pipefail then fails the whole thing - the same trap that made this
-        # lookup come back empty elsewhere in this file. Read the list, take one.
-        local _byname=()
-        mapfile -t _byname < <(find "$ARCHIVE" "$LIB" -type f -name "$remote_ep.*" 2>/dev/null | sort) || true
-        rsrc="${_byname[0]:-}"
-        [ -n "$rsrc" ] && say "found '$remote_ep' by name (its .part hides it from discovery)"
-      fi
-      if [ -n "$rsrc" ]; then
-        src="$rsrc"; base=$(basename "${src%.*}")
-        case "$src" in
-          "$ARCHIVE"/*) dest="$LIB/$(dirname "${src#"$ARCHIVE"/}")" ;;
-          *)            dest=$(dirname "$src") ;;
-        esac
-      else
-        # It is finishing something already delivered or not in our set; let it
-        # finish rather than destroying it, and re-select next cycle.
-        say "cannot map '$remote_ep' to a source - waiting rather than clobbering"
-        sleep "$POLL"; continue
-      fi
-    fi
-
-    lsz=$(stat -c%s "$src")
-    rsz=$(rsh "stat -c%s $RWORK/src.avi 2>/dev/null || echo 0" 2>/dev/null | tr -d '\r') || rsz=0
-    if [ "${rsz:-0}" != "$lsz" ] && [ "$remote_busy" = 1 ] && [ "$remote_ep" = "$base" ]; then
-      # Same episode, but the box is already working on it: its src.avi is in
-      # use. Pushing again would swap the file under a running decoder.
-      say "box already has this episode in flight - not re-pushing"
-    elif [ "${rsz:-0}" != "$lsz" ]; then
-      say "pushing source ($((lsz/1048576)) MB)"
-      # tell the box how big it will be, so its own status can show a real
-      # percentage while the push is in flight instead of a bare byte count
-      rsh "printf '%s' $lsz > $RWORK/srcsize" >/dev/null 2>&1 || true
-      if ! rsync -q --partial -e "ssh -o BatchMode=yes -o ControlPath=none $GPUHOST" "$src" ":$RWORK/src.avi"; then
-        say "push failed; retrying"; sleep "$POLL"; continue
-      fi
-      rsz=$(rsh "stat -c%s $RWORK/src.avi" 2>/dev/null | tr -d '\r') || rsz=0
-      if [ "$rsz" != "$lsz" ]; then say "size mismatch after push"; sleep "$POLL"; continue; fi
-    fi
-
-    # The box knows nothing but "src.avi": the episode's name and when the
-    # collector started it both have to be handed over, or `upscale --status`
-    # run ON the box has no title and no elapsed to show.
-    rsh "printf '%s' $(printf '%q' "$base") > $RWORK/episode
-         date +%s > $RWORK/started" >/dev/null 2>&1 || true
-    : > "$STATE/collect-started"
-
-    # A finished result is adopted too, not just a running job. The launch command
-    # begins `rm -f out.mkv`, so reaching it with a completed episode on the box
-    # would delete twenty-three minutes of GPU work and start again.
-    # Adoption requires the box to agree on WHICH episode. An out.mkv belongs to
-    # $RWORK/episode, never to whatever this instance happened to select.
-    if [ "$remote_busy" = 1 ] && [ -n "$remote_ep" ] && [ "$remote_ep" != "$base" ]; then
-      say "refusing to adopt '$remote_ep' as '$base'"; sleep "$POLL"; continue
-    elif rsh "test -f $RWORK/out.mkv" 2>/dev/null; then
-      say "result already on the box - collecting it"
-    elif rworking; then
-      say "remote job already running - adopting it"
-    else
-      # setsid+nohup so a dropped ssh session cannot kill a 15-minute episode.
-      # The launch itself is timeout-wrapped and its failure ignored: this ssh
-      # has been observed not to return even though the job started fine, and
-      # whether the job is running is answered by rworking below, not by the
-      # exit status of the command that asked for it.
-      timeout 30 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $GPUHOST \
-        "flock -n $RWORK/.launch.lock -c 'rm -f $RWORK/out.mkv; cd $RWORK && setsid nohup bash $RSCRIPT $RPHASE $RWORK/src.avi $RWORK/out.mkv \
-         > $RWORK/current.log 2>&1 < /dev/null & echo ok'" >/dev/null 2>&1 || true
-      sleep 10
-      if rworking; then
-        say "started remotely"
-      else
-        col_fail "$src" "$base" "remote job would not start"; sleep "$POLL"; continue
-      fi
-    fi
-
-    while :; do
-      sleep "$POLL"
-      if rsh "test -f $RWORK/out.mkv" 2>/dev/null; then break; fi
-      if ! rworking; then
-        # one confirmation: a single dropped ssh is not proof the job died
-        sleep 15
-        if ! rworking && ! rsh "test -f $RWORK/out.mkv" 2>/dev/null; then
-          say "remote process gone with no output"; break
-        fi
-      fi
-      say "  $(rsh "tail -1 $RWORK/current.log 2>/dev/null" 2>/dev/null | tr -d '\r' | cut -c1-70)"
-    done
-    if ! rsh "test -f $RWORK/out.mkv" 2>/dev/null; then
-      col_fail "$src" "$base" "remote produced no output"; sleep 20; continue
-    fi
-
-    # The first episode of a season has no destination directory yet - nothing
-    # has ever been delivered there - and rsync cannot create the parent, so the
-    # pull failed instantly and looped. Twelve times, on Season 3.
-    mkdir -p "$dest" 2>/dev/null || true
-    say "pulling result"
-    if ! rsync -q --partial -e "ssh -o BatchMode=yes -o ControlPath=none $GPUHOST" \
-         ":$RWORK/out.mkv" "$dest/.$base.mkv.part"; then
-      col_fail "$src" "$base" "pull failed"; sleep 20; continue
-    fi
-    got=$(oframes "$dest/.$base.mkv.part") || got=0
-    # oframes, not dframes: it counts packets only for codecs where one packet is
-    # exactly one frame (h264/hevc) and falls back to the honest decode for
-    # anything else - which is what MPEG-4 ASP packed bitstream needs, and it is
-    # the only reason this was ever a full decode. On an HEVC source that decode
-    # cost minutes per episode, after every pull, while the box sat idle.
-    want=$(oframes "$src") || want=0
-    streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$dest/.$base.mkv.part" 2>/dev/null | tr '\n' ' ')
-    # identity, not just shape - see ident_psnr above
-    ident=$(ident_psnr "$dest/.$base.mkv.part" "$src") || ident=0
-    identok=0
-    awk -v x="${ident:-0}" -v m="$IDENT_MIN_DB" 'BEGIN{exit !(x>=m)}' && identok=1
-    if [ "$identok" = 0 ]; then
-      col_fail "$src" "$base" "content does not match the source (${ident} dB < ${IDENT_MIN_DB} dB) - wrong episode?"
-      mv -f "$dest/.$base.mkv.part" "$STATE/rejected-$base.mkv" 2>/dev/null || true
-      rsh "rm -f $RWORK/out.mkv" >/dev/null 2>&1 || true
-      sleep 20; continue
-    fi
-    if [ "$got" = "$want" ] && printf '%s' "$streams" | grep -q audio; then
-      # ARCHIVE FIRST, then publish. With SRC_EXT=mkv the source IS
-      # "$dest/$base.mkv" - the very path the master is about to take - so
-      # publishing first overwrote the only copy of the original, and the
-      # archive step below then archived the MASTER, leaving the library slot
-      # empty. The episode read as outstanding again and was re-upscaled from
-      # its own 1440p output. That destroyed the source of S07E51, which was
-      # only recoverable because the torrent was still seeding.
-      #
-      # Deferring the archive until "the replacement is verified in place" is
-      # right for .avi sources, where the two paths differ. Here the master is
-      # already verified - frames, streams and a PSNR identity check all passed
-      # above - so nothing is protected by waiting, and everything is at risk.
-      case "$src" in
-        "$ARCHIVE"/*) : ;;
-        *) mkdir -p "$ARCHIVE/$(dirname "${src#"$LIB"/}")"
-           mv -n "$src" "$ARCHIVE/${src#"$LIB"/}" && say "archived original" ;;
-      esac
-      mv -f "$dest/.$base.mkv.part" "$dest/$base.mkv"
-      say "delivered $base.mkv ($got frames, ${ident} dB, $(du -h "$dest/$base.mkv" | cut -f1))"
-      # Give the new episode a real thumbnail. Jellyfin extracts one from the
-      # video at ~10% of runtime, which on a 350-episode show is the opening
-      # titles over and over; upscale-artwork replaces it with the provider's
-      # still. Backgrounded and best-effort: Jellyfin may not have scanned the
-      # file yet, and the timer picks up anything this misses. It must never be
-      # able to delay or fail a delivery.
-      if command -v upscale-artwork >/dev/null 2>&1; then
-        ( upscale-artwork "$(printf '%s' "$base" | grep -oiE 'S[0-9]+E[0-9]+' | head -1)" \
-            >/dev/null 2>&1 & ) || true
-      fi
-      rsh "rm -f $RWORK/out.mkv $RWORK/src.avi" >/dev/null 2>&1 || true
-    else
-      col_fail "$src" "$base" "frames $got vs $want, streams: $streams"
-      mv -f "$dest/.$base.mkv.part" "$STATE/rejected-$base.mkv" 2>/dev/null || true
-      # the remote result is wrong, so do not let the next attempt adopt it
-      rsh "rm -f $RWORK/out.mkv" >/dev/null 2>&1 || true
-      sleep 20
-    fi
-    if [ "$MODE" = once ]; then break; fi
-  done
-}
-
-
-# ---------------------------------------------------------------- devices ---
-# ONE FILE PER DEVICE, and that file is the only thing that decides what the
-# device takes and how it is started or stopped.
-#
-# Ownership used to be answerable from nine places - a stored assignment map in
-# the UI, per-host UI config, each collector's environment, profile files, a
-# saved config per state dir, the worker's own job file, .upscaleignore, the
-# held/removed maps, and `ep <range>` - and any of them could disagree with the
-# rest. Starting and stopping had as many: the UI's own kill paths, --pause and
-# --stop flag files, and plain process kills. Every serious bug in this queue
-# came from two of those paths disagreeing: a stop button that did not stop, a
-# finished episode shown as running on a machine that never owned it, an
-# episode nobody would pick up because a stale entry said it belonged elsewhere.
-#
-#   upscale device                        list every device and what it takes
-#   upscale device <name> <src> <dst> <range> [--ssh S] [--mode box|local]
-#                                         [--order forward|reverse] [--workers N]
-#                                         [--server ALIAS]
-#   upscale device --clear [name]         forget one device, or all of them
-#   upscale start <name>                  run it, from its file alone
-#   upscale stop  <name>                  stop it, one way
-# The device commands report failures with die(). The rest of this script uses
-# cdie(), which logs through say() - fine for the collector, wrong for a command
-# a human just typed. Without this every error path in `upscale device|start|stop`
-# died with "die: command not found", which is what happens when only the happy
-# path is ever exercised.
-die(){ printf '%s\n' "$*" >&2; exit 1; }
-
-DEVDIR=${DEVDIR:-$HOME/.upscale/devices}
-
-dev_file(){  printf '%s/%s.conf' "$DEVDIR" "$1"; }
-dev_state(){ printf '%s/.upscale/state/%s' "$HOME" "$1"; }
-
-dev_read(){   # $1 = name -> NAME SSH MODE SRC DST RANGE ORDER WORKERS RWORK SERVER
-  local f; f=$(dev_file "$1")
-  [ -r "$f" ] || return 1
-  NAME=''; SSH=''; MODE=''; SRC=''; DST=''; RANGE=''; ORDER=''; WORKERS=''; RWORK=''; SERVER=''; EXT=''; WORKER=''; WORK=''
-  # shellcheck disable=SC1090
-  . "$f"
-  NAME=${NAME:-$1}; MODE=${MODE:-box}; RANGE=${RANGE:-any}; ORDER=${ORDER:-forward}
-  RWORK=${RWORK:-/root/work}; DST=${DST:-$SRC}; SERVER=${SERVER:-ubuntu}
-  # Source extension is a fact about THIS library, not an ambient default.
-  # SRC_EXT is set to 'avi' near the top of this script, so a caller writing
-  # ${SRC_EXT:-mkv} silently inherited 'avi' and discovered nothing at all in
-  # an .mkv library - a queue that looked healthy and did nothing.
-  EXT=${EXT:-mkv}
-  return 0
-}
-
-dev_names(){ [ -d "$DEVDIR" ] || return 0; find "$DEVDIR" -maxdepth 1 -name '*.conf' 2>/dev/null | sort | while read -r f; do basename "$f" .conf; done; }
-
-dev_pid(){    local p; p=$(cat "$(dev_state "$1")/pid" 2>/dev/null) || return 1
-              case "$p" in ''|*[!0-9]*) return 1 ;; esac
-              kill -0 "$p" 2>/dev/null || return 1; printf '%s' "$p"; }
-# A local device's queue runs ON that device, so a pidfile here proves nothing.
-# Asking the machine is the only honest answer, and a device that reports
-# "stopped" while it is demonstrably working is the exact class of lie this
-# whole change exists to remove.
-# How many upscale processes are ALIVE on the device right now.
-#
-# Counted with patterns that cannot match the counting command itself: `pgrep -f
-# upscale-worker` matches the ssh command line carrying it, so it never returns
-# zero and every check that used it silently believed the machine was busy.
-dev_busy(){
-  local n=$1
-  # Matched on the full command line, never on comm: the kernel truncates comm to
-  # 15 characters, so "realesrgan-ncnn-vulkan" is reported as "realesrgan-ncnn"
-  # and an exact match on the full name silently counts zero - leaving this blind
-  # to precisely the orphaned GPU processes it exists to find.
-  local q='echo $(( $(ps -eo args= | grep -c "[r]ealesrgan-ncnn-vulkan") + $(ps -eo args= | grep -c "[l]ibexec/upscale-worker") ))'
-  ( dev_read "$n" || exit 1
-    if [ -n "$SSH" ]; then
-      # shellcheck disable=SC2086
-      timeout 20 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 $SSH "$q" 2>/dev/null || echo 0
-    else
-      eval "$q"
-    fi ) | tail -1
-}
-
-dev_running(){
-  local n=$1
-  ( dev_read "$n" || exit 1
-    case "$MODE" in
-      local)
-        # WHICH queue, not "is any queue running on that machine". Testing for
-        # `upscale run` on the host gave every local device on one machine the
-        # same answer: a device that had never been started once reported
-        # itself as running, and displayed the episode a DIFFERENT device was
-        # working on - which is exactly the kind of confident wrong answer this
-        # file exists to avoid. cmd_start exports STATE=$HOME/.upscale/state/
-        # <device> into the queue it launches, so that is what says whose it is.
-        local q
-        q='for p in $(pgrep -f "[u]pscale run" 2>/dev/null); do
-             tr "\0" "\n" < /proc/$p/environ 2>/dev/null |
-               grep -qx "STATE=$HOME/.upscale/state/'"$n"'" && exit 0
-           done
-           exit 1'
-        if [ -n "$SSH" ]; then
-          # shellcheck disable=SC2086
-          timeout 20 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=10 $SSH "$q" 2>/dev/null
-        else eval "$q"; fi ;;
-      *) dev_pid "$n" >/dev/null 2>&1 ;;
-    esac )
-}
-
-cmd_device(){
-  if [ $# -eq 0 ]; then
-    local n
-    for n in $(dev_names); do
-      dev_read "$n" || continue
-      printf '%-14s %-7s %-9s %-8s %-5s %s\n' "$n" "$MODE" "$RANGE" "$ORDER" "$EXT" \
-             "$(dev_running "$n" && echo running || echo stopped)"
-      printf '%-14s %s -> %s%s%s\n' '' "$SRC" "$DST" \
-             "$([ -n "$WORK" ] && printf '   scratch:%s' "$WORK")" \
-             "$([ -n "$SSH" ] && printf '   [%s]' "$SSH")"
-    done
-    [ -n "$(dev_names)" ] || echo "no devices configured"
-    return 0
-  fi
-  if [ "$1" = --clear ]; then
-    shift
-    if [ $# -eq 0 ]; then
-      local n; for n in $(dev_names); do cmd_stop "$n" >/dev/null 2>&1 || true; rm -f "$(dev_file "$n")"; echo "cleared $n"; done
-    else
-      cmd_stop "$1" >/dev/null 2>&1 || true; rm -f "$(dev_file "$1")"; echo "cleared $1"
-    fi
-    return 0
-  fi
-  local name=$1 src=${2:-} dst=${3:-} range=${4:-any}
-  shift $(( $# < 4 ? $# : 4 ))
-  [ -n "$src" ] || die "usage: upscale device <name> <src> <dst> <range> [--ssh S] [--mode box|local] [--order forward|reverse] [--workers N] [--server ALIAS]"
-  local ssh='' mode='' order=forward workers='' server='' rwork=/root/work ext=mkv work='' verify=1
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --ssh)     ssh=$2;     shift 2 ;;
-      --mode)    mode=$2;    shift 2 ;;
-      --order)   order=$2;   shift 2 ;;
-      --workers) workers=$2; shift 2 ;;
-      --server)  server=$2;  shift 2 ;;
-      --rwork)   rwork=$2;   shift 2 ;;
-      --ext)     ext=$2;     shift 2 ;;
-      --no-verify) verify=0; shift ;;   # configure a machine that is not up yet
-      --work)    work=$2;    shift 2 ;;
-      *) die "unknown option: $1" ;;
-    esac
-  done
-  # A device that cannot be reached is a device that will silently do nothing,
-  # so this is checked when it is written rather than when it next runs.
-  local worker=''
-  if [ -n "$ssh" ] && [ "$verify" = 1 ]; then
-    # shellcheck disable=SC2086
-    timeout 25 ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=15 $ssh true 2>/dev/null \
-      || die "cannot reach $name over ssh: $ssh"
-    # Resolve the worker HERE, while we are already talking to the machine.
-    # ~/.local/bin is not on the PATH of a non-interactive ssh, so anything
-    # that asks for it later gets "command not found" and reports the device
-    # as broken. Recording the absolute path once removes that whole class.
-    # shellcheck disable=SC2086
-    worker=$(timeout 25 ssh -o BatchMode=yes -o ControlPath=none $ssh \
-      'command -v upscale-worker 2>/dev/null || ls "$HOME/.local/libexec/upscale-worker" 2>/dev/null' 2>/dev/null | head -1) || worker=''
-  else
-    worker=$(command -v upscale-worker 2>/dev/null || ls "$HOME/.local/libexec/upscale-worker" 2>/dev/null | head -1) || worker=''
-  fi
-  [ -n "$worker" ] || say "warning: no upscale-worker found on $name; install it there"
-  [ -n "$mode" ] || { if [ -z "$ssh" ]; then mode=local; else mode=box; fi; }
-  mkdir -p "$DEVDIR"
-  umask 077
-  cat > "$(dev_file "$name")" <<EOF
-# $name - written by \`upscale device\`. One file per device; this is the only
-# thing that decides what it takes. Edit or rewrite with the same command.
-NAME=$(printf '%q' "$name")
-SSH=$(printf '%q' "$ssh")
-MODE=$(printf '%q' "$mode")
-SRC=$(printf '%q' "$src")
-DST=$(printf '%q' "${dst:-$src}")
-RANGE=$(printf '%q' "$range")
-ORDER=$(printf '%q' "$order")
-WORKERS=$(printf '%q' "$workers")
-RWORK=$(printf '%q' "$rwork")
-EXT=$(printf '%q' "$ext")
-# Scratch. The worker defaults to /mnt/scratch/upscale-ep, which on this desktop
-# is a DRAM-less SATA SSD; the frames for one episode are ~32 GB of PNGs written
-# and read back, and that drive collapses under it - 20 fps on NVMe became 14.
-# Where the scratch lives is a fact about the DEVICE, so it belongs here.
-WORK=$(printf '%q' "$work")
-WORKER=$(printf '%q' "$worker")
-SERVER=$(printf '%q' "${server:-ubuntu}")
+STATE_DIR=${UPSCALE_STATE:-$HOME/.upscale}
+RUN="$STATE_DIR/run"
+WORKER=${WORKER:-.local/libexec/upscale-worker}   # path on the DEVICE, from $HOME
+
+SOURCE='' TARGET='' ARCHIVE='' DELETE=0 SIZE=2 WORKERS='' SCRATCH='' MODEL=''
+DEVICES=()
+
+say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ printf 'upscale: %s\n' "$*" >&2; exit 1; }
+
+usage(){ cat >&2 <<'EOF'
+usage: upscale --source DIR --target DIR --device SPEC [--device SPEC ...]
+               [--size N] [--archive DIR | --delete]
+               [--workers N] [--scratch DIR] [--model NAME]
+
+  --source DIR   every regular file here is a source. Any extension.
+  --target DIR   results are written here under the same filename.
+  --device SPEC  an ssh destination: "desktop", or "-p 31174 root@1.2.3.4".
+                 Repeatable. Devices run in parallel, one file each.
+  --size N       scale factor (default 2).
+  --archive DIR  move each source here once its result is written, or
+  --delete       delete it. One of the two is required: a source that stays a
+                 source would be upscaled again on the next run.
+  --workers N    upscaler processes per device.
+  --scratch DIR  working directory ON the device (~40 GB per file).
+  --model NAME   model name, passed through to the worker.
+
+  A .upscaleignore in --source excludes files: one glob per line, '#' comments.
+  Moving a file out of --source does the same thing and needs no feature.
 EOF
-  echo "device $name: $range $order, $src -> ${dst:-$src}${ssh:+  [$ssh]}  (mode=$mode)"
-}
+exit 2; }
 
-cmd_start(){
-  local n=${1:?upscale start <device>}
-  dev_read "$n" || die "no such device: $n   (upscale device $n <src> <dst> <range>)"
-  local st; st=$(dev_state "$n"); mkdir -p "$st"
-  if dev_running "$n"; then echo "$n is already running"; return 0; fi
-  local _b; _b=$(dev_busy "$n"); case "$_b" in ''|*[!0-9]*) _b=0 ;; esac
-  if [ "$_b" -gt 0 ]; then
-    die "$n still has $_b upscale process(es) running; \`upscale stop $n\` first (starting now would put two generations on one GPU)"
-  fi
-  rm -f "$st/stop" "$st/pause"
-  case "$MODE" in
-    box)
-      [ -n "$SSH" ] || die "device $n is mode=box but has no --ssh target"
-      # shellcheck disable=SC2086
-      setsid nohup env STATE="$st" LIB="$SRC" ARCHIVE="$SRC/.upscale-originals" ${WORK:+WORK="$WORK"} \
-        REMOTE=local EPISODES="$RANGE" ORDER="$ORDER" SRC_EXT="$EXT" \
-        RWORK="$RWORK" RSCRIPT=/root/box-run.sh RPHASE=box GPUHOST="$SSH" \
-        "$0" collect >> "$st/collect.log" 2>&1 < /dev/null &
-      echo $! > "$st/pid"
-      ;;
-    local)
-      local remote_state="\$HOME/.upscale/state/$n"
-      local cmd="mkdir -p $remote_state && rm -f $remote_state/stop $remote_state/pause && cd \$HOME && setsid nohup env STATE=$remote_state REMOTE=$(printf '%q' "$SERVER")${WORK:+ WORK=$(printf '%q' "$WORK")} LIB=$(printf '%q' "$SRC") ARCHIVE=$(printf '%q' "$SRC/.upscale-originals") EPISODES=$(printf '%q' "$RANGE") ORDER=$(printf '%q' "$ORDER") SRC_EXT=$EXT${WORKERS:+ WORKERS=$WORKERS} \$HOME/.local/bin/upscale run >> $remote_state/run.log 2>&1 < /dev/null & echo \$!"
-      local rpid
-      if [ -n "$SSH" ]; then
-        # shellcheck disable=SC2086
-        rpid=$(timeout 40 ssh -o BatchMode=yes -o ControlPath=none $SSH "$cmd" 2>/dev/null | tail -1) || rpid=''
-      else
-        rpid=$(eval "$cmd" | tail -1) || rpid=''
-      fi
-      [ -n "$rpid" ] || die "$n: the queue would not start"
-      printf '%s' "$rpid" > "$st/rpid"
-      ;;
-    *) die "device $n has unknown mode: $MODE" ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --source)  SOURCE=${2:?}; shift 2 ;;
+    --target)  TARGET=${2:?}; shift 2 ;;
+    --device)  DEVICES+=("${2:?}"); shift 2 ;;
+    --size)    SIZE=${2:?}; shift 2 ;;
+    --archive) ARCHIVE=${2:?}; shift 2 ;;
+    --delete)  DELETE=1; shift ;;
+    --workers) WORKERS=${2:?}; shift 2 ;;
+    --scratch) SCRATCH=${2:?}; shift 2 ;;
+    --model)   MODEL=${2:?}; shift 2 ;;
+    -h|--help) usage ;;
+    *) die "unknown option: $1  (--help)" ;;
   esac
-  echo "started $n ($MODE, $RANGE $ORDER)"
-}
+done
 
-cmd_skip(){
-  local n=${1:?upscale skip <device>}
-  dev_read "$n" || die "no such device: $n"
-  # Stop the EPISODE, not the device. The queue stays up and takes the next one,
-  # which is what "hold this episode" has to mean for a machine that is already
-  # mid-way through it. Finished chunks stay in scratch, so releasing the hold
-  # later resumes rather than restarts.
-  #
-  # Transfers are spared on purpose: a delivery in flight belongs to a DIFFERENT,
-  # already-finished episode, and killing it once threw away 443 MB of a
-  # completed upload because a different episode was being skipped.
-  local q="pkill -f '[u]pscale-worker process' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true"
-  if [ -n "$SSH" ]; then
-    # shellcheck disable=SC2086
-    timeout 25 ssh -o BatchMode=yes -o ControlPath=none $SSH "$q" >/dev/null 2>&1
-  else
-    eval "$q" >/dev/null 2>&1
-  fi
-  echo "skipped the current episode on $n"
-}
+[ -n "$SOURCE" ] && [ -n "$TARGET" ] || usage
+[ "${#DEVICES[@]}" -gt 0 ] || die "at least one --device"
+[ -d "$SOURCE" ] || die "no such source directory: $SOURCE"
+[ "$DELETE" = 1 ] && [ -n "$ARCHIVE" ] && die "--archive and --delete are exclusive"
+[ "$DELETE" = 0 ] && [ -z "$ARCHIVE" ] && \
+  die "one of --archive DIR or --delete is required, so a finished file stops being a source"
+mkdir -p "$TARGET" || die "cannot create target: $TARGET"
+[ -n "$ARCHIVE" ] && { mkdir -p "$ARCHIVE" || die "cannot create archive: $ARCHIVE"; }
+mkdir -p "$RUN"
+STOP="$RUN/stop"; rm -f "$STOP"
 
-cmd_stop(){
-  local n=${1:?upscale stop <device>} after=0
-  case "${2:-}" in --after|--after-episode|--graceful) after=1 ;; esac
-  dev_read "$n" || die "no such device: $n"
-  local st; st=$(dev_state "$n"); mkdir -p "$st"
-  : > "$st/stop"
-  if [ "$after" = 1 ]; then
-    # Let it finish what it is on. The run loop checks this flag between
-    # episodes, so nothing in flight is thrown away - which matters most for a
-    # machine 90% through an episode, where killing costs the whole thing.
-    # A LOCAL device keeps its queue state on the device, so the flag has to be
-    # written there, not here.
-    if [ "$MODE" = local ]; then
-      local q="mkdir -p \$HOME/.upscale/state/$n && : > \$HOME/.upscale/state/$n/stop"
-      if [ -n "$SSH" ]; then
-        # shellcheck disable=SC2086
-        timeout 25 ssh -o BatchMode=yes -o ControlPath=none $SSH "$q" >/dev/null 2>&1
-      else
-        eval "$q"
-      fi
-    fi
-    echo "$n will stop after the episode it is on (nothing killed)"
-    return 0
-  fi
-  case "$MODE" in
-    box)
-      local p; p=$(dev_pid "$n" 2>/dev/null) && kill "$p" 2>/dev/null
-      rm -f "$st/pid"
-      # The GPU work, not the transfers: a killed rsync resumes from its .part,
-      # but killing an unrelated sync on that machine is a far worse surprise.
-      # shellcheck disable=SC2086
-      [ -n "$SSH" ] && timeout 25 ssh -o BatchMode=yes -o ControlPath=none $SSH \
-        "pkill -f '[u]pscale-worker process' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true" >/dev/null 2>&1
-      ;;
-    local)
-      local cmd="rm -f \$HOME/.upscale/state/$n/pid; touch \$HOME/.upscale/state/$n/stop; pkill -f '[u]pscale run' ; pkill -f '[u]pscale-worker' ; pkill -f '[r]ealesrgan-ncnn-vulkan' ; true"
-      if [ -n "$SSH" ]; then
-        # shellcheck disable=SC2086
-        timeout 25 ssh -o BatchMode=yes -o ControlPath=none $SSH "$cmd" >/dev/null 2>&1
-      else
-        eval "$cmd" >/dev/null 2>&1
-      fi
-      rm -f "$st/rpid"
-      ;;
-  esac
-  # Do NOT return until the machine is quiet. Signalling and returning is how one
-  # desktop ended up running SEVEN worker generations at once: stop said it had
-  # stopped, start was issued immediately, and the orphaned realesrgan children
-  # of the previous run were still on the GPU. Throughput collapsed from ~20 fps
-  # to 13.8 and nothing reported a fault, because nothing was faulty - there were
-  # simply three of everything.
-  local _b _i=0
-  while [ "$_i" -lt 15 ]; do
-    _b=$(dev_busy "$n"); case "$_b" in ''|*[!0-9]*) _b=0 ;; esac
-    [ "$_b" -eq 0 ] && { echo "stopped $n"; return 0; }
-    sleep 2; _i=$((_i+1))
-  done
-  echo "stopped $n - WARNING: $_b process(es) still alive there; start will refuse until they exit" >&2
+# ---------------------------------------------------------------- sources ---
+ignored(){
+  local f=$1 pat
+  [ -f "$SOURCE/.upscaleignore" ] || return 1
+  while IFS= read -r pat || [ -n "$pat" ]; do
+    case "$pat" in ''|'#'*) continue ;; esac
+    # shellcheck disable=SC2254
+    case "$f" in $pat) return 0 ;; esac
+  done < "$SOURCE/.upscaleignore"
   return 1
 }
 
-profiles_seed
-# Offsets before anything selects: epnum() runs in subshells and cannot build them.
-abs_init
-# --profile <name> may precede any command. PROFILE in the environment does the
-# same thing, so a systemd unit can select one with a single Environment= line
-# instead of a shell wrapper; the flag wins when both are given.
-if [ "${1:-}" = --profile ] || [ "${1:-}" = -p ]; then
-  PROFILE="${2:?--profile needs a name}"; load_profile "$PROFILE"; shift 2
-elif [ -n "${PROFILE:-}" ]; then
-  load_profile "$PROFILE"
-fi
+# No extension test. What makes a file a source is where it is.
+sources(){
+  local p b
+  for p in "$SOURCE"/*; do
+    [ -f "$p" ] || continue
+    b=${p##*/}
+    case "$b" in .*) continue ;; esac
+    ignored "$b" || printf '%s\n' "$b"
+  done
+}
 
-case "${1:-}" in
-  profiles|--profiles)
-    printf 'profiles in %s:\n' "$PROFILE_DIR"
-    for f in "$PROFILE_DIR"/*.conf; do
-      [ -e "$f" ] || continue
-      # ORDER belongs here too: `all` and `backwards` are both EPISODES=any and
-      # were indistinguishable in the one listing you check to confirm that two
-      # machines have not been pointed at the same work.
-      printf '  %-12s EPISODES=%-6s ORDER=%s\n' "$(basename "${f%.conf}")" \
-        "$(grep -m1 '^EPISODES=' "$f" 2>/dev/null | cut -d= -f2-)" \
-        "$(grep -m1 '^ORDER=' "$f" 2>/dev/null | cut -d= -f2- || true)"
+key(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+# mkdir is atomic, so two devices asking for the same file cannot both win.
+claim(){   mkdir "$RUN/claim-$(key "$1")" 2>/dev/null; }
+unclaim(){ rmdir "$RUN/claim-$(key "$1")" 2>/dev/null || true; }
+
+next_source(){
+  local b
+  while IFS= read -r b; do
+    [ -e "$TARGET/$b" ] && continue
+    claim "$b" || continue
+    printf '%s\n' "$b"; return 0
+  done < <(sources | sort)
+  return 1
+}
+
+# --------------------------------------------------------------- transfer ---
+# One implementation, and the server owns both ends. A device never reaches back
+# here: it has no route home and holds no key to this machine.
+# stderr is discarded on purpose: a rented box prints a login banner on every
+# single ssh, which buried the actual progress lines. What went wrong is carried
+# by the exit status and reported by the caller; what the worker has to say is
+# in the device's own log.
+rsh(){ local d=$1; shift; # shellcheck disable=SC2086
+       ssh -o BatchMode=yes -o ControlPath=none -o ConnectTimeout=20 $d "$@" 2>/dev/null; }
+push(){ rsync -q --partial -e "ssh -o BatchMode=yes -o ControlPath=none $1" "$2" ":$3"; }
+pull(){ rsync -q --partial -e "ssh -o BatchMode=yes -o ControlPath=none $1" ":$2" "$3"; }
+
+frames(){ ffprobe -v error -select_streams v:0 -count_packets \
+            -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null; }
+
+# ------------------------------------------------------------------- work ---
+run_one(){
+  local dev=$1 name=$2 st rwork out want got
+  st="$RUN/$(key "$dev")"; mkdir -p "$st"
+  rwork=$(rsh "$dev" 'printf %s "${UPSCALE_WORK:-$HOME/upscale-work}"' | tr -d '\r') || rwork=
+  [ -n "$rwork" ] || { say "[$dev] unreachable"; return 1; }
+  printf '%s' "$name" > "$st/file"
+
+  # The name travels with the file. That is the whole reason this program does
+  # not need to recognise a result from its pixels: nothing ever renamed it, so
+  # what comes back from out-<name> is <name>.
+  rsh "$dev" "mkdir -p $(printf %q "$rwork")" >/dev/null || return 1
+  if ! rsh "$dev" "test -s $(printf %q "$rwork/out-$name")" 2>/dev/null; then
+    say "[$dev] $name: sending"
+    push "$dev" "$SOURCE/$name" "$rwork/$name" || { say "[$dev] $name: send failed"; return 1; }
+    say "[$dev] $name: upscaling"
+    # shellcheck disable=SC2086
+    rsh "$dev" "cd $(printf %q "$rwork") && setsid nohup env \
+          ${WORKERS:+WORKERS=$WORKERS} ${SCRATCH:+WORK=$(printf %q "$SCRATCH")} \
+          ${MODEL:+MODEL=$MODEL} SCALE=$SIZE \
+          \$HOME/$WORKER process $(printf %q "$rwork/$name") $(printf %q "$rwork/out-$name") \
+          < /dev/null >> $(printf %q "$rwork/log") 2>&1" \
+      || { say "[$dev] $name: upscale failed (see $rwork/log on the device)"; return 1; }
+  else
+    say "[$dev] $name: result already on the device, collecting"
+  fi
+
+  say "[$dev] $name: retrieving"
+  out="$TARGET/.$name.part"
+  pull "$dev" "$rwork/out-$name" "$out" || { say "[$dev] $name: retrieve failed"; return 1; }
+
+  # The only check worth making. A truncated transfer is what actually goes
+  # wrong, and frame count catches it exactly. WHICH episode this is was never
+  # in question.
+  want=$(frames "$SOURCE/$name"); got=$(frames "$out")
+  if [ -z "$got" ] || [ "$want" != "$got" ]; then
+    say "[$dev] $name: $got frames, source has $want - left as .part, not published"
+    return 1
+  fi
+
+  mv -f "$out" "$TARGET/$name"
+  rsh "$dev" "rm -f $(printf %q "$rwork/$name") $(printf %q "$rwork/out-$name")" >/dev/null 2>&1 || true
+  if [ "$DELETE" = 1 ]; then rm -f "$SOURCE/$name"; say "[$dev] $name: done, source deleted"
+  else mv -f "$SOURCE/$name" "$ARCHIVE/$name"; say "[$dev] $name: done, source archived"; fi
+  rm -f "$st/file"
+}
+
+# "What is left" is read from the source directory every time, so files added
+# while this runs are simply picked up.
+device_loop(){
+  local dev=$1 name
+  while [ ! -f "$STOP" ]; do
+    name=$(next_source) || { say "[$dev] nothing left"; return 0; }
+    run_one "$dev" "$name" || say "[$dev] $name: left in place for a later run"
+    unclaim "$name"
+  done
+  say "[$dev] stopped"
+}
+
+# A snapshot for whatever wants to watch: the web UI reads this rather than
+# being told, so there is no second place that decides what is running.
+snapshot(){
+  local d f first=1
+  { printf '{"source":"%s","target":"%s","size":%s,"devices":[' "$SOURCE" "$TARGET" "$SIZE"
+    for d in "${DEVICES[@]}"; do
+      f=$(cat "$RUN/$(key "$d")/file" 2>/dev/null || true)
+      [ "$first" = 1 ] || printf ','; first=0
+      printf '{"device":"%s","file":"%s"}' "$d" "$f"
     done
-    exit 0 ;;
-  # --list, like --status, describes the queue that is running: same config,
-  # same selection rules, same order the run loop will take them in
-  list|--list)     load_config; discover | select_todo | nl; exit 0 ;;
-  # A collector has no local worker: cmd_status would describe the SERVER, which
-  # is idle by definition, and say nothing about the box doing the work.
-  status|--status) load_config
-                   # GPUHOST alone decides: it means "I am driving a box over
-                   # there". Also treating a local RWORK as the collector made
-                   # the BOX try to ssh to an empty GPUHOST and report itself
-                   # unreachable - RWORK is set there so it can find its own work.
-                   if [ -n "${GPUHOST:-}" ]
-                     then cmd_collect_status; else cmd_status; fi
-                   exit 0 ;;
-  # write BOTH: the worker polls its own state dir, so a flag written only
-  # here would silently never reach the running episode
-  pause|--pause)   load_config; touch "$PAUSE" "$EPSTATE/pause"; echo "paused - will hold after the current chunk"; exit 0 ;;
-  resume|--resume) load_config; rm -f "$PAUSE" "$EPSTATE/pause"; echo "resumed"; exit 0 ;;
-  # ONLY the queue's flag. Writing the worker's stop flag too made --stop abort
-  # the episode in flight - it says "finish the current episode", and it was
-  # throwing away fifteen minutes of GPU work and recording a failure for it.
-  # --pause is the one that reaches into the running episode.
-  # `--stop` only. The bare word belongs to `upscale stop <device>`, which is the
-  # one way to stop something; this flag remains for the legacy global queue and
-  # is what that command writes underneath.
-  --stop)          load_config; touch "$STOP"; echo "stopping after the current episode"; exit 0 ;;
-  # One episode, one command — the thing you actually want when a single episode
-  # is left over. It reuses the worker's own fetch+process+deliver and touches
-  # NONE of the queue machinery: no profiles, no config snapshot, no state files,
-  # no prefetch, no idle loop, no restart-on-failure. It runs, it reports, it
-  # exits with the worker's status.
-  ep|episode)
-    shift
-    RANGE=${1:-}
-    [ -n "$RANGE" ] || { echo "usage: upscale ep <range> [[host:]library]" >&2; exit 2; }
-    if [ -n "${2:-}" ]; then
-      case "$2" in
-        *:*) REMOTE=${2%%:*}; LIB=${2#*:} ;;
-        *)   REMOTE=local;    LIB=$2 ;;
-      esac
-      ARCHIVE="$LIB/.upscale-originals"
-    fi
-    mapfile -t _cands < <(discover)
-    _n=0
-    for _src in "${_cands[@]}"; do
-      [ -n "$_src" ] || continue
-      # Honour --stop and --pause between episodes. Without this an `ep` run was
-      # unstoppable except by killing it: --stop writes the flag, the run loop
-      # never looked at it, and the queue took the next episode anyway.
-      while [ -f "$PAUSE" ]; do sleep 5; done
-      if [ -f "$STOP" ]; then echo "stopped before $(basename "${_src%.*}")"; break; fi
-      ep_in_set "$(epnum "$(basename "${_src%.*}")")" "$RANGE" || continue
-      echo "==> $(basename "${_src%.*}")"
-      worker run "$_src" || { echo "FAILED: $_src" >&2; exit 1; }
-      _n=$((_n + 1))
-    done
-    if [ "$_n" -eq 0 ]; then
-      echo "nothing outstanding matches '$RANGE' in ${REMOTE}:${LIB}" >&2; exit 1
-    fi
-    echo "done: $_n episode(s)"
-    exit 0 ;;
-  device)          shift; cmd_device "$@"; exit $? ;;
-  start)           shift; cmd_start "${1:-}"; exit $? ;;
-  stop)            shift; cmd_stop  "${1:-}" "${2:-}"; exit $? ;;
-  skip)            shift; cmd_skip  "${1:-}"; exit $? ;;
-  run|--run)       MODE=run ;;
-  collect)         MODE=run;  DOCOLLECT=1 ;;
-  collect-once)    MODE=once; DOCOLLECT=1 ;;
-  once|--once)     MODE=once ;;
-  # Print the whole usage block, not a fixed line range: hard-coding '2,12p'
-  # quietly dropped --profile and --profiles from the help the moment `collect`
-  # added three lines above them.
-  # Print the usage block by shape, not by line number: it is the title, a blank
-  # comment line, the commands, and the next blank comment line ends it. The
-  # previous fixed '2,12p' silently dropped --profile and --profiles from the
-  # help the moment `collect` added three lines above them.
-  *) awk 'NR<2{next} /^#$/{if(++b>=2)exit; print ""; next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 1 ;;
-esac
+    printf '],"ts":%s}' "$(date +%s)"
+  } > "$RUN/state.json.tmp" && mv -f "$RUN/state.json.tmp" "$RUN/state.json"
+}
+watcher(){ while [ ! -f "$STOP" ]; do snapshot; sleep 5; done; snapshot; }
 
-# Clear BOTH stop flags, not just the queue's. `--stop` writes the worker's flag
-# too (or a running episode would never notice), so a queue restarted after a
-# stop had its very first episode abort instantly - and counted that as a
-# failure, three of which blacklist the episode.
-clear_stop(){ rm -f "$STOP" "$EPSTATE/stop"; }
+trap 'touch "$STOP"; say "stopping after the current file"' INT TERM
 
-if [ "${DOCOLLECT:-0}" = 1 ]; then clear_stop; save_config; cmd_collect; exit 0; fi
-
-clear_stop
-# Record what this run is actually configured with, so `upscale --status` in
-# another shell (with none of these variables in its environment) reports on THIS
-# queue instead of inventing a configuration of its own.
-save_config
-# mark each run: the log is appended across restarts, and the [N] counter
-# resets, so without this a resumed episode looks like a duplicate
-say "=== run start (pid $$) ==="
-deliver_pid=""; done_n=0
-while :; do
-  [ -f "$STOP" ] && { say "stopped"; break; }
-  while [ -f "$PAUSE" ]; do sleep 10; done
-
-  # select_todo applies the parity split and the watch-order rules. It is the
-  # SAME function --status uses, so the two can never again disagree about what
-  # this machine owns.
-  mapfile -t RAW < <(discover || true)
-  mapfile -t TODO < <(printf '%s\n' "${RAW[@]:-}" | select_todo || true)
-  if [ "${#TODO[@]}" -eq 0 ]; then
-    [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; deliver_pid=""; }
-    [ "$MODE" = once ] && { say "nothing outstanding"; break; }
-    sleep "$IDLE"; continue
-  fi
-
-  # runnable() drops what is done-but-awaiting-upload and what has failed too
-  # often. Again the same function --status uses for its "next" line, so the
-  # episode it names is the episode this loop will really take.
-  mapfile -t READY < <(printf '%s\n' "${TODO[@]}" | runnable || true)
-  src="${READY[0]:-}"
-  if [ -z "$src" ]; then
-    [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; deliver_pid=""; }
-    [ "$MODE" = once ] && { say "nothing left to process"; break; }
-    sleep 20; continue
-  fi
-  base=$(basename "${src%.*}")
-  say "[$((done_n+1))] processing $base  (${#TODO[@]} outstanding)"
-
-  worker fetch "$src"
-
-  # next episode downloads while this one is on the GPU
-  # Prefetch the next RUNNABLE episode, not TODO[1]. TODO[0] is often an episode
-  # that is done and merely awaiting upload, in which case src=READY[0] is TODO[1]
-  # and the old code re-fetched the very episode being processed - so nothing was
-  # downloaded ahead and the GPU waited on a cold fetch every time.
-  # Not silenced: this is the one background job whose failure costs GPU time.
-  prefetch_pid=""
-  if [ -n "${READY[1]:-}" ]; then
-    ( worker fetch "${READY[1]}" 2>&1 | sed 's/^/  prefetch: /' >> "$QLOG" ) & prefetch_pid=$!
-    say "prefetching $(basename "${READY[1]%.*}" | cut -c1-42)"
-  fi
-
-  # A failing episode must not end the run.
-  if ! worker process "$src"; then
-    fails=$(grep -cFx "$src" "$FAILED" 2>/dev/null) || fails=0
-    fails=$((fails + 1))
-    printf '%s\n' "$src" >> "$FAILED"
-    say "FAILED ($fails/$MAX_FAILS): $base"
-    continue
-  fi
-
-  # the previous upload must finish before this one starts, so two transfers
-  # never split a 2.2 MB/s link between them
-  [ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; }
-  ( worker deliver "$src" || say "DELIVERY FAILED: $base" ) & deliver_pid=$!
-
-  [ -n "$prefetch_pid" ] && { wait "$prefetch_pid" 2>/dev/null || true; }
-  done_n=$((done_n+1))
-  if [ "$LIMIT" -gt 0 ] && [ "$done_n" -ge "$LIMIT" ]; then
-    say "limit $LIMIT reached"; break
-  fi
-done
-[ -n "$deliver_pid" ] && { wait "$deliver_pid" 2>/dev/null || true; }
-say "queue done: $done_n episode(s) this run"
+say "$(sources | wc -l) file(s) in $SOURCE -> $TARGET, x$SIZE, ${#DEVICES[@]} device(s)"
+watcher &
+_watch=$!
+for d in "${DEVICES[@]}"; do device_loop "$d" & done
+for d in "${DEVICES[@]}"; do wait -n 2>/dev/null || true; done
+touch "$STOP"; wait "$_watch" 2>/dev/null || true; rm -f "$STOP"
+say "done"

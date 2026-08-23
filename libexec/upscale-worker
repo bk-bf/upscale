@@ -27,9 +27,6 @@
 #     uses `mv -n`, so a rerun can never clobber an archived original.
 set -euo pipefail
 
-REMOTE=${REMOTE:-ubuntu}
-LIB=${LIB:-/mnt/media/tv/Bleach}
-ARCHIVE=${ARCHIVE:-$LIB/.upscale-originals}
 MODEL=${MODEL:-animejanai-suc}
 MODEL_DIR=${MODEL_DIR:-$HOME/upscale-bench/models_janai}
 BIN=${BIN:-$HOME/upscale-bench/bin/realesrgan-ncnn-vulkan}
@@ -65,11 +62,6 @@ phase_set(){
   printf '%s %s %s %s %s\n' "$1" "${2:-0}" "${3:-0}" "$(date +%s)" "${4:-}" \
     > "$STATE/phase.tmp" 2>/dev/null && mv -f "$STATE/phase.tmp" "$STATE/phase" 2>/dev/null || true
 }
-# Network ops retry with backoff: the server rebooting mid-run must pause the
-# pipeline, not fail the episode.
-retry(){ local n=0 max=${RETRIES:-60}
-  until "$@"; do n=$((n+1)); [ "$n" -ge "$max" ] && return 1
-    say "retry $n/$max: $1 ..."; sleep $(( n<10 ? 10 : 30 )); done; }
 # Frame count. -count_frames decodes every single frame, which costs minutes on
 # a 1440p master, and the worker asks for this count four times per episode
 # (source, every chunk, the mux, and the timestamp normalisation). Where a codec
@@ -98,32 +90,6 @@ vframes(){
   vslow "$1"
 }
 
-cmd_status(){
-  [ -f "$JOB" ] || { echo "no job"; return 0; }
-  # shellcheck disable=SC1090
-  . "$JOB"
-  local segs=0 chunks state=running
-  [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
-  chunks=$(( (TOTAL + CHUNK - 1) / CHUNK ))
-  [ -f "$PAUSE" ] && state=paused
-  [ -f "$STOP" ]  && state=stopping
-  kill -0 "$PID" 2>/dev/null || state="not running"
-  local df=$(( segs * CHUNK )); [ "$df" -gt "$TOTAL" ] && df=$TOTAL
-  printf 'episode : %s\nstate   : %s (pid %s)\nprogress: %d/%d chunks, %d/%d frames (%d%%)\n' \
-    "$(basename "$SRC")" "$state" "$PID" "$segs" "$chunks" "$df" "$TOTAL" \
-    "$(( TOTAL ? df*100/TOTAL : 0 ))"
-  if [ -f "$STATE/started" ] && [ "$df" -gt 0 ]; then
-    awk -v f="$df" -v e="$(( $(date +%s) - $(cat "$STATE/started") ))" -v r="$((TOTAL-df))" \
-      'BEGIN{fps=(e>0)?f/e:0; printf "rate    : %.2f fps  elapsed %dm  eta %dm\n", fps, e/60, (fps>0)?r/fps/60:0}'
-  fi
-}
-
-# Same facts as cmd_status, as JSON, for anything that is not a human: the web
-# UI polls this over ssh rather than scraping the text form, which would break
-# the moment a label is reworded.
-#
-# Always valid JSON, including when there is no job at all - a consumer should
-# never have to distinguish "no job" from "ssh failed" by parse error.
 cmd_status_json(){
   local segs=0 chunks=0 state=idle df=0 pct=0 fps=0 elapsed=0 eta=0 ep="" phase=idle pp=0 transfer=""
   # THE JOB FILE IS NOT THE JOB. do_process writes it and deletes it again when
@@ -331,51 +297,28 @@ cmd_status_json(){
 # and the worker only does the GPU half, which is the one thing that machine is
 # actually for. This is what lets ONE worker serve every machine; the rental
 # used to need a hand-copied fork of this file to do the same job.
-BOX=0
 PHASE="${1:-}"
 case "$PHASE" in
-  status) if [ "${2:-}" = --json ]; then cmd_status_json; else cmd_status; fi; exit 0 ;;
+  status) cmd_status_json; exit 0 ;;
   pause)  touch "$PAUSE"; echo "pausing after current chunk"; exit 0 ;;
   resume) rm -f "$PAUSE"; echo resumed; exit 0 ;;
   stop)   touch "$STOP";  echo "stopping after current chunk"; exit 0 ;;
-  run|fetch|process|deliver) shift ;;
-  box)    BOX=1; shift ;;
-  *) { sed -n '2p' "$0"; grep '^#   upscale-ep ' "$0"; } |
+  process) shift ;;
+  *) { sed -n '2p' "$0"; grep '^#   upscale-worker ' "$0"; } |
        sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 
-SRC_REMOTE="${1:?need remote source path}"
-BASE=$(basename "${SRC_REMOTE%.*}")
+# Both paths are given outright: the source is already here (the server pushed
+# it, under its own name) and the output goes where the server will come looking
+# for it. The worker no longer fetches or delivers anything - one program moves
+# files, and it is not this one.
+LOCAL="${1:?need a source path:  upscale-worker process <src> <out>}"
+OUT="${2:?need an output path:  upscale-worker process <src> <out>}"
+[ -f "$LOCAL" ] || die "source is not here: $LOCAL"
+BASE=$(basename "${LOCAL%.*}")
 W="$WORK/$BASE"
-FRAMES="$W/frames"; UP="$W/up"; SEGDIR="$W/seg"; LOCAL="$W/src"; OUT="$W/$BASE.mkv"
-# Box mode is handed both paths outright: $1 is a file that is ALREADY local
-# (the server pushed it) and $2 is where the server will come looking for the
-# result. Everything else - scratch, chunking, resume - is unchanged.
-if [ "$BOX" = 1 ]; then
-  LOCAL="$SRC_REMOTE"
-  OUT="${2:?need an output path:  upscale-ep box <local-src> <out.mkv>}"
-  [ -f "$LOCAL" ] || die "box mode: source is not local: $LOCAL"
-fi
+FRAMES="$W/frames"; UP="$W/up"; SEGDIR="$W/seg"
 
-do_fetch(){
-  [ "$BOX" = 1 ] && return 0      # the server already pushed it
-  mkdir -p "$W"
-  [ -f "$LOCAL" ] && return 0
-  say "fetching $(basename "$SRC_REMOTE")"
-  phase_set fetching 0 0 bytes
-  retry rsync -q --partial "$REMOTE:$SRC_REMOTE" "$LOCAL.part" || die "fetch failed: $SRC_REMOTE"
-  mv "$LOCAL.part" "$LOCAL"          # rename only on success: a partial file
-}                                    # must never look like a complete fetch
-
-
-# Two independent decoders must agree before a single frame is upscaled.
-#
-# ffmpeg 8.1.2 silently mis-decodes MPEG-4 ASP: byte-identical input, visibly
-# corrupt output, correct frame COUNT - so every count-based check passed and two
-# episodes shipped damaged. Content checks are the only thing that catches this,
-# and it matters more on rented machines whose ffmpeg version is unknown.
-#
-# Cost is ~5 seconds per episode: five sampled frames, decoded twice, compared.
 verify_decoder(){
   local ref="${FFDEC_REF:-ffmpeg}" bad=0 n=0 t d
   [ "$(command -v "$FFDEC")" = "$(command -v "$ref")" ] && { say "only one decoder available - cross-check skipped"; return 0; }
@@ -409,7 +352,7 @@ do_process(){
   verify_decoder
 
   cat > "$JOB" <<EOF
-SRC="$SRC_REMOTE"
+SRC="$LOCAL"
 TOTAL=$TOTAL
 CHUNK=$CHUNK
 SEGDIR="$SEGDIR"
@@ -567,125 +510,4 @@ EOF
   say "processed $final frames, $(du -h "$OUT" | cut -f1)"
 }
 
-# Identity, not just shape.
-#
-# The episode that nearly shipped had the right duration, the right frame count
-# and the right stream layout. It was simply a DIFFERENT EPISODE, and every
-# count-based check in do_deliver passed it. Only comparing content catches that.
-#
-# This check existed, but only in `upscale collect` - the path that drove the
-# rented box. Everything delivered locally by `upscale run` / `upscale ep` went
-# out unverified.
-#
-# Best-of-N, not all-of-N, and that is not laziness: `-ss` before `-i` seeks to
-# the nearest keyframe, and an MPEG-4 source and an h264 output do not share
-# keyframe positions, so individual samples legitimately compare different frames
-# and score low - 13-18 dB on a known-good episode. A WRONG episode has no good
-# match at ANY timestamp; the near-miss scored 13.6 dB at its best, against
-# 29-44 dB for correct ones.
-#
-# Decoding uses $FFDEC for the same reason extraction does: the source is
-# MPEG-4 ASP, and a decoder that lies about it makes the comparison meaningless.
-IDENT_MIN_DB=${IDENT_MIN_DB:-20}
-ident_psnr(){          # $1 delivered mkv  $2 source -> best dB seen, "0" on error
-  local t best=0 p w h tmp dur
-  local -a times
-  tmp=$(mktemp -d) || { printf '0'; return 0; }
-  read -r w h < <(ffprobe -v error -select_streams v -show_entries stream=width,height \
-                    -of csv=p=0 "$2" 2>/dev/null | tr ',' ' ') || true
-  if [ -z "${w:-}" ]; then rm -rf "$tmp"; printf '0'; return 0; fi
-  # Sample at FRACTIONS of the duration, never fixed timestamps. The original
-  # 120/400/700/1000/1300 set was written for 23-minute episodes: on anything
-  # shorter every seek falls past the end, every sample is skipped, and the
-  # function returns 0 - which reads as "wrong episode" and refuses a delivery
-  # that is perfectly correct. Caught by a 3-second round-trip test.
-  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$2" 2>/dev/null) || dur=0
-  mapfile -t times < <(awk -v d="${dur:-0}" 'BEGIN{ if (d <= 0) d = 0;
-      split("10 25 45 65 85", p, " "); for (i = 1; i <= 5; i++) printf "%.2f\n", d * p[i] / 100 }')
-  for t in "${times[@]}"; do
-    "$FFDEC" -v error -ss "$t" -i "$1" -frames:v 1 "$tmp/a.png" -y 2>/dev/null || continue
-    "$FFDEC" -v error -ss "$t" -i "$2" -frames:v 1 "$tmp/b.png" -y 2>/dev/null || continue
-    # NOT -v error on this one: the psnr filter reports at info level, and -v
-    # error hides the very line being parsed - which silently scores everything 0.
-    p=$("$FFDEC" -hide_banner -i "$tmp/a.png" -i "$tmp/b.png" \
-          -lavfi "[0:v]scale=$w:$h,format=gray[a];[1:v]format=gray[b];[a][b]psnr" \
-          -f null - 2>&1 | grep -oE 'average:[0-9.]+' | head -1 | cut -d: -f2) || p=0
-    # `if`, not `awk ... && best=$p`: a false `a && b` is fatal under set -e.
-    if awk -v a="${p:-0}" -v b="$best" 'BEGIN{exit !(a>b)}'; then best=$p; fi
-  done
-  rm -rf "$tmp"; printf '%s' "${best:-0}"
-}
-
-do_deliver(){
-  # The box cannot reach the server; the server pulls $OUT itself, verifies it
-  # and publishes it. Leaving $OUT in place is the whole contract.
-  [ "$BOX" = 1 ] && { say "box mode: leaving $OUT for the server to collect"; return 0; }
-  # Sources may already live in the archive (the whole library was moved there
-  # up front, so Jellyfin shows only finished upscales). In that case the
-  # destination is the matching path back in the library, and there is nothing
-  # left to archive afterwards.
-  local dest pre_archived=0
-  case "$SRC_REMOTE" in
-    "$ARCHIVE"/*) pre_archived=1
-                  dest="${1:-$LIB/$(dirname "${SRC_REMOTE#"$ARCHIVE"/}")}" ;;
-    *)            dest="${1:-$(dirname "$SRC_REMOTE")}" ;;
-  esac
-  [ -f "$OUT" ] || die "nothing to deliver; run process first"
-
-  # Verify BEFORE the upload, not after: the link is ~2.2 MB/s, so a wrong
-  # episode caught here costs seconds instead of half an hour of transfer, and
-  # nothing wrong ever reaches the library path at all.
-  [ -f "$LOCAL" ] || die "source gone from $W; cannot verify identity - re-run fetch"
-  local ident
-  ident=$(ident_psnr "$OUT" "$LOCAL") || ident=0
-  if awk -v x="${ident:-0}" -v m="$IDENT_MIN_DB" 'BEGIN{exit !(x>=m)}'; then
-    say "identity ok: ${ident} dB (floor ${IDENT_MIN_DB})"
-  else
-    die "IDENTITY CHECK FAILED for $BASE: best ${ident} dB < ${IDENT_MIN_DB} dB. Refusing to deliver - this output does not match its source."
-  fi
-
-  phase_set delivering 0 "$(stat -c%s "$OUT" 2>/dev/null || echo 0)" bytes
-  say "delivering $BASE.mkv -> $dest"
-  # Upload to a hidden temp name and rename only after the size is verified, so
-  # Jellyfin and Sonarr never see a half-written episode.
-  local tmp=".$BASE.mkv.part"
-  retry ssh "$REMOTE" "mkdir -p $(printf '%q' "$dest")" || die "cannot reach server"
-  retry rsync -q --partial "$OUT" "$REMOTE:$dest/$tmp" || die "delivery failed"
-  local lsz rsz
-  lsz=$(stat -c%s "$OUT")
-  rsz=$(retry ssh "$REMOTE" "stat -c%s $(printf '%q' "$dest/$tmp")") || die "delivered file not found"
-  [ "$lsz" = "$rsz" ] || die "delivered size $rsz != local $lsz"
-  # ARCHIVE BEFORE PUBLISHING.
-  #
-  # When sources are .mkv (SRC_EXT=mkv), the delivered path IS the source path:
-  # "$dest/$BASE.mkv" is the very file this episode was fetched from. Publishing
-  # first would overwrite the original and then archive the upscale on top of it
-  # - original gone, archive holding a copy of the output, and every later run
-  # comparing the result against itself. With .avi sources the two paths always
-  # differed, which is why this order was safe for years and is not any more.
-  if [ "$pre_archived" = 1 ]; then
-    say "original already archived, leaving in place"
-  else
-    local rel="${SRC_REMOTE#"$LIB"/}"
-    retry ssh "$REMOTE" "mkdir -p $(printf '%q' "$ARCHIVE/$(dirname "$rel")") && \
-                   mv -n $(printf '%q' "$SRC_REMOTE") $(printf '%q' "$ARCHIVE/$rel")" \
-      || die "could not archive the original - refusing to publish over it"
-    say "archived original -> $ARCHIVE/$rel"
-  fi
-
-  retry ssh "$REMOTE" "mv -f $(printf '%q' "$dest/$tmp") $(printf '%q' "$dest/$BASE.mkv")" \
-    || die "could not publish $BASE.mkv"
-  phase_set idle 0 0
-  rm -rf "$W"
-}
-
-case "$PHASE" in
-  fetch)   do_fetch ;;
-  process) do_process ;;
-  deliver) do_deliver "${2:-}" ;;
-  run)     do_fetch; do_process; do_deliver "${2:-}" ;;
-  # Deliberately the same three phases as `run`. fetch and deliver are no-ops
-  # here, so the shape of an episode is identical on every machine and the
-  # collector still gets a "leaving ... for the server" line in its log.
-  box)     do_fetch; do_process; do_deliver ;;
-esac
+do_process

@@ -29,7 +29,7 @@ sources live in the same tree as their outputs. Verified consequences in
 different directories.** Then a source is "a file in the source dir", full stop —
 any extension, no probing, no archive lookup, no ignore-by-glob.
 
-- [ ] **Move to explicit source/target on the command line.** Proposed shape:
+- [x] **Move to explicit source/target on the command line.** Proposed shape:
       ```
       upscale --source /path/to/src --target /path/to/out --size 2 \
               --device <ip1> <ip2> [--delete | --archive /path/to/archive]
@@ -38,12 +38,12 @@ any extension, no probing, no archive lookup, no ignore-by-glob.
   - `--delete` or `--archive <dir>` replaces the current in-place archive dance.
   - `.upscaleignore` still works, placed in the source dir — but excluding an
     episode becomes "move it out of the source dir", which needs no feature.
-- [ ] **Delete `SRC_EXT` and everything that keys off it**, including
+- [x] **Deleted `SRC_EXT` and everything that keyed off it**, including
       `archived_for()` and the source-vs-output disambiguation.
 
 ## Transfer path — one implementation, not two
 
-- [ ] **Remove the duplicate transfer path.** There are two separate
+- [x] **Removed the duplicate transfer path.** There are two separate
       implementations of the same movement:
   - box mode: the *server* pushes (`upscale` L1314) and pulls (L1377) over ssh
   - local mode: the *worker* rsyncs for itself (`libexec/upscale-worker`)
@@ -52,7 +52,7 @@ any extension, no probing, no archive lookup, no ignore-by-glob.
 
 ## Identity — use the name
 
-- [ ] **Stop identifying episodes by picture content.** The PSNR identity check
+- [x] **Stopped identifying episodes by picture content.** The PSNR identity check
       (`upscale-worker` L583-611) exists because **the box always receives the
       file as `src.avi`** (`upscale` L841: *"On the box the source is always
       called src.avi"*). The transfer destroys the filename, so the returned
@@ -69,19 +69,37 @@ any extension, no probing, no archive lookup, no ignore-by-glob.
 
 ## Remove outright
 
-- [ ] **`upscale-artwork`** — a one-off thumbnail fix that was never meant to be
+- [x] **`upscale-artwork`** — a one-off thumbnail fix that was never meant to be
       permanent code. Remove `libexec/upscale-artwork`,
       `upscale-artwork.service`, `upscale-artwork.timer`, the `install.sh`
       lines, and disable the timer on any host running it.
-- [ ] **The TUI status renderer (`cmd_status`)** — deprecated by the web UI,
+- [x] **The TUI status renderer (`cmd_status`)** — deprecated by the web UI,
       which reads the same device files. Two renderers of one state is exactly
       the drift this project keeps paying for.
 
 ## Sequencing (so nothing breaks mid-run)
 
-- [ ] Do the removals first (`upscale-artwork`, `cmd_status`) — they touch
+- [x] Did the removals first (`upscale-artwork`, `cmd_status`) — they touch
       nothing a running queue depends on.
-- [ ] Do the source/target change as one commit with the transfer rework; they
-      are the same change seen from two ends.
-- [ ] Land it only when no queue is mid-episode, and keep the old device files
-      readable — the UI reads them and must not break in the same step.
+- [x] Source/target and the transfer rework landed together.
+- [x] Landed with both queues stopped. The UI was rewritten in the same pass
+      because its data source (per-device .conf files) no longer exists.
+
+## Result
+
+```
+upscale               1936 -> 228 lines
+libexec/upscale-worker 691 -> 513
+upscale-ui server.py  1341 -> 253
+upscale-ui page       599 -> 139
+deleted outright: upscale-artwork, upscale-watch, upscale-guard,
+                  upscale-worker-remote, 4 systemd units
+```
+
+## Still open
+
+- [ ] Re-point the Gintama work at the new CLI. The old device configs in
+      `~/.upscale/devices/` are dead; a run is now one command with --source
+      and --target. Nothing is queued right now.
+- [ ] The 3 fenced episodes (S02E18, S02E35, S03E14) and S01E34 still carry
+      their notes in /mnt/media/tv/Gintama/TASKS.md.
