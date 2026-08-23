@@ -73,6 +73,7 @@ exit 2; }
 # registry to know that "rental" and "-p 31174 root@1.2.3.4" are the same box.
 dev_name(){ case "$1" in [A-Za-z0-9_.-]*=*) printf '%s' "${1%%=*}" ;; *) printf '%s' "$1" ;; esac; }
 dev_spec(){ case "$1" in [A-Za-z0-9_.-]*=*) printf '%s' "${1#*=}" ;; *) printf '%s' "$1" ;; esac; }
+key(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 
 # Defaults live until the first --device; after that, an option belongs to the
 # device it follows. This is the only place the two are distinguished.
@@ -132,6 +133,25 @@ done
 mkdir -p "$RUN"
 STOP="$RUN/stop"; rm -f "$STOP"
 
+# A SOURCE DIRECTORY IS OWNED BY ONE RUN. Two devices cannot share one, and
+# neither can two runs: with no per-file claims left, a second run over the same
+# directory would hand the same file to another machine. Two drivers were found
+# doing exactly that, 38 minutes apart, both walking the same queue.
+#
+# The lock names the pid holding it, so a run that was killed does not lock the
+# directory for ever.
+for i in $(seq 0 $((n-1))); do
+  lk="$RUN/lock-$(key "$(readlink -f "${srcs[$i]}")")"
+  if [ -d "$lk" ]; then
+    owner=$(cat "$lk/pid" 2>/dev/null || true)
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      die "${srcs[$i]} is already being worked by pid $owner"
+    fi
+    rm -rf "$lk"
+  fi
+  mkdir -p "$lk" && printf '%s' "$$" > "$lk/pid"
+done
+
 # ---------------------------------------------------------------- sources ---
 ignored(){        # $1 = filename, $2 = source dir
   local f=$1 dir=$2 pat
@@ -155,7 +175,6 @@ sources(){        # $1 = source dir
   done
 }
 
-key(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 # No claiming. A device owns its source directory, so the only file two
 # devices could both pick is one that is in two directories at once, which it
 # cannot be. Reassigning an episode is moving it; there is nothing to release.
@@ -305,6 +324,9 @@ trap 'touch "$STOP"; say "stopping after the current file"' INT TERM
 cleanup(){
   local d
   rm -f "$RUN/state.json"
+  for d in "$RUN"/lock-*; do
+    [ -d "$d" ] && [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] && rm -rf "$d"
+  done
   for d in "$RUN"/claim-*; do
     [ -d "$d" ] && [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] && rm -rf "$d"
   done
