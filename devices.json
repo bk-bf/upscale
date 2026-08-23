@@ -1,0 +1,12 @@
+{
+  "rental": {
+    "ssh": "-p 31174 root@87.192.102.26",
+    "scratch": "",
+    "workers": 8
+  },
+  "desktop": {
+    "ssh": "desktop",
+    "scratch": "/home/kirill/upscale-scratch",
+    "workers": 8
+  }
+}

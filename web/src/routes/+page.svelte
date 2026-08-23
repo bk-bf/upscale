@@ -24,7 +24,7 @@
   const pause  = () => post("/api/pause");
   const resume = () => post("/api/resume");
   const stop   = () => post("/api/stop", "Stop after the current file?");
-  $effect(() => { refresh(); timer = setInterval(refresh, 3000); return () => clearInterval(timer); });
+  $effect(() => { refresh(); loadBook(); timer = setInterval(refresh, 3000); return () => clearInterval(timer); });
 
   // --- starting a run -------------------------------------------------------
   // The form assembles arguments; the server execs `upscale` with them. Nothing
@@ -63,6 +63,40 @@
   const addDevice = () => (form.devices = [...form.devices, ""]);
   const dropDevice = (i) => (form.devices = form.devices.filter((_, k) => k !== i));
 
+  // --- machines: an address book, so a rented box is not a row of digits -----
+  let book = $state({});
+  let showMachines = $state(false);
+  let nd = $state({ name: "", ssh: "", scratch: "", workers: "" });
+  let probed = $state(null);
+
+  async function loadBook() { book = (await (await fetch("/api/devices")).json()).devices || {}; }
+  async function probeDevice() {
+    probed = null;
+    const r = await fetch("/api/devices/probe", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ssh: nd.ssh }) });
+    const j = await r.json();
+    probed = j.probe || { reachable: false, error: j.error };
+  }
+  async function saveDevice() {
+    const r = await fetch("/api/devices/add", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(nd) });
+    const j = await r.json();
+    if (!j.ok) { err = j.error; return; }
+    book = j.devices; nd = { name: "", ssh: "", scratch: "", workers: "" }; probed = null;
+  }
+  async function removeDevice(name) {
+    if (!confirm(`Forget ${name}?`)) return;
+    const r = await fetch("/api/devices/remove", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    book = (await r.json()).devices || {};
+    form.devices = form.devices.filter((d) => d !== name);
+  }
+  function toggleDevice(name) {
+    const has = form.devices.includes(name);
+    form.devices = has ? form.devices.filter((d) => d !== name)
+                       : [...form.devices.filter((d) => d), name];
+  }
+
   const gb = (b) => (b ? `${(b / 1073741824).toFixed(1)} GB` : "");
   const hhmm = (s) => (s ? `${Math.floor(s / 60)}m` : "");
   const dir = (p) => (p || "").replace(/\/[^/]*$/, "");
@@ -82,6 +116,7 @@
     </span>
   {/each}
   <span class="spacer"></span>
+  <button class="tb" onclick={() => (showMachines = !showMachines)}>⚙ Machines</button>
   {#if d.running}
     <button class="tb" onclick={loadLog}>Log</button>
     {#if d.paused}
@@ -94,6 +129,48 @@
 </nav>
 
 {#if err}<div class="bar err">{err}</div>{/if}
+{#if showMachines}
+  <div class="starter">
+    <h2>Machines</h2>
+    {#each Object.entries(book) as [name, m]}
+      <div class="mrow">
+        <strong>{name}</strong>
+        <code class="mssh">{m.ssh}</code>
+        <span class="spacer"></span>
+        <button class="tb danger" onclick={() => removeDevice(name)}>Forget</button>
+      </div>
+    {:else}
+      <p class="muted" style="font-size:.83rem;margin:0">No machines yet. Add one below.</p>
+    {/each}
+    <div class="fields" style="border-top:1px solid #232838;padding-top:.8rem">
+      <div class="opts">
+        <label><span class="lbl">Name</span><input bind:value={nd.name} placeholder="rental" /></label>
+        <label class="grow"><span class="lbl">SSH destination</span>
+          <input bind:value={nd.ssh} placeholder="desktop   or   -p 31174 root@1.2.3.4" /></label>
+      </div>
+      <div class="opts">
+        <label class="grow"><span class="lbl">Scratch <em>optional</em></span><input bind:value={nd.scratch} placeholder="/home/kirill/upscale-scratch" /></label>
+        <label><span class="lbl">Workers <em>optional</em></span><input type="number" bind:value={nd.workers} /></label>
+      </div>
+      <div class="pathrow">
+        <button type="button" class="tb" onclick={probeDevice} disabled={!nd.ssh}>Test connection</button>
+        <button type="button" class="tb go" onclick={saveDevice} disabled={!nd.name || !nd.ssh}>Save machine</button>
+      </div>
+      {#if probed}
+        <div class="probe" class:bad={!probed.reachable}>
+          {#if probed.reachable}
+            <div><strong>{probed.host}</strong> reachable</div>
+            <div class="muted">{probed.gpu || "no NVIDIA GPU reported"} · {probed.cores} cores · {probed.free} GB free</div>
+            {#each probed.warnings as w}<div class="warn">⚠ {w}</div>{/each}
+          {:else}
+            <div class="warn">unreachable — {probed.error}</div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
 {#if !d.running}
   <form class="starter" onsubmit={(e) => { e.preventDefault(); start(); }}>
     <h2>New run</h2>
@@ -117,7 +194,15 @@
         <label class="grow"><span class="lbl">Scratch <em>on the device</em></span><input bind:value={form.scratch} placeholder="(worker default)" /></label>
       </div>
       <div class="devs">
-        <span class="lbl">Devices <em>ssh destination per GPU</em></span>
+        <span class="lbl">Devices <em>pick a machine, or type an ssh destination</em></span>
+        {#if Object.keys(book).length}
+          <div class="chips">
+            {#each Object.entries(book) as [name, m]}
+              <button type="button" class="pickchip" class:on={form.devices.includes(name)}
+                      onclick={() => toggleDevice(name)} title={m.ssh}>{name}</button>
+            {/each}
+          </div>
+        {/if}
         {#each form.devices as _, i}
           <span class="pathrow">
             <input bind:value={form.devices[i]} placeholder={"desktop   or   -p 31174 root@1.2.3.4"} />
@@ -264,6 +349,18 @@
     color: #e6e6e6; font: inherit; font-size: .84rem; padding: .3rem 0; cursor: pointer; }
   .dirs button:hover { color: #7ab6f5; }
   .dirs .muted { font-size: .74rem; font-variant-numeric: tabular-nums; }
+  .mrow { display: flex; align-items: center; gap: .6rem; font-size: .85rem;
+    padding: .3rem 0; border-bottom: 1px solid #171b26; }
+  .mssh { font-family: ui-monospace, monospace; font-size: .74rem; color: #8b93a7;
+    background: #0b0d12; padding: .1rem .4rem; border-radius: 4px; }
+  .chips { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .3rem; }
+  .pickchip { background: #171b26; border: 1px solid #2b3244; color: #8b93a7;
+    border-radius: 999px; padding: .2rem .7rem; font: inherit; font-size: .8rem; cursor: pointer; }
+  .pickchip.on { background: #17273f; border-color: #3b82f6; color: #7ab6f5; }
+  .probe { background: #0b0d12; border: 1px solid #232838; border-radius: 6px;
+    padding: .6rem .8rem; font-size: .82rem; display: flex; flex-direction: column; gap: .15rem; }
+  .probe.bad { border-color: #5a2233; }
+  .warn { color: #f5d76e; }
   .runlog { margin: 0 .9rem 1rem; padding: .8rem; background: #0b0d12;
     border: 1px solid #232838; border-radius: 8px; font-size: .74rem;
     max-height: 30vh; overflow: auto; white-space: pre-wrap; }

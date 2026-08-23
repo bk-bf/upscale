@@ -99,6 +99,66 @@ def browse(where: str) -> dict:
     return {"path": str(p), "up": up, "dirs": dirs, "files": files}
 
 
+# ------------------------------------------------------------------ devices ---
+# An ADDRESS BOOK, nothing more. It maps a name to an ssh destination so a
+# rented box is not a row of digits. It does not decide what a device does -
+# that is decided by the run, in its arguments, every time.
+DEVICES_PATH = HERE / "devices.json"
+
+
+def devices() -> dict:
+    try:
+        return json.loads(DEVICES_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_devices(d: dict) -> None:
+    tmp = DEVICES_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d, indent=2))
+    tmp.replace(DEVICES_PATH)
+
+
+def probe(spec: str) -> dict:
+    """Can we reach it, and is it ready to be given work?
+
+    Reports what would actually stop a run: no worker installed, no upscaler
+    binary, no mkvtoolnix (results play in mpv and fail in Jellyfin without it),
+    and how many cores the cgroup really allows - `nproc` lies on a rented box,
+    and worker count follows cores, not the card.
+    """
+    out = {"ssh": spec, "reachable": False}
+    rc, o, err = ssh_to(spec, (
+        "printf 'host=%s\n' \"$(hostname)\"; "
+        "printf 'worker=%s\n' \"$([ -x $HOME/.local/libexec/upscale-worker ] && echo yes || echo no)\"; "
+        "printf 'mkvmerge=%s\n' \"$(command -v mkvmerge >/dev/null && echo yes || echo no)\"; "
+        "printf 'gpu=%s\n' \"$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)\"; "
+        "printf 'nproc=%s\n' \"$(nproc)\"; "
+        "printf 'cpumax=%s\n' \"$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)\"; "
+        "printf 'free=%s\n' \"$(df -BG --output=avail $HOME 2>/dev/null | tail -1 | tr -d ' G')\""
+    ), timeout=25)
+    if rc != 0:
+        out["error"] = (err or "ssh failed").strip()[:200]
+        return out
+    out["reachable"] = True
+    for line in o.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip()
+    quota, period = (out.get("cpumax") or "").split(" ") if " " in (out.get("cpumax") or "") else ("", "")
+    if quota.isdigit() and period.isdigit() and int(period):
+        out["cores"] = round(int(quota) / int(period), 1)
+    elif (out.get("nproc") or "").isdigit():
+        out["cores"] = int(out["nproc"])
+    warn = []
+    if out.get("worker") != "yes":
+        warn.append("upscale-worker is not installed on it")
+    if out.get("mkvmerge") != "yes":
+        warn.append("mkvtoolnix is missing — results will fail in Jellyfin")
+    out["warnings"] = warn
+    return out
+
+
 # -------------------------------------------------------------------- start ---
 def start_run(body: dict) -> dict:
     """Build an `upscale` command line and run it.
@@ -110,10 +170,19 @@ def start_run(body: dict) -> dict:
     if state():
         return {"ok": False, "error": "a run is already going"}
     src, tgt = (body.get("source") or "").strip(), (body.get("target") or "").strip()
-    devices = [d.strip() for d in (body.get("devices") or []) if d and d.strip()]
+    book = devices()
+    # A saved name is resolved to NAME=SPEC so the name travels with the
+    # command and comes back in the log and the snapshot.
+    devs = []
+    for d in (body.get("devices") or []):
+        d = (d or "").strip()
+        if not d:
+            continue
+        devs.append(f"{d}={book[d]['ssh']}" if d in book else d)
+    devices_ = devs
     if not src or not tgt:
         return {"ok": False, "error": "source and target are required"}
-    if not devices:
+    if not devices_:
         return {"ok": False, "error": "at least one device is required"}
     for d in (src, tgt):
         if not allowed(Path(d)):
@@ -133,7 +202,7 @@ def start_run(body: dict) -> dict:
         v = str(body.get(k) or "").strip()
         if v:
             argv += [flag, v]
-    for d in devices:
+    for d in devices_:
         argv += ["--device", d]
     RUN.mkdir(parents=True, exist_ok=True)
     try:
@@ -333,6 +402,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"log": RUN_LOG.read_text(errors="replace")[-8000:]})
             except OSError:
                 return self._json({"log": ""})
+        if path == "/api/devices":
+            return self._json({"devices": devices()})
         if path == "/api/health":
             return self._json({"ok": True, "state": str(STATE_JSON),
                                "running": bool(state())})
@@ -358,6 +429,32 @@ class Handler(BaseHTTPRequestHandler):
             if bad:
                 return self._json({"ok": False, "error": "; ".join(bad)}, 502)
             return self._json({"ok": True, "action": action, "devices": len(devs)})
+        if path in ("/api/devices/probe", "/api/devices/add", "/api/devices/remove"):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except (ValueError, OSError) as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            if path.endswith("probe"):
+                spec = (body.get("ssh") or "").strip()
+                if not spec:
+                    return self._json({"ok": False, "error": "ssh destination is required"}, 400)
+                return self._json({"ok": True, "probe": probe(spec)})
+            book = devices()
+            if path.endswith("remove"):
+                book.pop((body.get("name") or "").strip(), None)
+                save_devices(book)
+                return self._json({"ok": True, "devices": book})
+            name = (body.get("name") or "").strip()
+            spec = (body.get("ssh") or "").strip()
+            if not name or not spec:
+                return self._json({"ok": False, "error": "name and ssh destination are required"}, 400)
+            if not all(c.isalnum() or c in "._-" for c in name):
+                return self._json({"ok": False, "error": "name may use letters, digits, dot, dash, underscore"}, 400)
+            book[name] = {"ssh": spec, "scratch": (body.get("scratch") or "").strip(),
+                          "workers": body.get("workers") or ""}
+            save_devices(book)
+            return self._json({"ok": True, "devices": book})
         if path == "/api/start":
             try:
                 n = int(self.headers.get("Content-Length") or 0)
