@@ -35,87 +35,38 @@ STATE_DIR=${UPSCALE_STATE:-$HOME/.upscale}
 RUN="$STATE_DIR/run"
 WORKER=${WORKER:-.local/libexec/upscale-worker}   # path on the DEVICE, from $HOME
 
-SOURCE='' TARGET='' ARCHIVE='' DELETE=0 SIZE=2 WORKERS='' SCRATCH='' MODEL=''
-DEVICES=()
 
 say(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ printf 'upscale: %s\n' "$*" >&2; exit 1; }
 
 usage(){ cat >&2 <<'EOF'
-usage: upscale --source DIR --target DIR --device SPEC [--device SPEC ...]
-               [--size N] [--archive DIR | --delete]
-               [--workers N] [--scratch DIR] [--model NAME]
+usage: upscale [common options] --device NAME=SPEC [options] [--device ...]
 
-  --source DIR   every regular file here is a source. Any extension.
+  A device OWNS a source directory. Options written after a --device belong to
+  that device; options written before the first one are defaults for all of
+  them. Two devices may share a target, never a source.
+
+    upscale --target /srv/done --archive /srv/originals --size 2 \
+            --device "rental=-p 31174 root@1.2.3.4" --source /srv/lane-a \
+            --device desktop --source /srv/lane-b --scratch /fast/scratch
+
+  --device NAME=SPEC  an ssh destination; NAME is what appears in the log and
+                      on the page. A bare destination is its own name.
+  --source DIR   the files this device works through. Any extension.
   --target DIR   results are written here under the same filename.
-  --device SPEC  an ssh destination: "desktop", or "-p 31174 root@1.2.3.4".
-                 Repeatable. Devices run in parallel, one file each.
-                 Write it as NAME=SPEC to give the machine a name, e.g.
-                 --device "rental=-p 31174 root@1.2.3.4" - the name is what
-                 appears in the log and on the page, so a rented box is not a
-                 row of digits.
-  --size N       scale factor (default 2).
   --archive DIR  move each source here once its result is written, or
-  --delete       delete it. One of the two is required: a source that stays a
-                 source would be upscaled again on the next run.
-  --workers N    upscaler processes per device.
+  --delete       delete it. One of the two is required, so a finished file
+                 stops being a source.
+  --size N       scale factor (default 2).
+  --workers N    upscaler processes on that device.
   --scratch DIR  working directory ON the device (~40 GB per file).
   --model NAME   model name, passed through to the worker.
 
-  A .upscaleignore in --source excludes files: one glob per line, '#' comments.
-  Moving a file out of --source does the same thing and needs no feature.
+  Which device does an episode? The one whose source directory holds it.
+  Reassigning is moving the file to the other directory; there is nothing else
+  to set. A .upscaleignore in a source directory excludes files by glob.
 EOF
 exit 2; }
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --source)  SOURCE=${2:?}; shift 2 ;;
-    --target)  TARGET=${2:?}; shift 2 ;;
-    --device)  DEVICES+=("${2:?}"); shift 2 ;;   # [NAME=]SPEC, split at use
-    --size)    SIZE=${2:?}; shift 2 ;;
-    --archive) ARCHIVE=${2:?}; shift 2 ;;
-    --delete)  DELETE=1; shift ;;
-    --workers) WORKERS=${2:?}; shift 2 ;;
-    --scratch) SCRATCH=${2:?}; shift 2 ;;
-    --model)   MODEL=${2:?}; shift 2 ;;
-    -h|--help) usage ;;
-    *) die "unknown option: $1  (--help)" ;;
-  esac
-done
-
-[ -n "$SOURCE" ] && [ -n "$TARGET" ] || usage
-[ "${#DEVICES[@]}" -gt 0 ] || die "at least one --device"
-[ -d "$SOURCE" ] || die "no such source directory: $SOURCE"
-[ "$DELETE" = 1 ] && [ -n "$ARCHIVE" ] && die "--archive and --delete are exclusive"
-[ "$DELETE" = 0 ] && [ -z "$ARCHIVE" ] && \
-  die "one of --archive DIR or --delete is required, so a finished file stops being a source"
-mkdir -p "$TARGET" || die "cannot create target: $TARGET"
-[ -n "$ARCHIVE" ] && { mkdir -p "$ARCHIVE" || die "cannot create archive: $ARCHIVE"; }
-mkdir -p "$RUN"
-STOP="$RUN/stop"; rm -f "$STOP"
-
-# ---------------------------------------------------------------- sources ---
-ignored(){
-  local f=$1 pat
-  [ -f "$SOURCE/.upscaleignore" ] || return 1
-  while IFS= read -r pat || [ -n "$pat" ]; do
-    case "$pat" in ''|'#'*) continue ;; esac
-    # shellcheck disable=SC2254
-    case "$f" in $pat) return 0 ;; esac
-  done < "$SOURCE/.upscaleignore"
-  return 1
-}
-
-# No extension test. What makes a file a source is where it is.
-sources(){
-  local p b
-  for p in "$SOURCE"/*; do
-    [ -f "$p" ] || continue
-    b=${p##*/}
-    case "$b" in .*) continue ;; esac
-    ignored "$b" || printf '%s\n' "$b"
-  done
-}
 
 # A device may be written NAME=SPEC. The name is a label only - it never
 # decides anything - but it travels with the command, so nothing has to keep a
@@ -123,34 +74,96 @@ sources(){
 dev_name(){ case "$1" in [A-Za-z0-9_.-]*=*) printf '%s' "${1%%=*}" ;; *) printf '%s' "$1" ;; esac; }
 dev_spec(){ case "$1" in [A-Za-z0-9_.-]*=*) printf '%s' "${1#*=}" ;; *) printf '%s' "$1" ;; esac; }
 
-key(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
-# mkdir is atomic, so two devices asking for the same file cannot both win.
-# The claim records WHO holds it, because a driver that is killed mid-file
-# would otherwise leave the claim behind for ever - and a claimed file is
-# skipped by every later run, so the episode simply disappears. Same shape as
-# an abandoned .part being read as a delivery in flight.
-claim(){   mkdir "$RUN/claim-$(key "$1")" 2>/dev/null && printf '%s' "$$" > "$RUN/claim-$(key "$1")/pid"; }
-unclaim(){ rm -rf "$RUN/claim-$(key "$1")" 2>/dev/null || true; }
+# Defaults live until the first --device; after that, an option belongs to the
+# device it follows. This is the only place the two are distinguished.
+d_source='' d_target='' d_archive='' d_delete=0
+d_workers='' d_scratch='' d_model='' d_size=2
+n=0
+names=() specs=() srcs=() tgts=() arcs=() dels=() wkss=() scrs=() mdls=() szs=()
 
-# Claims whose holder is gone are not claims.
-release_stale(){
-  local d owner
-  for d in "$RUN"/claim-*; do
-    [ -d "$d" ] || continue
-    owner=$(cat "$d/pid" 2>/dev/null || true)
-    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
-      rm -rf "$d"
-    fi
+set_opt(){        # $1 = array name, $2 = default var name, $3 = value
+  if [ "$n" -eq 0 ]; then printf -v "$2" '%s' "$3"
+  else eval "$1[\$((n-1))]=\$3"; fi
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --device)
+      n=$((n+1))
+      names+=("$(dev_name "${2:?}")"); specs+=("$(dev_spec "${2:?}")")
+      srcs+=("$d_source"); tgts+=("$d_target"); arcs+=("$d_archive")
+      dels+=("$d_delete"); wkss+=("$d_workers"); scrs+=("$d_scratch")
+      mdls+=("$d_model"); szs+=("$d_size")
+      shift 2 ;;
+    --source)  set_opt srcs d_source  "${2:?}"; shift 2 ;;
+    --target)  set_opt tgts d_target  "${2:?}"; shift 2 ;;
+    --archive) set_opt arcs d_archive "${2:?}"; shift 2 ;;
+    --delete)  set_opt dels d_delete  1;        shift ;;
+    --workers) set_opt wkss d_workers "${2:?}"; shift 2 ;;
+    --scratch) set_opt scrs d_scratch "${2:?}"; shift 2 ;;
+    --model)   set_opt mdls d_model   "${2:?}"; shift 2 ;;
+    --size)    set_opt szs  d_size    "${2:?}"; shift 2 ;;
+    -h|--help) usage ;;
+    *) die "unknown option: $1  (--help)" ;;
+  esac
+done
+
+[ "$n" -gt 0 ] || usage
+
+for i in $(seq 0 $((n-1))); do
+  nm=${names[$i]}
+  [ -n "${srcs[$i]}" ] || die "$nm has no --source"
+  [ -n "${tgts[$i]}" ] || die "$nm has no --target"
+  [ -d "${srcs[$i]}" ] || die "$nm: no such source directory: ${srcs[$i]}"
+  [ "${dels[$i]}" = 1 ] && [ -n "${arcs[$i]}" ] && die "$nm: --archive and --delete are exclusive"
+  [ "${dels[$i]}" = 0 ] && [ -z "${arcs[$i]}" ] && \
+    die "$nm: needs --archive DIR or --delete, so a finished file stops being a source"
+  mkdir -p "${tgts[$i]}" || die "$nm: cannot create target: ${tgts[$i]}"
+  [ -n "${arcs[$i]}" ] && { mkdir -p "${arcs[$i]}" || die "$nm: cannot create archive: ${arcs[$i]}"; }
+  # TWO DEVICES MAY NOT SHARE A SOURCE. That is what makes assignment a fact
+  # rather than a race: the directory a file sits in names the machine that
+  # will do it, and nothing has to claim anything.
+  for j in $(seq 0 $((i-1))); do
+    [ "$(readlink -f "${srcs[$i]}")" = "$(readlink -f "${srcs[$j]}")" ] && \
+      die "${names[$j]} and $nm share a source directory - give each its own"
+  done
+done
+
+mkdir -p "$RUN"
+STOP="$RUN/stop"; rm -f "$STOP"
+
+# ---------------------------------------------------------------- sources ---
+ignored(){        # $1 = filename, $2 = source dir
+  local f=$1 dir=$2 pat
+  [ -f "$dir/.upscaleignore" ] || return 1
+  while IFS= read -r pat || [ -n "$pat" ]; do
+    case "$pat" in ''|'#'*) continue ;; esac
+    # shellcheck disable=SC2254
+    case "$f" in $pat) return 0 ;; esac
+  done < "$dir/.upscaleignore"
+  return 1
+}
+
+# No extension test. What makes a file a source is where it is.
+sources(){        # $1 = source dir
+  local p b
+  for p in "$1"/*; do
+    [ -f "$p" ] || continue
+    b=${p##*/}
+    case "$b" in .*) continue ;; esac
+    ignored "$b" "$1" || printf '%s\n' "$b"
   done
 }
 
-next_source(){
+key(){ printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+# No claiming. A device owns its source directory, so the only file two
+# devices could both pick is one that is in two directories at once, which it
+# cannot be. Reassigning an episode is moving it; there is nothing to release.
+next_source(){    # $1 = source dir, $2 = target dir
   local b
   while IFS= read -r b; do
-    [ -e "$TARGET/$b" ] && continue
-    claim "$b" || continue
-    printf '%s\n' "$b"; return 0
-  done < <(sources | sort)
+    [ -e "$2/$b" ] || { printf '%s\n' "$b"; return 0; }
+  done < <(sources "$1" | sort)
   return 1
 }
 
@@ -181,9 +194,11 @@ frames(){ ffprobe -v error -select_streams v:0 -count_packets \
             -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null; }
 
 # ------------------------------------------------------------------- work ---
-run_one(){
-  local entry=$1 name=$2 dev nm st rwork out want got
-  dev=$(dev_spec "$entry"); nm=$(dev_name "$entry")
+run_one(){        # $1 lane index, $2 filename
+  local i=$1 name=$2 dev nm src tgt arc del wk scr mdl siz st rwork out want got
+  nm=${names[$i]}; dev=${specs[$i]}
+  src=${srcs[$i]}; tgt=${tgts[$i]}; arc=${arcs[$i]}; del=${dels[$i]}
+  wk=${wkss[$i]}; scr=${scrs[$i]}; mdl=${mdls[$i]}; siz=${szs[$i]}
   st="$RUN/$(key "$nm")"; mkdir -p "$st"
   rwork=$(rsh "$dev" 'printf %s "${UPSCALE_WORK:-$HOME/upscale-work}"' | tr -d '\r') || rwork=
   [ -n "$rwork" ] || { say "[$nm] unreachable"; return 1; }
@@ -214,12 +229,12 @@ run_one(){
 
   if ! rsh "$dev" "test -s $(printf %q "$rwork/out-$name")" 2>/dev/null; then
     phase sending; say "[$nm] $name: sending"
-    push "$dev" "$SOURCE/$name" "$rwork/$name" "$st" || { say "[$nm] $name: send failed"; return 1; }
+    push "$dev" "$src/$name" "$rwork/$name" "$st" || { say "[$nm] $name: send failed"; return 1; }
     phase upscaling; say "[$nm] $name: upscaling"
     # shellcheck disable=SC2086
     rsh "$dev" "cd $(printf %q "$rwork") && setsid nohup env \
-          ${WORKERS:+WORKERS=$WORKERS} ${SCRATCH:+WORK=$(printf %q "$SCRATCH")} \
-          ${MODEL:+MODEL=$MODEL} SCALE=$SIZE \
+          ${wk:+WORKERS=$wk} ${scr:+WORK=$(printf %q "$scr")} \
+          ${mdl:+MODEL=$mdl} SCALE=$siz \
           \$HOME/$WORKER process $(printf %q "$rwork/$name") $(printf %q "$rwork/out-$name") \
           < /dev/null >> $(printf %q "$rwork/log") 2>&1" \
       || { say "[$nm] $name: upscale failed (see $rwork/log on the device)"; return 1; }
@@ -228,34 +243,32 @@ run_one(){
   fi
 
   phase retrieving; say "[$nm] $name: retrieving"
-  out="$TARGET/.$name.part"
+  out="$tgt/.$name.part"
   pull "$dev" "$rwork/out-$name" "$out" "$st" || { say "[$nm] $name: retrieve failed"; return 1; }
 
   # The only check worth making. A truncated transfer is what actually goes
   # wrong, and frame count catches it exactly. WHICH episode this is was never
   # in question.
-  want=$(frames "$SOURCE/$name"); got=$(frames "$out")
+  want=$(frames "$src/$name"); got=$(frames "$out")
   if [ -z "$got" ] || [ "$want" != "$got" ]; then
     say "[$nm] $name: $got frames, source has $want - left as .part, not published"
     return 1
   fi
 
-  mv -f "$out" "$TARGET/$name"
+  mv -f "$out" "$tgt/$name"
   rsh "$dev" "rm -f $(printf %q "$rwork/$name") $(printf %q "$rwork/out-$name")" >/dev/null 2>&1 || true
-  if [ "$DELETE" = 1 ]; then rm -f "$SOURCE/$name"; say "[$nm] $name: done, source deleted"
-  else mv -f "$SOURCE/$name" "$ARCHIVE/$name"; say "[$nm] $name: done, source archived"; fi
+  if [ "$del" = 1 ]; then rm -f "$src/$name"; say "[$nm] $name: done, source deleted"
+  else mv -f "$src/$name" "$arc/$name"; say "[$nm] $name: done, source archived"; fi
   rm -f "$st/file" "$st/phase" "$st/xfer"
 }
 
 # "What is left" is read from the source directory every time, so files added
 # while this runs are simply picked up.
-device_loop(){
-  local entry=$1 nm name
-  nm=$(dev_name "$entry")
+device_loop(){    # $1 = lane index
+  local i=$1 nm=${names[$1]} name
   while [ ! -f "$STOP" ]; do
-    name=$(next_source) || { say "[$nm] nothing left"; return 0; }
-    run_one "$entry" "$name" || say "[$nm] $name: left in place for a later run"
-    unclaim "$name"
+    name=$(next_source "${srcs[$i]}" "${tgts[$i]}") || { say "[$nm] nothing left"; return 0; }
+    run_one "$i" "$name" || say "[$nm] $name: left in place for a later run"
   done
   say "[$nm] stopped"
 }
@@ -263,10 +276,10 @@ device_loop(){
 # A snapshot for whatever wants to watch: the web UI reads this rather than
 # being told, so there is no second place that decides what is running.
 snapshot(){
-  local d f ph nm sp xf first=1
-  { printf '{"source":"%s","target":"%s","size":%s,"devices":[' "$SOURCE" "$TARGET" "$SIZE"
-    for d in "${DEVICES[@]}"; do
-      nm=$(dev_name "$d"); sp=$(dev_spec "$d")
+  local i f ph nm sp xf first=1
+  { printf '{"devices":['
+    for i in $(seq 0 $((n-1))); do
+      nm=${names[$i]}; sp=${specs[$i]}
       f=$(cat "$RUN/$(key "$nm")/file" 2>/dev/null || true)
       # The DRIVER's phase, not the worker's. The worker only knows the GPU
       # part; sending and retrieving are this program's doing, and a worker
@@ -275,8 +288,9 @@ snapshot(){
       # last non-empty progress sample: "  123,456,789  45%  1.85MB/s  0:02:13"
       xf=$(grep -a '%' "$RUN/$(key "$nm")/xfer" 2>/dev/null | tail -1 | tr -s ' ' || true)
       [ "$first" = 1 ] || printf ','; first=0
-      printf '{"device":"%s","ssh":"%s","file":"%s","phase":"%s","xfer":"%s"}' \
-             "$nm" "$sp" "$f" "$ph" "$(printf '%s' "$xf" | tr -d '"')"
+      printf '{"device":"%s","ssh":"%s","source":"%s","target":"%s","file":"%s","phase":"%s","xfer":"%s"}' \
+             "$nm" "$sp" "${srcs[$i]}" "${tgts[$i]}" "$f" "$ph" \
+             "$(printf '%s' "$xf" | tr -d '"')"
     done
     printf '],"ts":%s}' "$(date +%s)"
   } > "$RUN/state.json.tmp" && mv -f "$RUN/state.json.tmp" "$RUN/state.json"
@@ -285,8 +299,6 @@ watcher(){ while [ ! -f "$STOP" ]; do snapshot; sleep 5; done; snapshot; }
 
 trap 'touch "$STOP"; say "stopping after the current file"' INT TERM
 
-release_stale
-say "$(sources | wc -l) file(s) in $SOURCE -> $TARGET, x$SIZE, ${#DEVICES[@]} device(s)"
 # The snapshot is only true while this process is alive. Left behind, it makes
 # the page report a run that ended - the same shape of bug as an abandoned
 # .part being read as a delivery in flight.
@@ -300,9 +312,13 @@ cleanup(){
 }
 trap cleanup EXIT
 
+for i in $(seq 0 $((n-1))); do
+  say "[${names[$i]}] $(sources "${srcs[$i]}" | wc -l) file(s)  ${srcs[$i]} -> ${tgts[$i]}  x${szs[$i]}"
+done
+
 watcher &
 _watch=$!
-for d in "${DEVICES[@]}"; do device_loop "$d" & done
-for d in "${DEVICES[@]}"; do wait -n 2>/dev/null || true; done
+for i in $(seq 0 $((n-1))); do device_loop "$i" & done
+for i in $(seq 0 $((n-1))); do wait -n 2>/dev/null || true; done
 touch "$STOP"; wait "$_watch" 2>/dev/null || true; rm -f "$STOP"
 say "done"
