@@ -482,7 +482,8 @@
     white-space: nowrap; }
   /* the release the file was built from - brighter than the directory, because
      this is the line that is actually being checked */
-  .fdest { font-family: ui-monospace, monospace; font-size: .72rem; color: #6ee7a0; }
+  /* the destination reads as another path, not as a status */
+  .fdest { font-family: ui-monospace, monospace; font-size: .7rem; color: #6b7280; }
   .fsrc { font-family: ui-monospace, monospace; font-size: .72rem; color: #7ab6f5;
     margin-top: .1rem; }
   .fpath { font-family: ui-monospace, monospace; font-size: .7rem; color: #6b7280; }
