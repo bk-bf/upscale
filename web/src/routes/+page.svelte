@@ -14,11 +14,16 @@
       err = "";
     } catch (e) { err = String(e); }
   }
-  async function stop() {
-    if (!confirm("Stop after the current file?")) return;
-    await fetch("/api/stop", { method: "POST" });
+  async function post(path, ask) {
+    if (ask && !confirm(ask)) return;
+    const r = await fetch(path, { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (!j.ok) err = j.error || `${path} failed`;
     refresh();
   }
+  const pause  = () => post("/api/pause");
+  const resume = () => post("/api/resume");
+  const stop   = () => post("/api/stop", "Stop after the current file?");
   $effect(() => { refresh(); timer = setInterval(refresh, 3000); return () => clearInterval(timer); });
 
   const gb = (b) => (b ? `${(b / 1073741824).toFixed(1)} GB` : "");
@@ -30,16 +35,24 @@
   <span class="brand">upscale</span>
   <span class="counts">
     {#if d.counts.running}<b class="c-run">{d.counts.running} running</b>{/if}
+    {#if d.counts.paused}<b class="c-hold">{d.counts.paused} paused</b>{/if}
     <span>{d.counts.queued ?? 0} queued</span>
     <span class="muted">{d.counts.done ?? 0} done</span>
   </span>
   {#each d.devices as h}
     <span class="chip" class:down={!h.reachable}>
-      {h.device}<em>{h.reachable ? (h.phase || "idle") : "unreachable"}</em>
+      {h.device}<em>{h.reachable ? (h.paused ? "paused" : (h.phase || "idle")) : "unreachable"}</em>
     </span>
   {/each}
   <span class="spacer"></span>
-  {#if d.running}<button class="tb danger" onclick={stop}>■ Stop</button>{/if}
+  {#if d.running}
+    {#if d.paused}
+      <button class="tb go" onclick={resume}>▶ Resume</button>
+    {:else}
+      <button class="tb" onclick={pause}>⏸ Pause</button>
+    {/if}
+    <button class="tb danger" onclick={stop}>■ Stop</button>
+  {/if}
 </nav>
 
 {#if err}<div class="bar err">{err}</div>{/if}
@@ -92,6 +105,9 @@
   .tb { background: #1b2030; color: #e6e6e6; border: 1px solid #2b3244; border-radius: 6px;
     padding: .3rem .7rem; font: inherit; font-size: .82rem; cursor: pointer; }
   .tb.danger { border-color: #5a2233; color: #f8899f; }
+  .tb.go { border-color: #1f4d33; color: #6ee7a0; }
+  .c-hold { color: #f5d76e; }
+  .pill.paused { background: #3a3212; color: #f5d76e; }
   .bar { padding: .5rem .9rem; font-size: .85rem; }
   .bar.err { background: #2a1220; color: #f8899f; }
   .bar.notice { background: #10233a; color: #7ab6f5; }

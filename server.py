@@ -71,6 +71,7 @@ def device_status(spec: str, expect: str) -> dict:
     than an error.
     """
     d = {"device": spec, "file": expect, "reachable": False, "phase": "",
+         "state": "", "paused": False,
          "done": 0, "total": 0, "unit": "", "fps": 0.0, "eta_s": 0}
     rc, out, _ = ssh_to(spec, f"$HOME/{WORKER} status", timeout=20)
     if rc != 0:
@@ -81,7 +82,8 @@ def device_status(spec: str, expect: str) -> dict:
     except ValueError:
         return d
     d.update({k: j.get(k, d[k]) for k in
-              ("phase", "done", "total", "unit", "fps", "eta_s") if k in j})
+              ("phase", "state", "done", "total", "unit", "fps", "eta_s") if k in j})
+    d["paused"] = j.get("state") == "paused"
     for a, b in (("frames_done", "done"), ("frames_total", "total")):
         if a in j and not d[b]:
             d[b] = j[a]
@@ -108,7 +110,7 @@ def rows(st: dict, devices: list) -> list:
             pct = int(d["done"] * 100 / d["total"])
         return {"n": n, "name": path.name, "path": str(path),
                 "library_name": Path(src).name if src else "",
-                "status": "running" if d else status,
+                "status": ("paused" if d.get("paused") else "running") if d else status,
                 "device": d["device"] if d else "",
                 "phase": d.get("phase", "") if d else "",
                 "percent": pct,
@@ -143,8 +145,9 @@ def collect() -> dict:
     return {"source": st.get("source", ""), "target": st.get("target", ""),
             "size": st.get("size", 0), "running": bool(st),
             "devices": devices, "hosts": devices, "rows": r,
+            "paused": any(x.get("paused") for x in devices),
             "counts": {s: sum(1 for x in r if x["status"] == s)
-                       for s in ("done", "running", "queued")},
+                       for s in ("done", "running", "paused", "queued")},
             "ts": int(time.time())}
 
 
@@ -223,10 +226,26 @@ class Handler(BaseHTTPRequestHandler):
                                "running": bool(state())})
         return self._static(path)
 
+    def _devices(self):
+        return [d.get("device", "") for d in state().get("devices", []) if d.get("device")]
+
     def do_POST(self):
         path = urlparse(self.path).path
-        # The only control worth exposing. Everything else about a run is
-        # decided by the command that started it.
+        # Pause and resume reach the worker on each device, which holds after the
+        # current CHUNK - so a pause costs at most one chunk, not the episode.
+        if path in ("/api/pause", "/api/resume"):
+            action = path.rsplit("/", 1)[-1]
+            devs = self._devices()
+            if not devs:
+                return self._json({"ok": False, "error": "nothing is running"}, 409)
+            bad = []
+            for spec in devs:
+                rc, _, err = ssh_to(spec, f"$HOME/{WORKER} {action}", timeout=20)
+                if rc != 0:
+                    bad.append(f"{spec}: {(err or 'ssh failed').strip()[:80]}")
+            if bad:
+                return self._json({"ok": False, "error": "; ".join(bad)}, 502)
+            return self._json({"ok": True, "action": action, "devices": len(devs)})
         if path == "/api/stop":
             try:
                 (RUN / "stop").touch()
