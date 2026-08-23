@@ -292,10 +292,12 @@ def device_status(spec: str, expect: str) -> dict:
     An unreachable device is reported as unreachable, never as idle.
     """
     d = {"device": spec, "ssh": spec, "file": expect, "reachable": False,
-         "phase": "", "state": "", "paused": False, "episode": "",
-         "percent": 0, "phase_percent": -1, "rate": "", "eta": ""}
-    rc, out, _ = ssh_to(spec, f"$HOME/{WORKER} status", timeout=20)
+         "phase": "", "state": "", "paused": False, "episode": "", "error": "",
+         "percent": 0, "phase_percent": -1, "rate": "", "eta": "",
+         "queue_running": False, "queue_stopping": False, "queue_note": ""}
+    rc, out, err = ssh_to(spec, f"$HOME/{WORKER} status", timeout=20)
     if rc != 0:
+        d["error"] = (err or "ssh failed").strip()[:200]
         return d
     try:
         j = json.loads(out.strip() or "{}")
@@ -398,7 +400,14 @@ def collect() -> dict:
                 lambda nx: {**device_status(nx[1], expect.get(nx[0], "")),
                             "device": nx[0], "ssh": nx[1],
                             "source": lanes.get(nx[0], ("", ""))[0],
-                            "target": lanes.get(nx[0], ("", ""))[1]}, named))
+                            "target": lanes.get(nx[0], ("", ""))[1],
+                            # It is in the run's own snapshot, and that file
+                            # exists only while the driver is alive - so this
+                            # device is being worked, whatever the box is doing
+                            # at this instant.
+                            "queue_running": True,
+                            "queue_stopping": (RUN / "stop").exists(),
+                            "queue_note": driver.get(nx[0], "")}, named))
         # What the driver is doing wins: it is the one moving the file, and a
         # worker asked during a push still reports its previous phase.
         for dv in devs:
@@ -437,6 +446,8 @@ def collect() -> dict:
         # manage them and start a run against one.
         devs = [{"device": n, "ssh": m.get("ssh", ""), "id": n, "label": n,
                     "reachable": None, "phase": "", "file": "", "percent": 0,
+                    "queue_running": False, "queue_stopping": False,
+                    "queue_note": "", "error": "", "source": "", "target": "",
                     "done": 0, "total": 0, "unit": "", "fps": 0, "eta_s": 0,
                     "scratch": m.get("scratch", ""), "default_scratch": m.get("scratch", "")}
                    for n, m in book.items()]
