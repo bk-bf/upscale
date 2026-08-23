@@ -341,6 +341,9 @@ def rows(st: dict, devices: list) -> list:
             pct = d.get("percent") or (int(d["done"] * 100 / d["total"]) if d.get("total") else 0)
         return {"n": n, "name": path.name, "path": str(path),
                 "library_name": Path(src).name if src else "",
+                # Where it lands. A queued row sits in the source directory, so
+                # its own path never shows the destination.
+                "target_dir": tgt or "",
                 "status": ("paused" if d.get("paused") else "running") if d else status,
                 "device": d["device"] if d else "",
                 "phase": d.get("phase", "") if d else "",
