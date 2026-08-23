@@ -150,15 +150,16 @@ run_one(){
   rwork=$(rsh "$dev" 'printf %s "${UPSCALE_WORK:-$HOME/upscale-work}"' | tr -d '\r') || rwork=
   [ -n "$rwork" ] || { say "[$dev] unreachable"; return 1; }
   printf '%s' "$name" > "$st/file"
+  phase(){ printf '%s' "$1" > "$st/phase"; }
 
   # The name travels with the file. That is the whole reason this program does
   # not need to recognise a result from its pixels: nothing ever renamed it, so
   # what comes back from out-<name> is <name>.
   rsh "$dev" "mkdir -p $(printf %q "$rwork")" >/dev/null || return 1
   if ! rsh "$dev" "test -s $(printf %q "$rwork/out-$name")" 2>/dev/null; then
-    say "[$dev] $name: sending"
+    phase sending; say "[$dev] $name: sending"
     push "$dev" "$SOURCE/$name" "$rwork/$name" || { say "[$dev] $name: send failed"; return 1; }
-    say "[$dev] $name: upscaling"
+    phase upscaling; say "[$dev] $name: upscaling"
     # shellcheck disable=SC2086
     rsh "$dev" "cd $(printf %q "$rwork") && setsid nohup env \
           ${WORKERS:+WORKERS=$WORKERS} ${SCRATCH:+WORK=$(printf %q "$SCRATCH")} \
@@ -170,7 +171,7 @@ run_one(){
     say "[$dev] $name: result already on the device, collecting"
   fi
 
-  say "[$dev] $name: retrieving"
+  phase retrieving; say "[$dev] $name: retrieving"
   out="$TARGET/.$name.part"
   pull "$dev" "$rwork/out-$name" "$out" || { say "[$dev] $name: retrieve failed"; return 1; }
 
@@ -187,7 +188,7 @@ run_one(){
   rsh "$dev" "rm -f $(printf %q "$rwork/$name") $(printf %q "$rwork/out-$name")" >/dev/null 2>&1 || true
   if [ "$DELETE" = 1 ]; then rm -f "$SOURCE/$name"; say "[$dev] $name: done, source deleted"
   else mv -f "$SOURCE/$name" "$ARCHIVE/$name"; say "[$dev] $name: done, source archived"; fi
-  rm -f "$st/file"
+  rm -f "$st/file" "$st/phase"
 }
 
 # "What is left" is read from the source directory every time, so files added
@@ -205,12 +206,16 @@ device_loop(){
 # A snapshot for whatever wants to watch: the web UI reads this rather than
 # being told, so there is no second place that decides what is running.
 snapshot(){
-  local d f first=1
+  local d f ph first=1
   { printf '{"source":"%s","target":"%s","size":%s,"devices":[' "$SOURCE" "$TARGET" "$SIZE"
     for d in "${DEVICES[@]}"; do
       f=$(cat "$RUN/$(key "$d")/file" 2>/dev/null || true)
+      # The DRIVER's phase, not the worker's. The worker only knows the GPU
+      # part; sending and retrieving are this program's doing, and a worker
+      # asked mid-push still reports whatever it last did.
+      ph=$(cat "$RUN/$(key "$d")/phase" 2>/dev/null || true)
       [ "$first" = 1 ] || printf ','; first=0
-      printf '{"device":"%s","file":"%s"}' "$d" "$f"
+      printf '{"device":"%s","file":"%s","phase":"%s"}' "$d" "$f" "$ph"
     done
     printf '],"ts":%s}' "$(date +%s)"
   } > "$RUN/state.json.tmp" && mv -f "$RUN/state.json.tmp" "$RUN/state.json"
