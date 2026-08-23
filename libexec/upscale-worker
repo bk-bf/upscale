@@ -100,9 +100,10 @@ cmd_status_json(){
   # The worker PROCESS is the ground truth that something is happening; the job
   # file, the GPU and rsync then say which phase it is in.
   local wargs=""
-  wargs=$(pgrep -af '[u]pscale-worker (run|fetch|process|deliver)' 2>/dev/null | head -1) || wargs=""
+  wargs=$(pgrep -af '[u]pscale-worker process' 2>/dev/null | head -1) || wargs=""
   if [ -n "$wargs" ]; then
     state=working
+    ep=$(cat "$STATE/episode" 2>/dev/null || true)
     # Everything after the phase word is the path - NOT the last space-separated
     # token. Episode titles are full of spaces ("A Gentle Right Arm SDTV.mkv"),
     # so ${wargs##* } returned "HDTV-720p.mkv".
@@ -111,8 +112,29 @@ cmd_status_json(){
     # one on the card, another uploading a finished episode - and pgrep lists
     # whichever it likes. The job file below names the episode actually being
     # processed, and it wins when it exists.
-    ep=$(printf '%s' "$wargs" | sed -E 's#^.*upscale-worker (run|fetch|process|deliver) ##')
-    ep=$(basename "$ep")
+    if [ -z "$ep" ]; then
+      ep=$(printf '%s' "$wargs" | sed -E 's#^.*upscale-worker process ##; s# [^ ]*$##')
+      ep=$(basename "$ep")
+    fi
+  fi
+  # No job file, but a worker IS running and has named its episode. That happens
+  # when a second worker on the same machine finished and deleted the shared job
+  # file on its way out - the work itself is untouched, and the work directory
+  # still holds the answer. Without this the status reports 0/0 for an episode
+  # that is 86% encoded.
+  if [ ! -f "$JOB" ] && [ -n "$ep" ] && [ -n "$wargs" ]; then
+    local _b="$WORK/${ep%.*}"
+    if [ -d "$_b" ]; then
+      SEGDIR="$_b/seg"
+      [ -d "$SEGDIR" ] && segs=$(find "$SEGDIR" -name 'seg_*.mkv' 2>/dev/null | wc -l)
+      TOTAL=$(pngs "$_b/frames")
+      [ "${TOTAL:-0}" -gt 0 ] && chunks=$(( (TOTAL + CHUNK - 1) / CHUNK ))
+      # Banked chunks are the only thing knowable here; frames in flight in the
+      # current chunk are not, so this rounds DOWN rather than inventing them.
+      df=$(( segs * CHUNK )); [ "$df" -gt "${TOTAL:-0}" ] && df=$TOTAL
+      pct=$(( ${TOTAL:-0} ? df * 100 / TOTAL : 0 ))
+      state=running
+    fi
   fi
   if [ -f "$JOB" ]; then
     # shellcheck disable=SC1090
@@ -316,6 +338,10 @@ LOCAL="${1:?need a source path:  upscale-worker process <src> <out>}"
 OUT="${2:?need an output path:  upscale-worker process <src> <out>}"
 [ -f "$LOCAL" ] || die "source is not here: $LOCAL"
 BASE=$(basename "${LOCAL%.*}")
+# Say which file this is, rather than making a reader recover it from the
+# command line. That parse assumed the source was the last argument; with an
+# output path and a redirection after it, the episode came back as "log 2>&1".
+mkdir -p "$STATE" && printf '%s' "$(basename "$LOCAL")" > "$STATE/episode"
 W="$WORK/$BASE"
 FRAMES="$W/frames"; UP="$W/up"; SEGDIR="$W/seg"
 
