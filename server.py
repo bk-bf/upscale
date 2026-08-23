@@ -71,6 +71,54 @@ def allowed(p: Path) -> bool:
     return any(r == root or root in r.parents for root in browse_roots())
 
 
+def search(q: str) -> dict:
+    """Typeahead over paths, in the shape the page already speaks.
+
+    A trailing slash lists a directory; anything else filters that directory by
+    prefix. Only the allowed roots are reachable.
+    """
+    q = q or ""
+    if not q:
+        return {"base": "", "results": [
+            {"kind": "dir", "name": str(r), "path": str(r), "files": 0} for r in browse_roots()]}
+    p = Path(q)
+    base, frag = (p, "") if q.endswith("/") else (p.parent, p.name.lower())
+    if not allowed(base) or not base.is_dir():
+        return {"base": str(base), "results": []}
+    out = []
+    try:
+        for e in sorted(base.iterdir()):
+            if e.name.startswith(".") or (frag and not e.name.lower().startswith(frag)):
+                continue
+            if e.is_dir():
+                try:
+                    n = sum(1 for f in e.iterdir() if f.is_file() and not f.name.startswith("."))
+                except OSError:
+                    n = 0
+                out.append({"kind": "dir", "name": e.name, "path": str(e), "files": n})
+            elif e.is_file():
+                out.append({"kind": "file", "name": e.name, "path": str(e),
+                            "size": e.stat().st_size})
+    except OSError:
+        pass
+    return {"base": str(base), "results": out[:400]}
+
+
+PENDING = RUN / "pending.json"
+
+
+def pending() -> dict:
+    try:
+        return json.loads(PENDING.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def set_pending(d: dict) -> None:
+    RUN.mkdir(parents=True, exist_ok=True)
+    PENDING.write_text(json.dumps({**pending(), **d}, indent=2))
+
+
 def browse(where: str) -> dict:
     """Directories under the allowed roots, with a count of what is in them.
 
@@ -169,12 +217,15 @@ def start_run(body: dict) -> dict:
     """
     if state():
         return {"ok": False, "error": "a run is already going"}
-    src, tgt = (body.get("source") or "").strip(), (body.get("target") or "").strip()
+    pend = pending()
+    src = (body.get("source") or pend.get("source") or "").strip()
+    tgt = (body.get("target") or pend.get("target") or "").strip()
     book = devices()
     # A saved name is resolved to NAME=SPEC so the name travels with the
     # command and comes back in the log and the snapshot.
+    wanted = body.get("devices") or ([body["host"]] if body.get("host") else [])
     devs = []
-    for d in (body.get("devices") or []):
+    for d in wanted:
         d = (d or "").strip()
         if not d:
             continue
@@ -188,7 +239,7 @@ def start_run(body: dict) -> dict:
         if not allowed(Path(d)):
             return {"ok": False, "error": f"not reachable: {d}"}
     argv = [config().get("upscale_bin") or "upscale", "--source", src, "--target", tgt]
-    arch = (body.get("archive") or "").strip()
+    arch = (body.get("archive") or pend.get("archive") or "").strip()
     if body.get("delete"):
         argv.append("--delete")
     elif arch:
@@ -237,7 +288,7 @@ def device_status(spec: str, expect: str) -> dict:
     than an error.
     """
     d = {"device": spec, "file": expect, "reachable": False, "phase": "",
-         "state": "", "paused": False,
+         "state": "", "paused": False, "percent": 0, "rate": "", "eta": "",
          "done": 0, "total": 0, "unit": "", "fps": 0.0, "eta_s": 0}
     rc, out, _ = ssh_to(spec, f"$HOME/{WORKER} status", timeout=20)
     if rc != 0:
@@ -249,6 +300,18 @@ def device_status(spec: str, expect: str) -> dict:
         return d
     d.update({k: j.get(k, d[k]) for k in
               ("phase", "state", "done", "total", "unit", "fps", "eta_s") if k in j})
+    # The worker reports progress for the phase it is IN - extraction is
+    # minutes with no frame upscaled, and a bar pinned at 0% for all of it
+    # reads as stuck.
+    # Prefer the phase's own numbers, but the worker reports phase_total as 0
+    # during extraction, so the episode's frame count is the fallback rather
+    # than a bar stuck at nothing.
+    d["done"] = j.get("phase_done") or j.get("frames_done") or 0
+    d["total"] = j.get("phase_total") or j.get("frames_total") or 0
+    d["unit"] = j.get("phase_unit") or j.get("unit") or "frames"
+    if d["total"]:
+        d["percent"] = int(d["done"] * 100 / d["total"])
+    d["eta_s"] = j.get("phase_eta_s") or j.get("eta_s") or 0
     d["paused"] = j.get("state") == "paused"
     for a, b in (("frames_done", "done"), ("frames_total", "total")):
         if a in j and not d[b]:
@@ -272,8 +335,10 @@ def rows(st: dict, devices: list) -> list:
         n += 1
         d = busy.get(path.name)
         pct = 0
-        if d and d.get("total"):
-            pct = int(d["done"] * 100 / d["total"])
+        if d:
+            # during a transfer the percentage is the transfer's; during the
+            # upscale it is the worker's frame count
+            pct = d.get("percent") or (int(d["done"] * 100 / d["total"]) if d.get("total") else 0)
         return {"n": n, "name": path.name, "path": str(path),
                 "library_name": Path(src).name if src else "",
                 "status": ("paused" if d.get("paused") else "running") if d else status,
@@ -284,6 +349,8 @@ def rows(st: dict, devices: list) -> list:
                 "total": d.get("total", 0) if d else 0,
                 "unit": d.get("unit", "") if d else "",
                 "fps": d.get("fps", 0) if d else 0,
+                "rate": d.get("rate", "") if d else "",
+                "eta": d.get("eta", "") if d else "",
                 "eta_s": d.get("eta_s", 0) if d else 0,
                 "size": path.stat().st_size if path.exists() else 0}
 
@@ -300,24 +367,60 @@ def rows(st: dict, devices: list) -> list:
 
 
 def collect() -> dict:
+    book = devices()          # fetched before the local name shadows it
     st = state()
-    specs = [d.get("device", "") for d in st.get("devices", [])]
-    expect = {d.get("device", ""): d.get("file", "") for d in st.get("devices", [])}
-    driver = {d.get("device", ""): d.get("phase", "") for d in st.get("devices", [])}
-    devices = []
-    if specs:
-        with ThreadPoolExecutor(max_workers=min(8, len(specs))) as ex:
-            devices = list(ex.map(lambda s: device_status(s, expect.get(s, "")), specs))
+    entries = st.get("devices", [])
+    # A device has a NAME and an ADDRESS, and they are not the same string.
+    # Asking "rental" over ssh reaches nothing; the worker lives at its ssh spec.
+    named = [(e.get("device", ""), e.get("ssh") or e.get("device", "")) for e in entries]
+    expect = {e.get("device", ""): e.get("file", "") for e in entries}
+    driver = {e.get("device", ""): e.get("phase", "") for e in entries}
+    xfer = {e.get("device", ""): e.get("xfer", "") for e in entries}
+    devs = []
+    if named:
+        with ThreadPoolExecutor(max_workers=min(8, len(named))) as ex:
+            devs = list(ex.map(
+                lambda nx: {**device_status(nx[1], expect.get(nx[0], "")),
+                            "device": nx[0], "ssh": nx[1]}, named))
         # What the driver is doing wins: it is the one moving the file, and a
         # worker asked during a push still reports its previous phase.
-        for dv in devices:
-            if driver.get(dv["device"]):
-                dv["phase"] = driver[dv["device"]]
-    r = rows(st, devices)
+        for dv in devs:
+            # The driver only owns the phases it performs itself. While the
+            # device is working, the worker knows better - it can say
+            # "extracting" where the driver only knows "upscaling".
+            dph = driver.get(dv["device"], "")
+            if dph in ("sending", "retrieving") or not dv.get("phase"):
+                dv["phase"] = dph or dv.get("phase", "")
+            # A transfer reports its own percentage, rate and ETA. Without them
+            # "sending" for four minutes looks the same as "stuck".
+            fields = (xfer.get(dv["device"]) or "").split()
+            for f in fields:
+                if f.endswith("%") and f[:-1].isdigit():
+                    dv["percent"] = int(f[:-1])
+                elif f.endswith("/s"):
+                    dv["rate"] = f
+                elif f.count(":") == 2:
+                    dv["eta"] = f
+    if not devs:
+        # Nothing running: the machines are still worth showing, so the page can
+        # manage them and start a run against one.
+        devs = [{"device": n, "ssh": m.get("ssh", ""), "id": n, "label": n,
+                    "reachable": None, "phase": "", "file": "", "percent": 0,
+                    "done": 0, "total": 0, "unit": "", "fps": 0, "eta_s": 0,
+                    "scratch": m.get("scratch", ""), "default_scratch": m.get("scratch", "")}
+                   for n, m in book.items()]
+    r = rows(st, devs)
+    for dv in devs:
+        meta = book.get(dv["device"], {})
+        dv["id"] = dv["device"]
+        dv["label"] = dv["device"]
+        dv["scratch"] = meta.get("scratch", "")
+        dv["default_scratch"] = meta.get("scratch", "")
     return {"source": st.get("source", ""), "target": st.get("target", ""),
+            "pending": pending(),
             "size": st.get("size", 0), "running": bool(st),
-            "devices": devices, "hosts": devices, "rows": r,
-            "paused": any(x.get("paused") for x in devices),
+            "devs": devs, "hosts": devs, "rows": r,
+            "paused": any(x.get("paused") for x in devs),
             "counts": {s: sum(1 for x in r if x["status"] == s)
                        for s in ("done", "running", "paused", "queued")},
             "ts": int(time.time())}
@@ -396,6 +499,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/browse":
             from urllib.parse import parse_qs
             q = parse_qs(urlparse(self.path).query)
+            if "q" in q:                       # typeahead, the page's own shape
+                return self._json(search(q["q"][0]))
             return self._json(browse((q.get("path") or [""])[0]))
         if path == "/api/log":
             try:
@@ -429,6 +534,8 @@ class Handler(BaseHTTPRequestHandler):
             if bad:
                 return self._json({"ok": False, "error": "; ".join(bad)}, 502)
             return self._json({"ok": True, "action": action, "devices": len(devs)})
+        if path in ("/api/hosts/probe", "/api/hosts/add", "/api/hosts/remove"):
+            path = path.replace("/api/hosts/", "/api/devices/")
         if path in ("/api/devices/probe", "/api/devices/add", "/api/devices/remove"):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
@@ -445,7 +552,7 @@ class Handler(BaseHTTPRequestHandler):
                 book.pop((body.get("name") or "").strip(), None)
                 save_devices(book)
                 return self._json({"ok": True, "devices": book})
-            name = (body.get("name") or "").strip()
+            name = (body.get("name") or body.get("label") or "").strip()
             spec = (body.get("ssh") or "").strip()
             if not name or not spec:
                 return self._json({"ok": False, "error": "name and ssh destination are required"}, 400)
@@ -455,6 +562,37 @@ class Handler(BaseHTTPRequestHandler):
                           "workers": body.get("workers") or ""}
             save_devices(book)
             return self._json({"ok": True, "devices": book})
+        if path in ("/api/import", "/api/remove", "/api/hold"):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except (ValueError, OSError) as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            paths = [p for p in (body.get("paths") or []) if p]
+            if path == "/api/import":
+                # Importing now means: this is where the work is. A directory is
+                # taken as-is; files are taken as the directory holding them,
+                # because a run reads a directory, not a list.
+                if not paths:
+                    return self._json({"ok": False, "error": "nothing picked"}, 400)
+                dirs = {str(Path(p) if Path(p).is_dir() else Path(p).parent) for p in paths}
+                if len(dirs) > 1:
+                    return self._json({"ok": False,
+                                       "error": "pick inside one directory: a run has one source"}, 400)
+                src = dirs.pop()
+                if not allowed(Path(src)):
+                    return self._json({"ok": False, "error": f"not reachable: {src}"}, 400)
+                set_pending({"source": src})
+                n_files = sum(1 for f in Path(src).iterdir()
+                              if f.is_file() and not f.name.startswith("."))
+                return self._json({"ok": True, "added": n_files, "source": src,
+                                   "note": f"source is {src} ({n_files} files)"})
+            # Hold and remove managed a stored work list. There is no list: what
+            # is queued is what is in the source directory, so the honest answer
+            # is to say so rather than pretend.
+            return self._json({"ok": False, "error":
+                               "there is no work list to edit — move files in or out of the "
+                               "source directory instead"}, 409)
         if path == "/api/start":
             try:
                 n = int(self.headers.get("Content-Length") or 0)
