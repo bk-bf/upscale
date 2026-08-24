@@ -1,0 +1,6 @@
+config.json
+web/node_modules/
+web/dist/
+web/.svelte-kit/
+__pycache__/
+*.log
