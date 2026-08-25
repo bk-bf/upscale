@@ -2,14 +2,16 @@
   import { onMount, onDestroy } from "svelte";
 
   let rows = $state([]);
-  let hosts = $state([]);
+  let devices = $state([]);
+  let book = $state([]);
   let counts = $state({});
+  let pending = $state({});
+  let running = $state(false);
+  let stopping = $state(false);
   let error = $state("");
   let notice = $state("");
   let busy = $state("");
-
-  let selected = $state(new Set());
-  let lastClicked = $state(null);
+  let noticeTimer;
 
   let showImport = $state(false);
   let showMachine = $state(false);
@@ -21,136 +23,143 @@
   let picked = $state(new Set());
   let searchTimer;
 
+  let mName = $state("");
   let mSsh = $state("");
-  let mLabel = $state("");
+  let mScratch = $state("");
+  let mWorkers = $state("");
   let probe = $state(null);
   let probing = $state(false);
 
-  let sHost = $state("");
+  let sDevices = $state(new Set());
+  let sSource = $state("");
+  let sTarget = $state("");
+  let sArchive = $state("");
+  let sDelete = $state(false);
   let sScratch = $state("");
+  let sWorkers = $state("");
 
   let timer;
 
-  const j = async (url, opts) => {
-    const r = await fetch(url, opts);
-    if (!r.ok && r.status >= 500) throw new Error(`${url} → ${r.status}`);
-    return r.json();
-  };
+  async function api(method, path, body) {
+    const opts = { method };
+    if (method !== "GET") {
+      opts.headers = { "Content-Type": "application/json" };
+      opts.body = JSON.stringify(body || {});
+    }
+    const r = await fetch(path, opts);
+    const d = await r.json().catch(() => ({ ok: false, error: `${path} → ${r.status}` }));
+    return d;
+  }
+
+  function say(text) {
+    notice = text;
+    clearTimeout(noticeTimer);
+    if (text) noticeTimer = setTimeout(() => (notice = ""), 6000);
+  }
 
   async function refresh() {
+    const d = await api("GET", "/api/queue");
+    if (d.ok === false) { error = d.error || "queue unavailable"; return; }
+    rows = d.rows || [];
+    counts = d.counts || {};
+    devices = d.devices || [];
+    pending = d.pending || {};
+    running = !!d.running;
+    stopping = !!d.stopping;
+    error = "";
+  }
+
+  async function loadBook() {
+    const d = await api("GET", "/api/devices");
+    if (d.ok) book = d.devices || [];
+  }
+
+  async function act(method, path, body, label) {
+    busy = label;
     try {
-      const d = await j("/api/queue");
-      rows = d.rows || [];
-      counts = d.counts || {};
-      hosts = d.hosts || [];
-      if (!sHost && hosts.length) { sHost = hosts[0].id; sScratch = hosts[0].default_scratch || ""; }
-      error = "";
-    } catch (e) { error = String(e); }
+      const d = await api(method, path, body);
+      say(d.ok === false ? `${label} failed: ${d.error}` : (d.note || `${label} ok`));
+      await refresh();
+      return d;
+    } finally { busy = ""; }
   }
 
   async function browse() {
-    try {
-      const d = await j(`/api/browse?q=${encodeURIComponent(query)}`);
-      listing = d.results || []; base = d.base || "";
-    } catch (e) { listing = []; }
+    const d = await api("GET", `/api/browse?q=${encodeURIComponent(query)}`);
+    listing = d.results || []; base = d.base || "";
   }
   function onQuery() { clearTimeout(searchTimer); searchTimer = setTimeout(browse, 130); }
-  function into(dir) { query = dir.path + "/"; picked = new Set(); browse(); }
+  function into(d) { query = d.path + "/"; picked = new Set(); browse(); }
   function up() {
     const p = (base || query).replace(/\/+$/, "");
     query = p.slice(0, p.lastIndexOf("/") + 1) || "/";
     picked = new Set(); browse();
   }
 
-  async function post(url, body, label) {
-    busy = label;
-    try {
-      const d = await j(url, { method: "POST",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      notice = d.ok === false ? `failed: ${d.error}` : (d.said || `${label} ok`);
-      await refresh();
-      return d;
-    } catch (e) { notice = String(e); }
-    finally { busy = ""; }
-  }
-
   async function doImport() {
     if (!picked.size) return;
-    const d = await post("/api/import", { paths: [...picked] }, "import");
-    if (d?.ok) { notice = `imported ${d.added} file${d.added > 1 ? "s" : ""}`; showImport = false; picked = new Set(); }
-  }
-
-  async function hold(on) {
-    const want = on ? ["queued", "running"] : ["held", "paused"];
-    const paths = sel.filter(r => want.includes(r.status)).map(r => r.path);
-    if (!paths.length) {
-      notice = `nothing to ${on ? "hold" : "release"} — selected: `
-             + [...new Set(sel.map(r => r.status))].join(", ");
-      return;
-    }
-    busy = on ? "hold" : "release";
-    try {
-      const d = await j("/api/hold", { method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ paths, hold: on }) });
-      notice = d.ok
-        ? `${on ? "held" : "released"} ${paths.length} episode${paths.length > 1 ? "s" : ""}`
-          + (d.skipped?.length ? ` — ${d.skipped.join(", ")} moving to the next` : "")
-        : `failed: ${d.error}`;
-      await refresh();
-    } catch (e) { notice = String(e); }
-    finally { busy = ""; }
-  }
-
-  async function del() {
-    if (!selected.size) return;
-    if (!confirm(`Remove ${selected.size} from the queue?`)) return;
-    await post("/api/remove", { paths: [...selected] }, "removed");
-    selected = new Set();
-  }
-
-  async function start() {
-    const paths = selected.size
-      ? rows.filter(r => selected.has(r.path) && r.status === "queued").map(r => r.path)
-      : rows.filter(r => r.status === "queued").map(r => r.path);
-    if (!paths.length) { notice = "nothing queued to start"; return; }
-    notice = `starting ${paths.length} on ${sHost}…`;
-    const d = await post("/api/start", { host: sHost }, "start");
-    if (d?.ok) { notice = d.note || `started ${sHost}`; showStart = false; }
+    const d = await act("POST", "/api/import", { paths: [...picked] }, "import");
+    if (d?.ok) { showImport = false; picked = new Set(); sSource = d.source; }
   }
 
   async function doProbe() {
     probing = true; probe = null;
     try {
-      probe = await j("/api/hosts/probe", { method: "POST",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ssh: mSsh }) });
-    } catch (e) { probe = { ok: false, error: String(e) }; }
-    finally { probing = false; }
-  }
-  async function addMachine() {
-    const d = await post("/api/hosts/add", { ssh: mSsh, label: mLabel }, "add machine");
-    if (d?.ok) { showMachine = false; mSsh = ""; mLabel = ""; probe = null; }
+      probe = await api("POST", "/api/devices/probe", { ssh: mSsh });
+      if (probe.reachable && !mName) mName = probe.host.replace(/[^A-Za-z0-9._-]/g, "-");
+    } finally { probing = false; }
   }
 
-  function rowClick(ev, i, r) {
-    const s = new Set(selected);
-    if (ev.shiftKey && lastClicked !== null) {
-      const [a, b] = [Math.min(lastClicked, i), Math.max(lastClicked, i)];
-      for (let k = a; k <= b; k++) s.add(sorted[k].path);
-    } else if (ev.ctrlKey || ev.metaKey) {
-      s.has(r.path) ? s.delete(r.path) : s.add(r.path);
-      lastClicked = i;
-    } else { s.clear(); s.add(r.path); lastClicked = i; }
-    selected = s;
+  async function addMachine() {
+    const d = await act("POST", "/api/devices/add",
+      { name: mName, ssh: mSsh, scratch: mScratch, workers: mWorkers }, "add machine");
+    if (d?.ok) {
+      book = d.devices;
+      mName = ""; mSsh = ""; mScratch = ""; mWorkers = ""; probe = null;
+    }
+  }
+
+  async function removeMachine(name) {
+    const d = await act("POST", "/api/devices/remove", { name }, `remove ${name}`);
+    if (d?.devices) book = d.devices;
+    if (d?.ok) sDevices = new Set([...sDevices].filter(n => n !== name));
+  }
+
+  function openStart() {
+    sSource = sSource || pending.source || "";
+    sTarget = sTarget || pending.target || "";
+    sArchive = sArchive || pending.archive || "";
+    if (!sDevices.size && book.length) sDevices = new Set([book[0].name]);
+    showStart = true;
+  }
+
+  function toggleDevice(name) {
+    const s = new Set(sDevices);
+    s.has(name) ? s.delete(name) : s.add(name);
+    sDevices = s;
+  }
+
+  function startBody(dry) {
+    return {
+      devices: [...sDevices], source: sSource, target: sTarget,
+      archive: sDelete ? "" : sArchive, delete: sDelete,
+      scratch: sScratch, workers: sWorkers, dry_run: !!dry,
+    };
+  }
+
+  async function preview() { await act("POST", "/api/start", startBody(true), "preview"); }
+
+  async function start() {
+    const d = await act("POST", "/api/start", startBody(false), "start");
+    if (d?.ok) showStart = false;
   }
 
   let sortKey = $state("n");
   let sortDir = $state(1);
   function sortBy(k) {
-    if (sortKey === k) sortDir = -sortDir;
-    else { sortKey = k; sortDir = k === "n" ? 1 : 1; }
+    if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = 1; }
   }
-  const RANK = { running: 0, delivering: 1, paused: 2, queued: 3, held: 4, missing: 5, done: 6 };
+  const RANK = { running: 0, paused: 1, queued: 2, done: 3 };
   const sorted = $derived([...rows].sort((a, b) => {
     const k = sortKey;
     let x, y;
@@ -165,11 +174,6 @@
     return (a.n ?? 0) - (b.n ?? 0);
   }));
 
-  const sel = $derived(rows.filter(r => selected.has(r.path)));
-  const canHold    = $derived(sel.some(r => r.status === "queued" || r.status === "running"));
-  const canRelease = $derived(sel.some(r => r.status === "held" || r.status === "paused"));
-  const runningHost = $derived(hosts.find(h => h.reachable && h.state !== "idle"));
-  const selHost = $derived(hosts.find(h => h.id === sHost));
   const focusOnMount = (n) => n.focus();
 
   const hhmm = (s) => {
@@ -181,7 +185,7 @@
   const dir = (p) => (p || "").replace(/\/[^/]*$/, "");
 
   function phaseRate(r) {
-    if (!["running", "paused", "delivering"].includes(r.status)) return "";
+    if (!["running", "paused"].includes(r.status)) return "";
     if (r.phase_unit === "bytes" && r.phase_elapsed_s > 0 && r.phase_done > 0)
       return `${(r.phase_done / r.phase_elapsed_s / 1048576).toFixed(1)} MB/s`;
     if (r.phase === "upscaling" && r.fps) return `${r.fps} fps`;
@@ -192,8 +196,11 @@
     return "…";
   }
 
-  onMount(async () => { await refresh(); timer = setInterval(refresh, 3000); });
-  onDestroy(() => clearInterval(timer));
+  onMount(async () => {
+    await Promise.all([refresh(), loadBook()]);
+    timer = setInterval(refresh, 3000);
+  });
+  onDestroy(() => { clearInterval(timer); clearTimeout(noticeTimer); });
 </script>
 
 <svelte:window onkeydown={(e) => { if (e.key === "Escape") { showImport = false; showMachine = false; showStart = false; } }} />
@@ -203,47 +210,32 @@
   <span class="brand">upscale</span>
   <span class="counts">
     {#if counts.running}<b class="c-run">{counts.running} running</b>{/if}
-    {#if counts.delivering}<span class="c-dev">{counts.delivering} delivering</span>{/if}
     <span>{counts.queued ?? 0} queued</span>
-    {#if counts.held}<span class="c-held">{counts.held} held</span>{/if}
-    {#if counts.missing}<span class="c-miss">{counts.missing} missing</span>{/if}
     <span class="muted">{counts.done ?? 0} done</span>
   </span>
   <span class="spacer"></span>
 
-  {#each hosts as h}
-    <span class="chip" class:down={!h.reachable} title={h.error || h.work || ""}>
-      {h.label}<em>{h.reachable ? (h.phase && h.phase !== "idle" ? h.phase : h.state) : "unreachable"}</em>
+  {#each devices as h}
+    <span class="chip" class:down={h.reachable === false} title={h.error || ""}>
+      {h.name}<em>{h.reachable === null ? "idle" : h.reachable ? (h.phase || h.state || "idle") : "unreachable"}</em>
       {#if h.queue_running}
         <span class="qtag" class:stopping={h.queue_stopping} title={h.queue_note || ""}>
           {h.queue_stopping ? "stopping" : "queue"}
         </span>
-      {:else}
-        <span class="qtag off" title={h.queue_note || ""}>stopped</span>
       {/if}
     </span>
   {/each}
 
-  <button class="tb" onclick={() => (showStart = true)} disabled={!hosts.length || !!busy}>▶ Start</button>
-  <button class="tb" onclick={() => post("/api/stop", { host: (hosts.find(h => h.queue_running) || runningHost || hosts[0])?.id }, "stop")}
-          disabled={!hosts.length || !!busy}
-          title="Stop everything now. Finished chunks are kept; Start resumes from there.">■ Stop</button>
-  <button class="tb" onclick={() => { showMachine = true; probe = null; }} title="Onboard a GPU machine">⚙ Machines</button>
-  <button class="add" onclick={() => { showImport = true; picked = new Set(); browse(); }} title="Import episodes">+</button>
+  <button class="tb" onclick={openStart} disabled={running || !!busy}>▶ Start</button>
+  <button class="tb" onclick={() => act("POST", "/api/stop", {}, "stop")}
+          disabled={!running || stopping || !!busy}
+          title="Stop after the current file. Finished chunks are kept.">■ Stop</button>
+  <button class="tb" onclick={() => { showMachine = true; probe = null; loadBook(); }}>⚙ Machines</button>
+  <button class="add" onclick={() => { showImport = true; picked = new Set(); browse(); }} title="Pick the source directory">+</button>
 </nav>
 
-{#if selected.size}
-  <div class="selbar">
-    <span>{selected.size} selected</span>
-    <button onclick={() => hold(true)} disabled={!canHold || !!busy}>❚❚ Hold</button>
-    <button onclick={() => hold(false)} disabled={!canRelease || !!busy}>▶ Release</button>
-    <button class="danger" onclick={del} disabled={!!busy}>🗑 Delete</button>
-    <button class="ghost" onclick={() => (selected = new Set())}>Clear</button>
-  </div>
-{/if}
-
 {#if error}<p class="bar err">{error}</p>{/if}
-{#if notice}<button class="bar notice" onclick={() => (notice = "")}>{notice}</button>{/if}
+{#if notice}<button class="bar notice" onclick={() => say("")}>{notice}</button>{/if}
 
 <table>
   <thead><tr>
@@ -258,10 +250,8 @@
     {/each}
   </tr></thead>
   <tbody>
-    {#each sorted as r, i}
-      <tr class={r.status} class:sel={selected.has(r.path)} tabindex="0" role="button"
-          onclick={(e) => rowClick(e, i, r)}
-          onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); rowClick(e, i, r); } }}>
+    {#each sorted as r}
+      <tr class={r.status}>
         <td class="num">{r.n ?? "–"}</td>
         <td class="name" title={r.target_dir ? `${r.path}\n→ ${r.target_dir}` : r.path}>
           <span class="fname">{r.name}</span>
@@ -269,12 +259,10 @@
           {#if r.target_dir && r.status !== "done"}<span class="fdest">→ {r.target_dir}</span>{/if}
         </td>
         <td class="lib">{r.library_name}</td>
-        
         <td class="dev">{#if r.device}<span class="devtag">{r.device}</span>{:else}<span class="muted">—</span>{/if}</td>
         <td class="st"><span class="pill {r.status}">{r.status === "running" && r.phase ? r.phase : r.status}</span></td>
         <td class="pr">
-          {#if r.status === "running" || r.status === "paused" || r.status === "delivering"}
-            
+          {#if r.status === "running" || r.status === "paused"}
             {#if (r.phase_percent ?? -1) >= 0}
               <div class="bar2"><div class="fill" style="width:{r.phase_percent}%"></div></div>
               <span class="pct">{r.phase_percent}%</span>
@@ -283,14 +271,13 @@
               <span class="pct">–</span>
             {/if}
           {:else if r.status === "done"}<span class="muted">✓</span>
-          {:else if r.status === "missing"}<span class="c-miss small">source moved</span>
           {:else}<span class="muted">{gb(r.size)}</span>{/if}
         </td>
         <td class="rt">{phaseRate(r)}</td>
         <td class="et">{r.phase_eta_s ? hhmm(r.phase_eta_s) : (r.eta_s ? hhmm(r.eta_s) : (r.status === "running" ? "…" : ""))}</td>
       </tr>
     {:else}
-      <tr><td colspan="8" class="muted pad">nothing imported — press + to pick episodes</td></tr>
+      <tr><td colspan="8" class="muted pad">no source directory — press + to pick one</td></tr>
     {/each}
   </tbody>
 </table>
@@ -298,11 +285,11 @@
 {#if showImport}
   <button class="scrim" aria-label="Close" onclick={() => (showImport = false)}></button>
   <div class="modal wide">
-    <h2>Import episodes</h2>
+    <h2>Source directory</h2>
     <div class="row">
       <button class="ghost" onclick={up} title="Up one level">↑</button>
       <input class="grow" bind:value={query} oninput={onQuery} use:focusOnMount
-             placeholder="/mnt/media/tv/… — a path, or a name to search the roots" />
+             placeholder="/mnt/media/tv/… — a path, or a name to filter" />
     </div>
     <ul class="ac">
       {#each listing as it}
@@ -310,15 +297,13 @@
           {#if it.kind === "dir"}
             <button class="acrow" onclick={() => into(it)}>
               <span class="ic">📁</span><span class="acname">{it.name}</span>
-              <span class="muted small">{it.files} video{it.files === 1 ? "" : "s"}</span>
+              <span class="muted small">{it.files ? `${it.files} file${it.files === 1 ? "" : "s"}` : `${it.dirs} folder${it.dirs === 1 ? "" : "s"}`}</span>
             </button>
           {:else}
-            <button class="acrow" class:dim={it.imported} disabled={it.imported}
-                    onclick={() => { const s = new Set(picked); s.has(it.path) ? s.delete(it.path) : s.add(it.path); picked = s; }}>
-              <span class="ic">{picked.has(it.path) ? "☑" : it.imported ? "•" : "☐"}</span>
+            <button class="acrow" onclick={() => { const s = new Set(picked); s.has(it.path) ? s.delete(it.path) : s.add(it.path); picked = s; }}>
+              <span class="ic">{picked.has(it.path) ? "☑" : "☐"}</span>
               <span class="acname">{it.name}</span>
               <span class="muted small">{gb(it.size)}</span>
-              {#if it.imported}<span class="pill done">in queue</span>{/if}
             </button>
           {/if}
         </li>
@@ -327,11 +312,11 @@
       {/each}
     </ul>
     <div class="row gap">
-      <button class="primary" onclick={doImport} disabled={!picked.size || !!busy}>
-        Import {picked.size || ""} file{picked.size === 1 ? "" : "s"}
+      <button class="primary" onclick={() => { picked = new Set([base || query.replace(/\/+$/, "")]); doImport(); }} disabled={!!busy}>
+        Use this directory
       </button>
-      <button class="ghost" onclick={() => { picked = new Set(listing.filter(x => x.kind === "file" && !x.imported).map(x => x.path)); }}>
-        Select all in folder
+      <button class="ghost" onclick={doImport} disabled={!picked.size || !!busy}>
+        Use the {picked.size || ""} picked file{picked.size === 1 ? "" : "s"}' directory
       </button>
       <button class="ghost" onclick={() => (showImport = false)}>Cancel</button>
     </div>
@@ -342,33 +327,39 @@
   <button class="scrim" aria-label="Close" onclick={() => (showMachine = false)}></button>
   <div class="modal">
     <h2>Machines</h2>
-    {#each hosts as h}
+    {#each book as m}
       <div class="row hostrow">
-        <span class="grow">{h.label} <span class="muted small">{h.reachable ? h.work : h.error}</span></span>
-        <button class="ghost" onclick={() => post("/api/hosts/remove", { id: h.id }, "removed host")}>Remove</button>
+        <span class="grow">{m.name} <span class="muted small mono">{m.ssh}</span></span>
+        <button class="ghost danger" onclick={() => removeMachine(m.name)} disabled={!!busy}>Remove</button>
       </div>
+    {:else}
+      <p class="muted small">none yet</p>
     {/each}
     <hr />
     <div class="form">
       <label>SSH target
         <input bind:value={mSsh} use:focusOnMount placeholder="desktop · user@host · -p 48726 root@1.2.3.4" />
       </label>
-      <label>Label (optional)
-        <input bind:value={mLabel} placeholder="desktop (RX 5700 XT)" />
+      <label>Name
+        <input bind:value={mName} placeholder="desktop" />
+      </label>
+      <label>Scratch
+        <input bind:value={mScratch} placeholder="/home/kirill/upscale-scratch" />
+      </label>
+      <label>Workers
+        <input bind:value={mWorkers} placeholder="8" />
       </label>
     </div>
     <div class="row gap">
       <button class="ghost" onclick={doProbe} disabled={!mSsh || probing}>{probing ? "probing…" : "Test connection"}</button>
-      <button class="primary" onclick={addMachine} disabled={!mSsh || !probe?.ok || !!busy}>Add machine</button>
+      <button class="primary" onclick={addMachine} disabled={!mSsh || !mName || !!busy}>Add machine</button>
     </div>
     {#if probe}
       <div class="probe">
-        {#if probe.ok}
-          <p><b>{probe.host}</b> · {probe.cpus} CPUs · {probe.gpu || "no GPU detected"}</p>
-          <p class="muted small">worker: <span class="mono">{probe.worker || "NOT FOUND"}</span></p>
-          <p class="muted small">scratch: {Object.entries(probe.scratch || {}).map(([k, v]) => `${k} (${v.free_gb} GB free)`).join(" · ") || "none found"}</p>
-          {#if !probe.ready}<p class="err small">{probe.note}</p>{/if}
-        {:else}<p class="err small">{probe.error}</p>{/if}
+        {#if probe.reachable}
+          <p><b>{probe.host}</b> · {probe.cores} cores · {probe.gpu || "no GPU detected"} · {probe.free_gb} GB free</p>
+          {#each probe.warnings as w}<p class="err small">{w}</p>{/each}
+        {:else}<p class="err small">{probe.error || "unreachable"}</p>{/if}
       </div>
     {/if}
   </div>
@@ -376,25 +367,41 @@
 
 {#if showStart}
   <button class="scrim" aria-label="Close" onclick={() => (showStart = false)}></button>
-  <div class="modal">
+  <div class="modal wide">
     <h2>Start</h2>
     <div class="form">
-      <label>Machine
-        <select bind:value={sHost} onchange={() => { sScratch = selHost?.default_scratch || ""; }}>
-          {#each hosts as h}<option value={h.id}>{h.label}</option>{/each}
-        </select>
+      <label>Source
+        <input bind:value={sSource} placeholder="/mnt/media/tv/show" />
+      </label>
+      <label>Target
+        <input bind:value={sTarget} placeholder="/mnt/media/tv-4k/show" />
+      </label>
+      <label>Archive
+        <input bind:value={sArchive} disabled={sDelete} placeholder="/mnt/media/archive/show" />
       </label>
       <label>Scratch
-        <select bind:value={sScratch}>
-          {#each Object.entries(selHost?.scratch || {}) as [k, p]}<option value={k}>{k} — {p}</option>{/each}
-        </select>
+        <input bind:value={sScratch} placeholder="leave empty for the device default" />
+      </label>
+      <label>Workers
+        <input bind:value={sWorkers} placeholder="leave empty for the device default" />
       </label>
     </div>
-    <p class="muted small">
-      {selected.size ? sel.filter(r => r.status === "queued").length : (counts.queued ?? 0)} episodes
-    </p>
+    <label class="check">
+      <input type="checkbox" bind:checked={sDelete} />
+      Delete each source once it is delivered, instead of archiving it
+    </label>
+    <div class="devpick">
+      {#each book as m}
+        <button class="pickdev" class:on={sDevices.has(m.name)} onclick={() => toggleDevice(m.name)}>
+          {sDevices.has(m.name) ? "☑" : "☐"} {m.name}
+        </button>
+      {:else}
+        <span class="muted small">no machines — add one under ⚙ Machines</span>
+      {/each}
+    </div>
     <div class="row gap">
-      <button class="primary" onclick={start} disabled={!sHost || !!busy}>Start</button>
+      <button class="primary" onclick={start} disabled={!sDevices.size || !!busy}>Start</button>
+      <button class="ghost" onclick={preview} disabled={!sDevices.size || !!busy}>Show the command</button>
       <button class="ghost" onclick={() => (showStart = false)}>Cancel</button>
     </div>
   </div>
@@ -511,6 +518,15 @@
   button.primary:disabled { opacity: .45; cursor: not-allowed; }
   .modal button.ghost { color: #e6e6e6; border: 1px solid #2b3244; border-radius: 6px;
     padding: .45rem .9rem; font: inherit; font-size: .85rem; cursor: pointer; }
+  .check { display: flex; flex-direction: row; align-items: center; gap: .5rem;
+    margin-top: .8rem; font-size: .82rem; color: #b9c0d0; }
+  .check input { width: 1rem; height: 1rem; padding: 0; accent-color: #1d4ed8; }
+  .devpick { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .8rem; }
+  .pickdev { background: #171b26; color: #e6e6e6; border: 1px solid #2b3244;
+    border-radius: 999px; padding: .25rem .7rem; font: inherit; font-size: .8rem;
+    cursor: pointer; }
+  .pickdev.on { border-color: #1d4ed8; color: #9dc0ff; }
+  .modal .danger { border-color: #5a2233; color: #f8899f; }
   .muted { color: #8b93a7; } .small { font-size: .78rem; }
   .mono { font-family: ui-monospace, monospace; font-size: .76rem; }
   .pad { padding: 1.2rem .6rem; }

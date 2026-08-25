@@ -3,410 +3,19 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
-import subprocess
 import sys
 import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-HERE = Path(__file__).resolve().parent
-DIST = HERE / "web" / "dist"
-RUN = Path(os.environ.get("UPSCALE_STATE", Path.home() / ".upscale")) / "run"
-STATE_JSON = RUN / "state.json"
-WORKER = os.environ.get("UPSCALE_WORKER", ".local/libexec/upscale-worker")
-RUN_LOG = RUN / "run.log"
+import api
 
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-       "-o", "ControlPath=none"]
-SNAPSHOT_INTERVAL = 5.0
+DIST = Path(__file__).resolve().parent / "web" / "dist"
 
-
-def run(cmd, timeout=30):
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout, p.stderr
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        return 124, "", str(exc)
-
-
-def ssh_to(spec: str, cmd: str, timeout=20):
-    return run(SSH + shlex.split(spec) + [cmd], timeout=timeout)
-
-
-def config() -> dict:
-    try:
-        return json.loads((HERE / "config.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def browse_roots() -> list:
-    return [Path(p) for p in config().get("browse_roots", ["/mnt/media"])]
-
-
-def allowed(p: Path) -> bool:
-    try:
-        r = p.resolve()
-    except OSError:
-        return False
-    return any(r == root or root in r.parents for root in browse_roots())
-
-
-def search(q: str) -> dict:
-    q = q or ""
-    if not q:
-        return {"base": "", "results": [
-            {"kind": "dir", "name": str(r), "path": str(r), "files": 0} for r in browse_roots()]}
-    p = Path(q)
-    base, frag = (p, "") if q.endswith("/") else (p.parent, p.name.lower())
-    if not allowed(base) or not base.is_dir():
-        return {"base": str(base), "results": []}
-    out = []
-    try:
-        for e in sorted(base.iterdir()):
-            if e.name.startswith(".") or (frag and not e.name.lower().startswith(frag)):
-                continue
-            if e.is_dir():
-                try:
-                    n = sum(1 for f in e.iterdir() if f.is_file() and not f.name.startswith("."))
-                except OSError:
-                    n = 0
-                out.append({"kind": "dir", "name": e.name, "path": str(e), "files": n})
-            elif e.is_file():
-                out.append({"kind": "file", "name": e.name, "path": str(e),
-                            "size": e.stat().st_size})
-    except OSError:
-        pass
-    return {"base": str(base), "results": out[:400]}
-
-
-PENDING = RUN / "pending.json"
-
-
-def pending() -> dict:
-    try:
-        return json.loads(PENDING.read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def set_pending(d: dict) -> None:
-    RUN.mkdir(parents=True, exist_ok=True)
-    PENDING.write_text(json.dumps({**pending(), **d}, indent=2))
-
-
-def browse(where: str) -> dict:
-    if not where:
-        return {"path": "", "up": "", "dirs": [
-            {"path": str(r), "name": str(r), "files": 0} for r in browse_roots()]}
-    p = Path(where)
-    if not allowed(p) or not p.is_dir():
-        return {"error": f"not reachable: {where}", "dirs": []}
-    dirs = []
-    try:
-        for d in sorted(p.iterdir()):
-            if d.is_dir() and not d.name.startswith("."):
-                try:
-                    n = sum(1 for f in d.iterdir() if f.is_file() and not f.name.startswith("."))
-                except OSError:
-                    n = 0
-                dirs.append({"path": str(d), "name": d.name, "files": n})
-    except OSError as exc:
-        return {"error": str(exc), "dirs": []}
-    up = str(p.parent) if allowed(p.parent) else ""
-    files = sum(1 for f in p.iterdir() if f.is_file() and not f.name.startswith("."))
-    return {"path": str(p), "up": up, "dirs": dirs, "files": files}
-
-
-DEVICES_PATH = HERE / "devices.json"
-
-
-def devices() -> dict:
-    try:
-        return json.loads(DEVICES_PATH.read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def save_devices(d: dict) -> None:
-    tmp = DEVICES_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(d, indent=2))
-    tmp.replace(DEVICES_PATH)
-
-
-def probe(spec: str) -> dict:
-    out = {"ssh": spec, "reachable": False}
-    rc, o, err = ssh_to(spec, (
-        "printf 'host=%s\n' \"$(hostname)\"; "
-        "printf 'worker=%s\n' \"$([ -x $HOME/.local/libexec/upscale-worker ] && echo yes || echo no)\"; "
-        "printf 'mkvmerge=%s\n' \"$(command -v mkvmerge >/dev/null && echo yes || echo no)\"; "
-        "printf 'gpu=%s\n' \"$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)\"; "
-        "printf 'nproc=%s\n' \"$(nproc)\"; "
-        "printf 'cpumax=%s\n' \"$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)\"; "
-        "printf 'free=%s\n' \"$(df -BG --output=avail $HOME 2>/dev/null | tail -1 | tr -d ' G')\""
-    ), timeout=25)
-    if rc != 0:
-        out["error"] = (err or "ssh failed").strip()[:200]
-        return out
-    out["reachable"] = True
-    for line in o.splitlines():
-        if "=" in line:
-            k, _, v = line.partition("=")
-            out[k.strip()] = v.strip()
-    quota, period = (out.get("cpumax") or "").split(" ") if " " in (out.get("cpumax") or "") else ("", "")
-    if quota.isdigit() and period.isdigit() and int(period):
-        out["cores"] = round(int(quota) / int(period), 1)
-    elif (out.get("nproc") or "").isdigit():
-        out["cores"] = int(out["nproc"])
-    warn = []
-    if out.get("worker") != "yes":
-        warn.append("upscale-worker is not installed on it")
-    if out.get("mkvmerge") != "yes":
-        warn.append("mkvtoolnix is missing — results will fail in Jellyfin")
-    out["warnings"] = warn
-    return out
-
-
-def start_run(body: dict) -> dict:
-    if state():
-        return {"ok": False, "error": "a run is already going"}
-    pend = pending()
-    src = (body.get("source") or pend.get("source") or "").strip()
-    tgt = (body.get("target") or pend.get("target") or "").strip()
-    book = devices()
-    wanted = body.get("devices") or ([body["host"]] if body.get("host") else [])
-    devs = []
-    for d in wanted:
-        d = (d or "").strip()
-        if not d:
-            continue
-        devs.append(f"{d}={book[d]['ssh']}" if d in book else d)
-    devices_ = devs
-    if not src or not tgt:
-        return {"ok": False, "error": "source and target are required"}
-    if not devices_:
-        return {"ok": False, "error": "at least one device is required"}
-    for d in (src, tgt):
-        if not allowed(Path(d)):
-            return {"ok": False, "error": f"not reachable: {d}"}
-    argv = [config().get("upscale_bin") or "upscale", "--source", src, "--target", tgt]
-    arch = (body.get("archive") or pend.get("archive") or "").strip()
-    if body.get("delete"):
-        argv.append("--delete")
-    elif arch:
-        if not allowed(Path(arch)):
-            return {"ok": False, "error": f"not reachable: {arch}"}
-        argv += ["--archive", arch]
-    else:
-        return {"ok": False, "error": "choose --archive or --delete: a finished file has to stop being a source"}
-    for k, flag in (("size", "--size"), ("workers", "--workers"),
-                    ("scratch", "--scratch"), ("model", "--model")):
-        v = str(body.get(k) or "").strip()
-        if v:
-            argv += [flag, v]
-    for d in devices_:
-        argv += ["--device", d]
-    RUN.mkdir(parents=True, exist_ok=True)
-    try:
-        log = open(RUN_LOG, "ab", buffering=0)
-        subprocess.Popen(argv, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-                         start_new_session=True, cwd=str(Path.home()))
-    except OSError as exc:
-        return {"ok": False, "error": str(exc)}
-    return {"ok": True, "command": " ".join(shlex.quote(a) for a in argv)}
-
-
-def state() -> dict:
-    try:
-        return json.loads(STATE_JSON.read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def device_status(spec: str, expect: str) -> dict:
-    d = {"device": spec, "ssh": spec, "file": expect, "reachable": False,
-         "phase": "", "state": "", "paused": False, "episode": "", "error": "",
-         "percent": 0, "phase_percent": -1, "rate": "", "eta": "",
-         "queue_running": False, "queue_stopping": False, "queue_note": ""}
-    rc, out, err = ssh_to(spec, f"$HOME/{WORKER} status", timeout=20)
-    if rc != 0:
-        d["error"] = (err or "ssh failed").strip()[:200]
-        return d
-    try:
-        j = json.loads(out.strip() or "{}")
-    except ValueError:
-        return d
-    d.update(j)
-    d["reachable"] = True
-    d["file"] = expect
-    d["paused"] = j.get("state") == "paused"
-    return d
-
-
-EP_RE = __import__("re").compile(r"[Ss](\d+)[Ee](\d+)")
-
-
-def episode_key(name: str):
-    m = EP_RE.search(name)
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
-def rows(st: dict, devices: list) -> list:
-    lanes = [(d.get("device", ""), d.get("source", ""), d.get("target", ""))
-             for d in devices if d.get("source")]
-    if not lanes:
-        lanes = [("", st.get("source", ""), st.get("target", ""))]
-    busy = {d["file"]: d for d in devices if d.get("file")}
-    working = {d.get("episode"): d for d in devices if d.get("episode")}
-    out, n = [], 0
-
-    def entry(path: Path, status: str, lsrc: str = "", ltgt: str = ""):
-        nonlocal n
-        n += 1
-        ek = episode_key(path.name)
-        d = busy.get(path.name)
-        w = working.get(path.name)
-        pct = 0
-        if w and not d:
-            d = w
-        if d and w is None and d.get("phase") not in ("sending", "retrieving", "waiting"):
-            d = {**d, "phase": "waiting", "done": 0, "total": 0, "percent": 0,
-                 "fps": 0, "eta_s": 0, "rate": "", "eta": ""}
-        if d:
-            pct = d.get("percent") or (int(d["done"] * 100 / d["total"]) if d.get("total") else 0)
-        base = dict(d) if d else {}
-        base.pop("device", None); base.pop("ssh", None); base.pop("file", None)
-        return {**base,
-                "n": ek[1] if ek else n,
-                "_sort": ek or (99, 9999 + n),
-                "name": path.name, "path": str(path),
-                "library_name": Path(lsrc).name if lsrc else "",
-                "target_dir": "",
-                "status": ("paused" if d.get("paused") else "running") if d else status,
-                "device": d["device"] if d else "",
-                "phase": d.get("phase", "") if d else "",
-                "percent": pct,
-                "size": path.stat().st_size if path.exists() else 0}
-
-    seen = set()
-    for owner, lsrc, ltgt in lanes:
-        for base, status in ((lsrc, "queued"), (ltgt, "done")):
-            if not base or (base, status) in seen:
-                continue
-            seen.add((base, status))
-            p = Path(base)
-            if not p.is_dir():
-                continue
-            for f in sorted(p.iterdir()):
-                if f.is_file() and not f.name.startswith("."):
-                    r = entry(f, status, lsrc, ltgt)
-                    r["target_dir"] = ltgt
-                    if status == "queued" and not r.get("device"):
-                        r["device"] = owner
-                    out.append(r)
-    out.sort(key=lambda r: (r["_sort"], r["name"]))
-    for r in out:
-        r.pop("_sort", None)
-    return out
-
-
-def collect() -> dict:
-    book = devices()
-    st = state()
-    entries = st.get("devices", [])
-    named = [(e.get("device", ""), e.get("ssh") or e.get("device", "")) for e in entries]
-    lanes = {e.get("device", ""): (e.get("source", ""), e.get("target", "")) for e in entries}
-    expect = {e.get("device", ""): e.get("file", "") for e in entries}
-    driver = {e.get("device", ""): e.get("phase", "") for e in entries}
-    xfer = {e.get("device", ""): e.get("xfer", "") for e in entries}
-    devs = []
-    if named:
-        with ThreadPoolExecutor(max_workers=min(8, len(named))) as ex:
-            devs = list(ex.map(
-                lambda nx: {**device_status(nx[1], expect.get(nx[0], "")),
-                            "device": nx[0], "ssh": nx[1],
-                            "source": lanes.get(nx[0], ("", ""))[0],
-                            "target": lanes.get(nx[0], ("", ""))[1],
-                            "queue_running": True,
-                            "queue_stopping": (RUN / "stop").exists(),
-                            "queue_note": driver.get(nx[0], "")}, named))
-        for dv in devs:
-            dph = driver.get(dv["device"], "")
-            if dph in ("sending", "retrieving") or not dv.get("phase"):
-                dv["phase"] = dph or dv.get("phase", "")
-            fields = (xfer.get(dv["device"]) or "").split()
-            done = pct = elapsed = 0
-            for f in fields:
-                if f.replace(",", "").isdigit() and not done:
-                    done = int(f.replace(",", ""))
-                elif f.endswith("%") and f[:-1].isdigit():
-                    pct = int(f[:-1])
-                elif f.count(":") == 2:
-                    h, m, sec = f.split(":")
-                    if h.isdigit():
-                        elapsed = int(h) * 3600 + int(m) * 60 + int(sec)
-            if fields:
-                dv["phase_percent"] = pct
-                dv["phase_done"] = done
-                dv["phase_total"] = int(done * 100 / pct) if pct else 0
-                dv["phase_unit"] = "bytes"
-                dv["phase_elapsed_s"] = elapsed
-                dv["percent"] = pct
-    if not devs:
-        devs = [{"device": n, "ssh": m.get("ssh", ""), "id": n, "label": n,
-                    "reachable": None, "phase": "", "file": "", "percent": 0,
-                    "queue_running": False, "queue_stopping": False,
-                    "queue_note": "", "error": "", "source": "", "target": "",
-                    "done": 0, "total": 0, "unit": "", "fps": 0, "eta_s": 0,
-                    "scratch": m.get("scratch", ""), "default_scratch": m.get("scratch", "")}
-                   for n, m in book.items()]
-    r = rows(st, devs)
-    for dv in devs:
-        meta = book.get(dv["device"], {})
-        dv["id"] = dv["device"]
-        dv["label"] = dv["device"]
-        dv["scratch"] = meta.get("scratch", "")
-        dv["default_scratch"] = meta.get("scratch", "")
-    return {"source": st.get("source", ""), "target": st.get("target", ""),
-            "pending": pending(),
-            "size": st.get("size", 0), "running": bool(st),
-            "devs": devs, "hosts": devs, "rows": r,
-            "paused": any(x.get("paused") for x in devs),
-            "counts": {s: sum(1 for x in r if x["status"] == s)
-                       for s in ("done", "running", "paused", "queued")},
-            "ts": int(time.time())}
-
-
-_lock = threading.Lock()
-_snapshot: dict = {}
-_ready = threading.Event()
-
-
-def snapshot_loop():
-    global _snapshot
-    while True:
-        try:
-            s = collect()
-            with _lock:
-                _snapshot = s
-        except Exception as exc:
-            print(f"snapshot failed: {exc}", file=sys.stderr, flush=True)
-        _ready.set()
-        time.sleep(SNAPSHOT_INTERVAL)
-
-
-def snapshot(wait: float = 20.0) -> dict:
-    if not _ready.is_set():
-        _ready.wait(wait)
-    with _lock:
-        s = dict(_snapshot)
-    if s:
-        s["age"] = max(0, int(time.time()) - s.get("ts", 0))
-    return s
+CTYPE = {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
+         ".json": "application/json", ".svg": "image/svg+xml",
+         ".png": "image/png", ".ico": "image/x-icon", ".woff2": "font/woff2"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -427,8 +36,14 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _json(self, obj, code: int = 200):
+    def _json(self, code: int, obj):
         self._send(code, json.dumps(obj).encode(), "application/json")
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        return json.loads(self.rfile.read(n) or b"{}")
 
     def _static(self, path: str):
         rel = path.lstrip("/") or "index.html"
@@ -437,129 +52,39 @@ class Handler(BaseHTTPRequestHandler):
             target = DIST / "index.html"
         if not target.is_file():
             return self._send(503, b"UI not built: cd web && pnpm build\n", "text/plain")
-        ctype = {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
-                 ".json": "application/json", ".svg": "image/svg+xml",
-                 ".png": "image/png", ".ico": "image/x-icon",
-                 ".woff2": "font/woff2"}.get(target.suffix, "application/octet-stream")
-        self._send(200, target.read_bytes(), ctype)
+        self._send(200, target.read_bytes(),
+                   CTYPE.get(target.suffix, "application/octet-stream"))
+
+    def _api(self, method: str, path: str, query: dict, body):
+        code, obj = api.dispatch(method, path, body, query)
+        self._json(code, obj)
 
     def do_GET(self):
-        path = urlparse(self.path).path
-        if path in ("/api/queue", "/api/hosts"):
-            return self._json(snapshot())
-        if path == "/api/browse":
-            from urllib.parse import parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            if "q" in q:
-                return self._json(search(q["q"][0]))
-            return self._json(browse((q.get("path") or [""])[0]))
-        if path == "/api/log":
-            try:
-                return self._json({"log": RUN_LOG.read_text(errors="replace")[-8000:]})
-            except OSError:
-                return self._json({"log": ""})
-        if path == "/api/devices":
-            return self._json({"devices": devices()})
-        if path == "/api/health":
-            return self._json({"ok": True, "state": str(STATE_JSON),
-                               "running": bool(state())})
-        return self._static(path)
-
-    def _devices(self):
-        return [d.get("device", "") for d in state().get("devices", []) if d.get("device")]
+        u = urlparse(self.path)
+        if not u.path.startswith("/api/"):
+            return self._static(u.path)
+        query = {k: v[0] for k, v in parse_qs(u.query).items()}
+        self._api("GET", u.path, query, {})
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        if path in ("/api/pause", "/api/resume"):
-            action = path.rsplit("/", 1)[-1]
-            devs = self._devices()
-            if not devs:
-                return self._json({"ok": False, "error": "nothing is running"}, 409)
-            bad = []
-            for spec in devs:
-                rc, _, err = ssh_to(spec, f"$HOME/{WORKER} {action}", timeout=20)
-                if rc != 0:
-                    bad.append(f"{spec}: {(err or 'ssh failed').strip()[:80]}")
-            if bad:
-                return self._json({"ok": False, "error": "; ".join(bad)}, 502)
-            return self._json({"ok": True, "action": action, "devices": len(devs)})
-        if path in ("/api/hosts/probe", "/api/hosts/add", "/api/hosts/remove"):
-            path = path.replace("/api/hosts/", "/api/devices/")
-        if path in ("/api/devices/probe", "/api/devices/add", "/api/devices/remove"):
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}")
-            except (ValueError, OSError) as exc:
-                return self._json({"ok": False, "error": str(exc)}, 400)
-            if path.endswith("probe"):
-                spec = (body.get("ssh") or "").strip()
-                if not spec:
-                    return self._json({"ok": False, "error": "ssh destination is required"}, 400)
-                return self._json({"ok": True, "probe": probe(spec)})
-            book = devices()
-            if path.endswith("remove"):
-                book.pop((body.get("name") or "").strip(), None)
-                save_devices(book)
-                return self._json({"ok": True, "devices": book})
-            name = (body.get("name") or body.get("label") or "").strip()
-            spec = (body.get("ssh") or "").strip()
-            if not name or not spec:
-                return self._json({"ok": False, "error": "name and ssh destination are required"}, 400)
-            if not all(c.isalnum() or c in "._-" for c in name):
-                return self._json({"ok": False, "error": "name may use letters, digits, dot, dash, underscore"}, 400)
-            book[name] = {"ssh": spec, "scratch": (body.get("scratch") or "").strip(),
-                          "workers": body.get("workers") or ""}
-            save_devices(book)
-            return self._json({"ok": True, "devices": book})
-        if path in ("/api/import", "/api/remove", "/api/hold"):
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}")
-            except (ValueError, OSError) as exc:
-                return self._json({"ok": False, "error": str(exc)}, 400)
-            paths = [p for p in (body.get("paths") or []) if p]
-            if path == "/api/import":
-                if not paths:
-                    return self._json({"ok": False, "error": "nothing picked"}, 400)
-                dirs = {str(Path(p) if Path(p).is_dir() else Path(p).parent) for p in paths}
-                if len(dirs) > 1:
-                    return self._json({"ok": False,
-                                       "error": "pick inside one directory: a run has one source"}, 400)
-                src = dirs.pop()
-                if not allowed(Path(src)):
-                    return self._json({"ok": False, "error": f"not reachable: {src}"}, 400)
-                set_pending({"source": src})
-                n_files = sum(1 for f in Path(src).iterdir()
-                              if f.is_file() and not f.name.startswith("."))
-                return self._json({"ok": True, "added": n_files, "source": src,
-                                   "note": f"source is {src} ({n_files} files)"})
-            return self._json({"ok": False, "error":
-                               "there is no work list to edit — move files in or out of the "
-                               "source directory instead"}, 409)
-        if path == "/api/start":
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}")
-            except (ValueError, OSError) as exc:
-                return self._json({"ok": False, "error": str(exc)}, 400)
-            r = start_run(body)
-            return self._json(r, 200 if r.get("ok") else 400)
-        if path == "/api/stop":
-            try:
-                (RUN / "stop").touch()
-            except OSError as exc:
-                return self._json({"ok": False, "error": str(exc)}, 500)
-            return self._json({"ok": True, "note": "stopping after the current file"})
-        return self._json({"error": "not found"}, 404)
+        u = urlparse(self.path)
+        try:
+            body = self._body()
+        except (ValueError, OSError) as exc:
+            return self._json(400, {"ok": False, "error": f"bad request body: {exc}"})
+        if not isinstance(body, dict):
+            return self._json(400, {"ok": False, "error": "body must be a JSON object"})
+        self._api("POST", u.path, {k: v[0] for k, v in parse_qs(u.query).items()}, body)
 
 
 def main():
-    cfg = config()
+    cfg = api.config()
     port = int(os.environ.get("UPSCALE_UI_PORT") or cfg.get("port") or 8790)
     bind = os.environ.get("UPSCALE_UI_BIND") or cfg.get("bind") or "127.0.0.1"
     srv = ThreadingHTTPServer((bind, port), Handler)
     srv.daemon_threads = True
-    threading.Thread(target=snapshot_loop, name="snapshot", daemon=True).start()
+    threading.Thread(target=api.snapshot_loop, name="snapshot", daemon=True,
+                     kwargs={"log": lambda m: print(m, file=sys.stderr, flush=True)}).start()
     print(f"upscale-ui on http://{bind}:{port}", flush=True)
     try:
         srv.serve_forever()

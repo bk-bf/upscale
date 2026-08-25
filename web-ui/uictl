@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import api
+
+
+USAGE = """usage: uictl METHOD PATH [key=value ...]
+       uictl routes
+
+  uictl GET  /api/devices
+  uictl POST /api/devices/remove name=rental
+  uictl POST /api/start devices=desktop source=/mnt/media/tv/x target=/mnt/media/up/x delete=true dry_run=true
+  uictl GET  /api/browse q=/mnt/media/
+
+Values are JSON when they parse as JSON, otherwise strings.
+Repeat a key to build a list: devices=a devices=b
+"""
+
+
+def parse(pairs):
+    out = {}
+    for p in pairs:
+        k, _, v = p.partition("=")
+        try:
+            v = json.loads(v)
+        except ValueError:
+            pass
+        if k in out:
+            out[k] = out[k] + [v] if isinstance(out[k], list) else [out[k], v]
+        else:
+            out[k] = v
+    return out
+
+
+def main(argv):
+    if len(argv) == 1 and argv[0] == "routes":
+        for m, p in sorted(api.ROUTES):
+            print(f"{m:5} {p:28} {' '.join(sorted(api.ROUTES[(m, p)].accepts)) or '-'}")
+        return 0
+    if len(argv) < 2:
+        print(USAGE, file=sys.stderr)
+        return 2
+    method, path, rest = argv[0].upper(), argv[1], parse(argv[2:])
+    if method == "GET":
+        code, obj = api.dispatch(method, path, {}, {k: str(v) for k, v in rest.items()})
+    else:
+        code, obj = api.dispatch(method, path, rest, {})
+    print(json.dumps(obj, indent=2))
+    return 0 if code < 400 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

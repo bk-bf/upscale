@@ -1,7 +1,7 @@
 # upscale-ui
 
-One page to drive [`upscale`](https://github.com/bk-bf/upscale): pick a library
-and a GPU host, start a range, watch it, pause it.
+One page to drive [`upscale`](https://github.com/bk-bf/upscale): pick a source
+directory and a GPU device, start it, watch it, stop it.
 
 Runs on the machine that **holds the libraries** (ubuntuserver). It never
 upscales anything itself — it reads the libraries locally and drives GPU hosts
@@ -14,26 +14,78 @@ http://100.122.63.6:8790                   (direct on the tailnet)
 
 ## What it shows
 
-Per host: state, current episode, chunk and frame progress, fps, elapsed, ETA,
-which scratch disk it is using, and whether a GPU process is actually turning.
-That last one matters — the job file survives a crash, so "running" on its own
-can lie.
+Per device: state, current episode, chunk and frame progress, fps, elapsed, ETA
+and whether a GPU process is actually turning. That last one matters — the job
+file survives a crash, so "running" on its own can lie.
 
-It also says whether a **queue** is driving the host, separately from the
-episode. Without one, the host finishes what it has and stops; that is a normal
-state and worth seeing rather than inferring.
+It also says whether a run is driving the device, separately from the episode.
+Without one, the device finishes what it has and stops.
+
+## How it is put together
+
+Three files, split by what each one can be tested without.
+
+| File | What it is | Needs |
+|---|---|---|
+| `api.py` | every endpoint, as a function in `ROUTES` | nothing — no socket, no browser |
+| `server.py` | sockets, static files, the snapshot thread | a port |
+| `web/src/routes/+page.svelte` | the page | a build |
+
+`api.dispatch(method, path, body, query) -> (status, dict)` is the only way in.
+The HTTP server calls it, `uictl` calls it, and the tests call it, so a feature
+that works from one works from all three.
+
+Each route declares the body keys it reads:
+
+```python
+@route("POST", "/api/devices/remove", accepts=("name",))
+```
+
+`dispatch` rejects a body carrying anything else with a 400 naming the key. A
+page that posts `{id}` to a handler reading `name` gets an error instead of a
+success it did not earn.
+
+## Driving it without a browser
+
+```bash
+./uictl routes                                     # every path and the keys it reads
+./uictl GET  /api/devices
+./uictl POST /api/devices/remove name=rental
+./uictl GET  /api/browse q=/mnt/media/tv/
+./uictl POST /api/start devices=desktop \
+    source=/mnt/media/tv/show target=/mnt/media/tv-4k/show \
+    delete=true dry_run=true                       # prints the command, runs nothing
+```
+
+`uictl` imports `api.py` directly — it is the page's own code path with the
+browser taken out. `dry_run=true` on `/api/start` returns the exact `upscale`
+command line without spawning it.
+
+## Tests
+
+```bash
+python3 test_api.py
+```
+
+Stdlib `unittest`, no network and no GPU: `api.ssh_to` and `api.spawn` are
+replaced with fakes, and `api.configure()` points the device book and the run
+directory at a temp directory.
+
+`FrontendContract` reads `+page.svelte`, extracts every `api()`/`act()` call and
+the keys of the object it posts, and fails if a path has no route or a key no
+handler reads — reporting the svelte line number. That check is why a rename on
+one side cannot silently pass on the other.
 
 ## Two rules it is built on
 
-**Truth is derived, never stored.** The pipeline keeps no work list — it asks
-"which source has no matching `.mkv`?" every cycle — and this server keeps no
-job database for the same reason. Outstanding work comes from `upscale --list`;
-host state comes from that host. Restarting this service cannot make it
-disagree with reality.
+**Truth is derived, never stored.** The pipeline keeps no work list — what is
+left to do is what is in the source directory — and this server keeps no job
+database for the same reason. Restarting it cannot make it disagree with
+reality.
 
 **Nothing is invented when a host is unreachable.** An ssh failure is reported
-as an error on that host, never as "idle". An idle-looking panel for a box that
-is actually grinding is worse than an error.
+as an error on that device, never as "idle". An idle-looking panel for a box
+that is actually grinding is worse than an error.
 
 ## Install
 
