@@ -61,6 +61,17 @@ success it did not earn.
 browser taken out. `dry_run=true` on `/api/start` returns the exact `upscale`
 command line without spawning it.
 
+## Checking a change
+
+```bash
+./check                                          # tests, build, restart, health
+mkdir -p /tmp/upscale-ui && node shot.mjs        # one PNG per UI state
+```
+
+`shot.mjs` drives headless firefox through `web/node_modules/playwright` and
+exits non-zero on a page error, console error or failed request. `../CLAUDE.md`
+has the full sequence and the hook that enforces it.
+
 ## Tests
 
 ```bash

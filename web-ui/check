@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -uo pipefail
+cd "$(dirname "$0")"
+
+STEP=${1:-all}
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+echo "1/3 tests"
+python3 test_api.py 2>&1 | tail -3 | sed 's/^/     /'
+[ "${PIPESTATUS[0]}" -eq 0 ] || fail "python3 web-ui/test_api.py"
+
+[ "$STEP" = tests ] && exit 0
+
+echo "2/3 build"
+( cd web && pnpm build ) >/tmp/upscale-ui-build.log 2>&1 || {
+  tail -20 /tmp/upscale-ui-build.log >&2; fail "cd web-ui/web && pnpm build"; }
+echo "     web/dist written"
+
+newest_src=$(find server.py api.py web/src web/*.js -newer web/dist/index.html 2>/dev/null | head -1)
+[ -n "$newest_src" ] && fail "web/dist is older than $newest_src"
+
+[ "$STEP" = build ] && exit 0
+
+echo "3/3 service"
+systemctl --user restart upscale-ui || fail "systemctl --user restart upscale-ui"
+sleep 3
+systemctl --user is-active --quiet upscale-ui || {
+  journalctl --user -u upscale-ui -n 20 --no-pager >&2; fail "upscale-ui did not come back"; }
+curl -sf --max-time 6 http://100.122.63.6:8790/api/health >/dev/null || fail "GET /api/health"
+echo "     upscale-ui active, /api/health answers"
+
+echo
+echo "now look at it:"
+echo "  mkdir -p /tmp/upscale-ui && node web-ui/shot.mjs"
+echo "  then Read each PNG it prints"
