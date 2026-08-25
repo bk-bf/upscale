@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""upscale-ui — one page showing what the upscaler is doing.
-
-Runs on the machine holding the media. It never upscales anything and it never
-decides anything: it reads the run's own snapshot, lists two directories, and
-asks each device what it is working on.
-
-Truth is derived, never stored, and there is far less of it to derive than
-there used to be. The pipeline no longer selects a subset of a shared library,
-so this server no longer mirrors episode numbering, ranges, parities, ignore
-globs or an archive lookup to stay in step with it. What is left to do is what
-is in the source directory; what is done is what is in the target directory.
-
-Stdlib only.
-"""
 from __future__ import annotations
 
 import json
@@ -58,7 +44,6 @@ def config() -> dict:
         return {}
 
 
-# ------------------------------------------------------------------ browse ---
 def browse_roots() -> list:
     return [Path(p) for p in config().get("browse_roots", ["/mnt/media"])]
 
@@ -72,11 +57,6 @@ def allowed(p: Path) -> bool:
 
 
 def search(q: str) -> dict:
-    """Typeahead over paths, in the shape the page already speaks.
-
-    A trailing slash lists a directory; anything else filters that directory by
-    prefix. Only the allowed roots are reachable.
-    """
     q = q or ""
     if not q:
         return {"base": "", "results": [
@@ -120,11 +100,6 @@ def set_pending(d: dict) -> None:
 
 
 def browse(where: str) -> dict:
-    """Directories under the allowed roots, with a count of what is in them.
-
-    Nothing outside browse_roots is reachable, and only directories are listed -
-    a run takes a directory, not a file.
-    """
     if not where:
         return {"path": "", "up": "", "dirs": [
             {"path": str(r), "name": str(r), "files": 0} for r in browse_roots()]}
@@ -147,10 +122,6 @@ def browse(where: str) -> dict:
     return {"path": str(p), "up": up, "dirs": dirs, "files": files}
 
 
-# ------------------------------------------------------------------ devices ---
-# An ADDRESS BOOK, nothing more. It maps a name to an ssh destination so a
-# rented box is not a row of digits. It does not decide what a device does -
-# that is decided by the run, in its arguments, every time.
 DEVICES_PATH = HERE / "devices.json"
 
 
@@ -168,13 +139,6 @@ def save_devices(d: dict) -> None:
 
 
 def probe(spec: str) -> dict:
-    """Can we reach it, and is it ready to be given work?
-
-    Reports what would actually stop a run: no worker installed, no upscaler
-    binary, no mkvtoolnix (results play in mpv and fail in Jellyfin without it),
-    and how many cores the cgroup really allows - `nproc` lies on a rented box,
-    and worker count follows cores, not the card.
-    """
     out = {"ssh": spec, "reachable": False}
     rc, o, err = ssh_to(spec, (
         "printf 'host=%s\n' \"$(hostname)\"; "
@@ -207,22 +171,13 @@ def probe(spec: str) -> dict:
     return out
 
 
-# -------------------------------------------------------------------- start ---
 def start_run(body: dict) -> dict:
-    """Build an `upscale` command line and run it.
-
-    The page never decides anything the command would decide. It assembles
-    arguments and execs the binary - so what runs is what you would have typed,
-    and there is one implementation of the rules.
-    """
     if state():
         return {"ok": False, "error": "a run is already going"}
     pend = pending()
     src = (body.get("source") or pend.get("source") or "").strip()
     tgt = (body.get("target") or pend.get("target") or "").strip()
     book = devices()
-    # A saved name is resolved to NAME=SPEC so the name travels with the
-    # command and comes back in the log and the snapshot.
     wanted = body.get("devices") or ([body["host"]] if body.get("host") else [])
     devs = []
     for d in wanted:
@@ -258,8 +213,6 @@ def start_run(body: dict) -> dict:
     RUN.mkdir(parents=True, exist_ok=True)
     try:
         log = open(RUN_LOG, "ab", buffering=0)
-        # No shell: every argument - including an ssh spec with spaces in it -
-        # is passed through as one word and never re-parsed.
         subprocess.Popen(argv, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
                          start_new_session=True, cwd=str(Path.home()))
     except OSError as exc:
@@ -267,13 +220,7 @@ def start_run(body: dict) -> dict:
     return {"ok": True, "command": " ".join(shlex.quote(a) for a in argv)}
 
 
-# ------------------------------------------------------------------- state ---
 def state() -> dict:
-    """The run's own snapshot: source, target, devices, and each device's file.
-
-    Written by `upscale` itself, so there is no second opinion about what is
-    running. Absent means nothing is running, which is a normal answer.
-    """
     try:
         return json.loads(STATE_JSON.read_text())
     except (OSError, ValueError):
@@ -281,16 +228,6 @@ def state() -> dict:
 
 
 def device_status(spec: str, expect: str) -> dict:
-    """What this device says about itself, PASSED THROUGH UNCHANGED.
-
-    The worker already emits phase, phase_percent, phase_done, phase_total,
-    phase_unit, phase_elapsed_s, fps, eta_s and the rest. Renaming any of that
-    on the way past is how the page came to ask for fields nothing produced and
-    render a dash: the API answered correctly in a vocabulary only this file
-    spoke. There is one shape, and the worker defines it.
-
-    An unreachable device is reported as unreachable, never as idle.
-    """
     d = {"device": spec, "ssh": spec, "file": expect, "reachable": False,
          "phase": "", "state": "", "paused": False, "episode": "", "error": "",
          "percent": 0, "phase_percent": -1, "rate": "", "eta": "",
@@ -303,7 +240,7 @@ def device_status(spec: str, expect: str) -> dict:
         j = json.loads(out.strip() or "{}")
     except ValueError:
         return d
-    d.update(j)                      # verbatim - no translation
+    d.update(j)
     d["reachable"] = True
     d["file"] = expect
     d["paused"] = j.get("state") == "paused"
@@ -314,35 +251,15 @@ EP_RE = __import__("re").compile(r"[Ss](\d+)[Ee](\d+)")
 
 
 def episode_key(name: str):
-    """(season, episode) from the filename, or None.
-
-    The number in the # column has to be a property of the EPISODE, not of the
-    listing. It used to be a running counter assigned while walking the source
-    directory and then the target, so a finished file was renumbered and sorted
-    to the back the moment it moved - the row jumped while you were reading it.
-    """
     m = EP_RE.search(name)
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def rows(st: dict, devices: list) -> list:
-    """One row per file: what is in the source directory, then the target.
-
-    No numbering, no ownership rule, no archive probe. A file being worked on is
-    the file a device says it has - and it says a name, because the name never
-    left it.
-    """
-    # Each device owns a source directory, so a file's device is simply which
-    # directory it is in. Nothing is assigned, guessed or claimed - reassigning
-    # an episode is moving it, and the column can never credit the wrong box.
     lanes = [(d.get("device", ""), d.get("source", ""), d.get("target", ""))
              for d in devices if d.get("source")]
     if not lanes:
         lanes = [("", st.get("source", ""), st.get("target", ""))]
-    # The driver's claim says which row it is working on. The WORKER says what
-    # the GPU is actually on, by name, from its own file. While the driver is
-    # waiting for a busy device those are different files, and only the second
-    # one may lend a row its progress.
     busy = {d["file"]: d for d in devices if d.get("file")}
     working = {d.get("episode"): d for d in devices if d.get("episode")}
     out, n = [], 0
@@ -355,14 +272,11 @@ def rows(st: dict, devices: list) -> list:
         w = working.get(path.name)
         pct = 0
         if w and not d:
-            d = w                      # the GPU is on it, whoever claimed it
+            d = w
         if d and w is None and d.get("phase") not in ("sending", "retrieving", "waiting"):
-            # claimed, but the device is busy with something else
             d = {**d, "phase": "waiting", "done": 0, "total": 0, "percent": 0,
                  "fps": 0, "eta_s": 0, "rate": "", "eta": ""}
         if d:
-            # during a transfer the percentage is the transfer's; during the
-            # upscale it is the worker's frame count
             pct = d.get("percent") or (int(d["done"] * 100 / d["total"]) if d.get("total") else 0)
         base = dict(d) if d else {}
         base.pop("device", None); base.pop("ssh", None); base.pop("file", None)
@@ -371,8 +285,6 @@ def rows(st: dict, devices: list) -> list:
                 "_sort": ek or (99, 9999 + n),
                 "name": path.name, "path": str(path),
                 "library_name": Path(lsrc).name if lsrc else "",
-                # Where it lands. A queued row sits in the source directory, so
-                # its own path never shows the destination.
                 "target_dir": "",
                 "status": ("paused" if d.get("paused") else "running") if d else status,
                 "device": d["device"] if d else "",
@@ -393,12 +305,9 @@ def rows(st: dict, devices: list) -> list:
                 if f.is_file() and not f.name.startswith("."):
                     r = entry(f, status, lsrc, ltgt)
                     r["target_dir"] = ltgt
-                    # a queued file belongs to the device whose directory holds it
                     if status == "queued" and not r.get("device"):
                         r["device"] = owner
                     out.append(r)
-    # Sorted by episode, so a file keeps its place when it moves from the
-    # source directory to the target one.
     out.sort(key=lambda r: (r["_sort"], r["name"]))
     for r in out:
         r.pop("_sort", None)
@@ -406,11 +315,9 @@ def rows(st: dict, devices: list) -> list:
 
 
 def collect() -> dict:
-    book = devices()          # fetched before the local name shadows it
+    book = devices()
     st = state()
     entries = st.get("devices", [])
-    # A device has a NAME and an ADDRESS, and they are not the same string.
-    # Asking "rental" over ssh reaches nothing; the worker lives at its ssh spec.
     named = [(e.get("device", ""), e.get("ssh") or e.get("device", "")) for e in entries]
     lanes = {e.get("device", ""): (e.get("source", ""), e.get("target", "")) for e in entries}
     expect = {e.get("device", ""): e.get("file", "") for e in entries}
@@ -424,28 +331,13 @@ def collect() -> dict:
                             "device": nx[0], "ssh": nx[1],
                             "source": lanes.get(nx[0], ("", ""))[0],
                             "target": lanes.get(nx[0], ("", ""))[1],
-                            # It is in the run's own snapshot, and that file
-                            # exists only while the driver is alive - so this
-                            # device is being worked, whatever the box is doing
-                            # at this instant.
                             "queue_running": True,
                             "queue_stopping": (RUN / "stop").exists(),
                             "queue_note": driver.get(nx[0], "")}, named))
-        # What the driver is doing wins: it is the one moving the file, and a
-        # worker asked during a push still reports its previous phase.
         for dv in devs:
-            # The driver only owns the phases it performs itself. While the
-            # device is working, the worker knows better - it can say
-            # "extracting" where the driver only knows "upscaling".
             dph = driver.get(dv["device"], "")
             if dph in ("sending", "retrieving") or not dv.get("phase"):
                 dv["phase"] = dph or dv.get("phase", "")
-            # A transfer is a phase like any other, and it is described in the
-            # SAME vocabulary the worker uses - phase_percent, phase_done,
-            # phase_unit, phase_elapsed_s - so the page needs no special case
-            # and no second set of field names.
-            #
-            # rsync: "  199,185,400 100%   19.16MB/s    0:00:09"
             fields = (xfer.get(dv["device"]) or "").split()
             done = pct = elapsed = 0
             for f in fields:
@@ -465,8 +357,6 @@ def collect() -> dict:
                 dv["phase_elapsed_s"] = elapsed
                 dv["percent"] = pct
     if not devs:
-        # Nothing running: the machines are still worth showing, so the page can
-        # manage them and start a run against one.
         devs = [{"device": n, "ssh": m.get("ssh", ""), "id": n, "label": n,
                     "reachable": None, "phase": "", "file": "", "percent": 0,
                     "queue_running": False, "queue_stopping": False,
@@ -491,9 +381,6 @@ def collect() -> dict:
             "ts": int(time.time())}
 
 
-# One collector, however many browsers. Each device poll is an ssh round trip,
-# and the page refreshes every few seconds; done per request, N clients caused
-# N sweeps and the sweeps piled up on each other.
 _lock = threading.Lock()
 _snapshot: dict = {}
 _ready = threading.Event()
@@ -506,7 +393,7 @@ def snapshot_loop():
             s = collect()
             with _lock:
                 _snapshot = s
-        except Exception as exc:                     # never kill the collector
+        except Exception as exc:
             print(f"snapshot failed: {exc}", file=sys.stderr, flush=True)
         _ready.set()
         time.sleep(SNAPSHOT_INTERVAL)
@@ -522,7 +409,6 @@ def snapshot(wait: float = 20.0) -> dict:
     return s
 
 
-# ------------------------------------------------------------------ server ---
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -564,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/browse":
             from urllib.parse import parse_qs
             q = parse_qs(urlparse(self.path).query)
-            if "q" in q:                       # typeahead, the page's own shape
+            if "q" in q:
                 return self._json(search(q["q"][0]))
             return self._json(browse((q.get("path") or [""])[0]))
         if path == "/api/log":
@@ -584,8 +470,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        # Pause and resume reach the worker on each device, which holds after the
-        # current CHUNK - so a pause costs at most one chunk, not the episode.
         if path in ("/api/pause", "/api/resume"):
             action = path.rsplit("/", 1)[-1]
             devs = self._devices()
@@ -635,9 +519,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": str(exc)}, 400)
             paths = [p for p in (body.get("paths") or []) if p]
             if path == "/api/import":
-                # Importing now means: this is where the work is. A directory is
-                # taken as-is; files are taken as the directory holding them,
-                # because a run reads a directory, not a list.
                 if not paths:
                     return self._json({"ok": False, "error": "nothing picked"}, 400)
                 dirs = {str(Path(p) if Path(p).is_dir() else Path(p).parent) for p in paths}
@@ -652,9 +533,6 @@ class Handler(BaseHTTPRequestHandler):
                               if f.is_file() and not f.name.startswith("."))
                 return self._json({"ok": True, "added": n_files, "source": src,
                                    "note": f"source is {src} ({n_files} files)"})
-            # Hold and remove managed a stored work list. There is no list: what
-            # is queued is what is in the source directory, so the honest answer
-            # is to say so rather than pretend.
             return self._json({"ok": False, "error":
                                "there is no work list to edit — move files in or out of the "
                                "source directory instead"}, 409)

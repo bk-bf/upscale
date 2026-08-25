@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
-# set-baseline.sh — turn the baseline repeats into the number to beat.
-#
-# A baseline is not one run. Without knowing the run-to-run spread there is no
-# way to tell an improvement from weather, and a loop that cannot tell the
-# difference will spend the night keeping noise and reverting real wins.
-#
-# Writes research/baseline.env, which trial.sh reads to judge every later trial.
 set -uo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
 
-stats(){  # $1 = regime
+stats(){
   local re=$1 f
   local -a fps=()
   for f in "$R"/runs/baseline*."$re".txt; do
@@ -26,9 +19,6 @@ stats(){  # $1 = regime
 read -r A_MEAN A_MIN A_MAX A_N A_SPREAD < <(stats A)
 read -r B_MEAN B_MIN B_MAX B_N B_SPREAD < <(stats B)
 
-# Every baseline repeat must agree on the pixels. If they do not, the upscaler
-# is not deterministic on this box and the whole gate is void — better to fail
-# loudly here than to spend eight hours discarding good work.
 SHAS=$(grep -h '^frame_sha:' "$R"/runs/baseline*.txt 2>/dev/null | awk '{print $2}' | sort -u)
 NSHA=$(printf '%s\n' "$SHAS" | grep -c . ) || NSHA=0
 XSHAS=$(grep -h '^x264_opts_sha:' "$R"/runs/baseline*.txt 2>/dev/null | awk '{print $2}' | sort -u)

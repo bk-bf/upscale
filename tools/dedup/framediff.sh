@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# Per-frame "fraction of pixels that changed since the previous frame".
-#
-# Computed entirely in ffmpeg so it needs no numpy:
-#   format=gray            full 640x480, no thumbnailing - localised motion
-#                          (a mouth, a slow pan) must not be averaged away
-#   tblend=difference      |frame[n] - frame[n-1]|
-#   lutyuv if(gt(val,8))   binarise: ignore per-pixel XviD noise below 8/255
-#   signalstats YAVG       mean of the binarised plane = 255 * changed-fraction
-#
-# Output: one "<frame-index> <changed-fraction>" per line.
 set -e
 SRC="$1"; OUT="$2"
 ffmpeg -v error -i "$SRC" -an -vf \

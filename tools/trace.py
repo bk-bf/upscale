@@ -1,7 +1,3 @@
-"""Load an SRVGGNetCompact .pth and trace it to TorchScript for pnnx.
-
-    python trace.py <model.pth> <num_feat> <num_conv> <out.pt>
-"""
 import sys
 import torch
 from srvgg import SRVGGNetCompact

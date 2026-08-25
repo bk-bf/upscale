@@ -4,8 +4,6 @@ from torch.nn import functional as F
 
 
 class SRVGGNetCompact(nn.Module):
-    """Real-ESRGAN SRVGGNetCompact: a conv/PReLU stack, a pixelshuffle, and a
-    nearest-neighbour upsample of the input added back as a residual base."""
 
     def __init__(self, num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=2):
         super().__init__()

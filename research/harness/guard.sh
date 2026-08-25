@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# guard.sh — the time guard. The loop is told to run forever; this is what
-# makes "forever" end at eight hours.
-#
-#   guard.sh --arm 8      set the deadline to eight hours from now
-#   guard.sh              exit 0 while there is time left, 1 once there is not
-#
-# Deliberately a separate file from the loop's own bookkeeping: a loop that
-# tracks its own deadline in its own head forgets, drifts, or talks itself out
-# of stopping. This one is on disk and cannot be argued with.
 set -uo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
 D="$R/.deadline"

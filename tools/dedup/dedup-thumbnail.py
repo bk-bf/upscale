@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""Map each frame of a clip to the earlier frame it duplicates.
-
-Anime is animated on 2s/3s, so consecutive frames are often the same cel. They
-are not bit-identical after XviD (per-frame compression noise), so the match has
-to be perceptual: each frame is reduced to a 64x48 grey thumbnail and compared
-to the previous KEPT frame by mean absolute difference. Comparing against the
-kept frame rather than the immediate predecessor stops slow drift from
-accumulating across a long run of "duplicates".
-
-Writes a mapping file: one line per source frame, giving the 1-based index of
-the unique frame whose upscale should be reused.
-"""
 import subprocess, sys
 
 src, out_map, thresh = sys.argv[1], sys.argv[2], float(sys.argv[3])
@@ -23,8 +11,8 @@ raw = subprocess.run(
     capture_output=True).stdout
 
 n = len(raw) // FRAME
-mapping = []          # mapping[i] = index of the unique frame to reuse
-uniques = []          # indices that must actually be upscaled
+mapping = []
+uniques = []
 ref = None
 ref_idx = 0
 

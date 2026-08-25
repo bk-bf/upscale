@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# upscale-ui installer.
-#
-#   ./install.sh                 build the SPA (nothing else)
-#   ./install.sh --with-units    also write the systemd --user unit, not enabled
-#   ./install.sh --uninstall     remove the unit
-#
-# The backend is stdlib Python run in place, so there is nothing to install for
-# it - the unit points at this checkout. Building the SPA needs pnpm; if it is
-# missing the server still runs and serves a "UI not built" message rather than
-# a stack trace.
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"

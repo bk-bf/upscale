@@ -1,17 +1,7 @@
 #!/usr/bin/env bash
-# trial.sh — run one trial on the box and print ONE line. Run from the repo root.
-#
-#   research/harness/trial.sh <tag>
-#
-# One line is the point. This loop runs for eight hours and perhaps a hundred
-# trials; if each one dumps a log into the agent's context, the agent runs out
-# of context long before it runs out of night. Everything else is written to
-# research/runs/<tag>.txt and read only when a trial actually needs debugging.
 set -uo pipefail
 
 TAG=${1:?need a tag}
-# Regime A is the whole box; regime B starves the CPU to emulate the balance a
-# real production box has. See trial-run.sh. A keeper must win in BOTH.
 REGIME=${REGIME:-${2:-A}}
 R=$(cd "$(dirname "$0")/.." && pwd)
 cd "$R/.."
@@ -19,15 +9,12 @@ cd "$R/.."
 # shellcheck source=/dev/null
 . "$R/harness/box.env"
 
-# A shared connection: 4.3 s cold vs 0.7 s multiplexed, measured. Over a hundred
-# trials that is an hour of ssh handshakes not spent.
 CM="-o ControlMaster=auto -o ControlPath=/tmp/.upscale-research-%r@%h:%p -o ControlPersist=8h"
 SSH="ssh $CM $BOX_SSH"
 
 mkdir -p "$R/runs"
 LOG="$R/runs/$TAG.$REGIME.txt"
 
-# Push the two files that can change. Everything else on the box is fixed.
 scp -q $CM -P "${BOX_PORT}" "$R/worker.sh" "$R/harness/trial-run.sh" \
     "${BOX_USER}@${BOX_HOST}:/root/research/" || { echo "tag=$TAG gate=FAIL(push)"; exit 1; }
 
@@ -46,8 +33,6 @@ XSHA=$(get x264_opts_sha)
 GPU=$(get gpu_util_mean);  IDLE=$(get gpu_idle_pct)
 CPU=$(get cpu_util_mean);  DISK=$(get peak_disk_mb)
 
-# ------------------------------------------------------------------ the gate
-# Evaluated BEFORE fps is allowed to mean anything.
 GATE=PASS; WHY=""
 if [ -f "$R/baseline.env" ]; then
   # shellcheck source=/dev/null
@@ -60,8 +45,6 @@ fi
 [ "$G2" = 1 ] || { GATE=FAIL; WHY="${WHY:+$WHY,}encoder-unreadable"; }
 [ "$G3" = 1 ] || { GATE=FAIL; WHY="${WHY:+$WHY,}frame-count"; }
 
-# Compared against the baseline for THIS regime — the two are different numbers
-# and comparing across them would manufacture a speedup out of thin air.
 eval "BASE=\${BASE_FPS_$REGIME:-}"
 SPD="n/a"
 if [ -n "${BASE:-}" ] && [ "${BASE:-0}" != "0" ]; then

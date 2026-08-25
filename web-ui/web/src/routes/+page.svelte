@@ -8,27 +8,24 @@
   let notice = $state("");
   let busy = $state("");
 
-  let selected = $state(new Set());   // file paths
+  let selected = $state(new Set());
   let lastClicked = $state(null);
 
   let showImport = $state(false);
   let showMachine = $state(false);
   let showStart = $state(false);
 
-  // import browser
   let query = $state("/mnt/media/tv/");
   let listing = $state([]);
   let base = $state("");
   let picked = $state(new Set());
   let searchTimer;
 
-  // add-machine
   let mSsh = $state("");
   let mLabel = $state("");
   let probe = $state(null);
   let probing = $state(false);
 
-  // start
   let sHost = $state("");
   let sScratch = $state("");
 
@@ -83,19 +80,10 @@
     if (d?.ok) { notice = `imported ${d.added} file${d.added > 1 ? "s" : ""}`; showImport = false; picked = new Set(); }
   }
 
-  // Hold = "not this one, move on".
-  //
-  // On a QUEUED episode it drops out of the run order. On the RUNNING one the
-  // machine stops it and takes the next unheld episode - it does not stall,
-  // because stopping the whole queue is what the topbar Stop button is for.
-  // Finished chunks stay in scratch, so releasing later resumes rather than
-  // restarts.
   async function hold(on) {
     const want = on ? ["queued", "running"] : ["held", "paused"];
     const paths = sel.filter(r => want.includes(r.status)).map(r => r.path);
     if (!paths.length) {
-      // Returning quietly here made Hold look broken: nothing moved, nothing
-      // was said, and the only wrong thing was the selection.
       notice = `nothing to ${on ? "hold" : "release"} — selected: `
              + [...new Set(sel.map(r => r.status))].join(", ");
       return;
@@ -127,9 +115,6 @@
       : rows.filter(r => r.status === "queued").map(r => r.path);
     if (!paths.length) { notice = "nothing queued to start"; return; }
     notice = `starting ${paths.length} on ${sHost}…`;
-    // The endpoint runs `upscale start <device>` and returns what the command
-    // printed. It does not return a count or a scratch path any more, and
-    // inventing them here is what produced "started undefined ep in scratch".
     const d = await post("/api/start", { host: sHost }, "start");
     if (d?.ok) { notice = d.note || `started ${sHost}`; showStart = false; }
   }
@@ -159,9 +144,6 @@
     selected = s;
   }
 
-  // Sorting is a view, applied over whatever the server last sent - the table
-  // keeps refreshing every 3s underneath it, so it must not be a one-off sort
-  // of the array.
   let sortKey = $state("n");
   let sortDir = $state(1);
   function sortBy(k) {
@@ -180,8 +162,6 @@
     else { x = (a[k] ?? "").toString().toLowerCase(); y = (b[k] ?? "").toString().toLowerCase(); }
     if (x < y) return -sortDir;
     if (x > y) return sortDir;
-    // Episode number as the tiebreak, so an equal column never shuffles rows
-    // between refreshes.
     return (a.n ?? 0) - (b.n ?? 0);
   }));
 
@@ -198,13 +178,8 @@
     return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
   };
   const gb = (b) => b ? `${(b / 1073741824).toFixed(1)} GB` : "";
-  // The directory only: the basename is already the line above it, and
-  // repeating it doubles the width of the widest column for nothing.
   const dir = (p) => (p || "").replace(/\/[^/]*$/, "");
 
-  // The rate of the CURRENT phase, in that phase's own unit. fps for anything
-  // counting frames, MB/s for the two that move bytes, nothing for a phase with
-  // nothing to count.
   function phaseRate(r) {
     if (!["running", "paused", "delivering"].includes(r.status)) return "";
     if (r.phase_unit === "bytes" && r.phase_elapsed_s > 0 && r.phase_done > 0)
@@ -294,18 +269,12 @@
           {#if r.target_dir && r.status !== "done"}<span class="fdest">→ {r.target_dir}</span>{/if}
         </td>
         <td class="lib">{r.library_name}</td>
-        <!-- Which GPU machine this episode is on. Blank when nothing is running
-             it: guessing a device for queued work would be a promise no
-             scheduler here has made. -->
+        
         <td class="dev">{#if r.device}<span class="devtag">{r.device}</span>{:else}<span class="muted">—</span>{/if}</td>
         <td class="st"><span class="pill {r.status}">{r.status === "running" && r.phase ? r.phase : r.status}</span></td>
         <td class="pr">
           {#if r.status === "running" || r.status === "paused" || r.status === "delivering"}
-            <!-- THE PHASE'S OWN BAR. Each phase measures a different thing, so
-                 an episode-level number cannot represent any of them - which is
-                 how a 39% episode sat at 39% through minutes of verifying and
-                 read as stuck. A phase with nothing to count says so instead of
-                 showing a zero. -->
+            
             {#if (r.phase_percent ?? -1) >= 0}
               <div class="bar2"><div class="fill" style="width:{r.phase_percent}%"></div></div>
               <span class="pct">{r.phase_percent}%</span>
@@ -470,8 +439,6 @@
     border-bottom: 1px solid #232838; }
   tbody td { padding: .34rem .6rem; border-bottom: 1px solid #171b26; font-size: .84rem; }
   tbody tr:hover { background: #12151d; }
-  /* Shift-click is a range selection here, not a text selection - without this
-     the browser paints the run of rows blue as if it were a paragraph. */
   tbody, thead { user-select: none; -webkit-user-select: none; }
   tbody tr.sel { background: #16203a; }
   tbody tr.done { color: #6b7280; }
@@ -480,9 +447,6 @@
   .name { max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fname, .fsrc, .fpath, .fdest { display: block; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; }
-  /* the release the file was built from - brighter than the directory, because
-     this is the line that is actually being checked */
-  /* the destination reads as another path, not as a status */
   .fdest { font-family: ui-monospace, monospace; font-size: .7rem; color: #6b7280; }
   .fsrc { font-family: ui-monospace, monospace; font-size: .72rem; color: #7ab6f5;
     margin-top: .1rem; }
@@ -551,15 +515,6 @@
   .mono { font-family: ui-monospace, monospace; font-size: .76rem; }
   .pad { padding: 1.2rem .6rem; }
 
-  /* ---------------------------------------------------------------- phone ---
-     One column, and the table stops being a table. Fixed widths (.dev 10rem,
-     .pr 11rem, ...) add up to far more than a phone is wide, so the page used
-     to scroll sideways with the episode name clipped to nothing.
-
-     Rows become cards: the name is the heading, the small facts wrap
-     underneath it, and the progress bar takes the full width. thead goes to a
-     screen-reader-only box rather than display:none so sorting stays reachable
-     for anything that reads the header row. */
   @media (max-width: 760px) {
     thead { position: absolute; width: 1px; height: 1px; margin: -1px;
       overflow: hidden; clip-path: inset(50%); }
@@ -569,13 +524,11 @@
     tbody tr:focus-visible { outline-offset: 2px; }
     tbody td { padding: .1rem 0; border-bottom: 0; font-size: .85rem; }
 
-    /* the episode name is the card's heading, so let it wrap in full */
     .name { max-width: none; white-space: normal; overflow: visible;
       font-weight: 600; margin-bottom: .15rem; }
     .fname, .fsrc, .fpath, .fdest { white-space: normal; overflow: visible; }
     .fsrc, .fpath, .fdest { font-weight: 400; overflow-wrap: anywhere; }
 
-    /* the small facts flow inline under it instead of each owning a column */
     .num, .lib, .dev, .st, .rt, .et {
       display: inline-flex; align-items: center; width: auto;
       text-align: left; margin: .1rem .5rem .1rem 0; }
@@ -584,14 +537,12 @@
     .bar2 { flex: 1; width: auto; }
     .pct { margin-left: 0; }
 
-    /* comfortable touch targets, and a top bar that stacks instead of clipping */
     .topbar { padding: .5rem .55rem; gap: .45rem; }
     .counts { flex-wrap: wrap; row-gap: .2rem; }
     .spacer { flex-basis: 100%; height: 0; }
     .tb, .selbar button, button.primary, .modal button.ghost { min-height: 2.25rem; }
     .add { width: 2.4rem; height: 2.4rem; }
 
-    /* a modal centred on a short screen has to be able to scroll */
     .modal, .modal.wide { width: calc(100vw - 1.2rem);
       max-height: min(88vh, 100dvh - 2rem); overflow-y: auto; padding: .9rem; }
     .form { grid-template-columns: 1fr; }

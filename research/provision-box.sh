@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# provision-box.sh — make a fresh rented GPU box able to run upscale trials.
-#
-# Runs ON the box. Idempotent: every step checks before it does anything, so a
-# re-run after a partial failure costs seconds, not a re-download.
-#
-# There was no provisioning script for the Bleach run — the box was built by
-# hand and the recipe died with it. This is that recipe, written down.
-#
-# The model is NOT built here. It is converted on the orchestration node (torch
-# + pnnx, CPU only) and pushed in, so it survives the box being destroyed.
 set -euo pipefail
 
 BENCH=${BENCH:-/root/bench}
@@ -21,7 +11,6 @@ die(){ printf 'provision: %s\n' "$*" >&2; exit 1; }
 
 mkdir -p "$BENCH"
 
-# ---------------------------------------------------------------- packages
 if ! command -v unzip >/dev/null 2>&1 || ! command -v vulkaninfo >/dev/null 2>&1; then
   say "installing packages"
   export DEBIAN_FRONTEND=noninteractive
@@ -31,10 +20,6 @@ else
   say "packages already present"
 fi
 
-# ---------------------------------------------------------------- vulkan
-# The GPU must be visible to Vulkan, not just to nvidia-smi. A container with a
-# working nvidia-smi and no ICD json fails here, and realesrgan's failure mode
-# is a silent fallback to a device that does not exist.
 say "vulkan check"
 if [ ! -e /usr/share/vulkan/icd.d/nvidia_icd.json ] && [ -e /etc/vulkan/icd.d/nvidia_icd.json ]; then
   mkdir -p /usr/share/vulkan/icd.d
@@ -45,15 +30,12 @@ GPUNAME=$(vulkaninfo --summary 2>/dev/null | grep -m1 "deviceName" | sed 's/.*= 
 [ -n "$GPUNAME" ] || die "no Vulkan device — realesrgan cannot run here"
 say "  vulkan device: $GPUNAME"
 
-# ---------------------------------------------------------------- upscaler
 if [ -x "$BENCH/resrgan/realesrgan-ncnn-vulkan" ]; then
   say "realesrgan already installed"
 else
   say "downloading realesrgan-ncnn-vulkan $RESRGAN_VER"
   tmp=$(mktemp -d)
   curl -fsSL "$RESRGAN_URL" -o "$tmp/r.zip" || die "realesrgan download failed"
-  # The zip carries a top-level directory; flatten it so the binary path is
-  # stable across releases.
   unzip -qo "$tmp/r.zip" -d "$tmp/x"
   bin=$(find "$tmp/x" -name realesrgan-ncnn-vulkan -type f | head -1)
   [ -n "$bin" ] || die "no realesrgan binary inside the zip"
@@ -64,10 +46,6 @@ else
   say "  installed to $BENCH/resrgan"
 fi
 
-# ---------------------------------------------------------------- ffmpeg
-# ffmpeg 8.1.2 silently mis-decodes MPEG-4 ASP with a *correct* frame count.
-# The box ships 6.1.1; a second, independent decoder is fetched so the
-# two-decoder cross-check the pipeline relies on can actually run once here.
 FFSTATIC="$BENCH/ffmpeg-${FFMPEG_VER}-amd64-static/ffmpeg"
 if [ -x "$FFSTATIC" ]; then
   say "static ffmpeg $FFMPEG_VER already installed"
@@ -93,7 +71,6 @@ else
   rm -rf "$tmp"
 fi
 
-# ---------------------------------------------------------------- report
 say "--- provisioned ---"
 printf 'gpu_vulkan\t%s\n'  "$GPUNAME"
 printf 'resrgan\t%s\n'     "$([ -x "$BENCH/resrgan/realesrgan-ncnn-vulkan" ] && echo ok || echo MISSING)"

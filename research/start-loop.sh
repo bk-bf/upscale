@@ -1,30 +1,15 @@
 #!/usr/bin/env bash
-# start-loop.sh — arm the guard, cut the branch, hand the night to mon.
-#
-#   research/start-loop.sh [hours]      default 8
-#
-# Everything the loop needs to know is in PROGRAM.md and BASELINE.md; this only
-# sets up the things that cannot live in a document — the deadline on disk, the
-# branch to advance, and a session the user can read from a phone.
 set -euo pipefail
 R=$(cd "$(dirname "$0")" && pwd)
 cd "$R/.."
 
 HOURS=${1:-8}
 
-# mon is not on PATH in a non-login shell, which is exactly where this gets run
-# from. Resolve it rather than failing after the guard is already armed.
 MON=$(command -v mon) || MON=$HOME/Documents/Projects/mon/mon
 [ -x "$MON" ] || { echo "cannot find mon" >&2; exit 1; }
 TAG=${TAG:-$(date +%b%d | tr 'A-Z' 'a-z')}
 BRANCH="autoresearch/$TAG"
 
-# No baseline.env check: establishing the baseline is the loop's own first job,
-# per PROGRAM.md "Setup". Handing it a baseline measured by someone else would
-# make experiment zero unreproducible by the thing that depends on it.
-# A branch that exists but carries no experiments is a launch that failed before
-# it started, not a run in progress — reuse it. Refuse only when there is real
-# work on it, which a fresh run would silently bury.
 if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
   AHEAD=$(git rev-list --count "main..$BRANCH") || AHEAD=1
   [ "$AHEAD" = 0 ] || {
@@ -35,13 +20,8 @@ else
   git checkout -q -b "$BRANCH"
 fi
 
-# The deadline goes on disk before anything else. A loop that tracks its own
-# deadline in its own head forgets, drifts, or talks itself out of stopping.
 "$R/harness/guard.sh" --arm "$HOURS"
 
-# One registered sender, so the morning report and a dead loop cannot each
-# invent their own way to reach the phone. Two notifiers on one topic already
-# produced three alerts for one event in this project.
 notify --register upscale-research "$R/start-loop.sh" \
   "overnight upscale optimisation loop: finished, or died early" 2>/dev/null || true
 
