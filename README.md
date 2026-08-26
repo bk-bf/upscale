@@ -12,6 +12,10 @@ upscale --source /srv/incoming --target /srv/done --archive /srv/originals \
 Two files. `upscale` runs on the machine holding the media; `upscale-worker`
 runs on each GPU. `./install.sh` puts both in `~/.local`.
 
+On a GPU box that has no checkout, that copy is the only thing there and the
+default is what you want. On the machine you edit from, `./install.sh --link`
+symlinks the two instead, so an edit is live without reinstalling.
+
 ## The idea
 
 A source is a file in the source directory. That is the whole model.
