@@ -353,6 +353,51 @@ no re-encode, ~30 s on a 1 GB episode, frame count re-asserted afterwards. If
 mkvmerge is missing the worker says so loudly rather than shipping a file that
 looks fine everywhere except in front of the person watching it.
 
+## The one where the audio was muxed minutes ahead of the video
+
+**`ffmpeg -f concat -i segments -i source -c copy` writes the source's audio far
+ahead of the concatenated video, and mpv then gets no video packets at all.**
+
+65 MB into a delivered Air Gear episode the audio had reached 274 s and the
+video 0.2 s. ffmpeg's interleaver waits `max_interleave_delta` — 10 s by
+default — for the slower input and then flushes what it is holding, and the
+concat demuxer feeds video slowly enough to hit that on every episode.
+
+Every check the pipeline makes passes. Frame count, duration, per-track start
+times, stream list, chapters, attachments and full-file decoding are all
+correct, because `ffmpeg` reads sequentially with no queue of its own. mpv has
+one, and stops reading when it fills:
+
+```
+[mkv] Too many packets in the demuxer packet queues:
+[mkv]   video/0: 0 packets, 0 bytes
+[mkv]   audio/1: 10092 packets, 157292272 bytes
+```
+
+The video track receives nothing, so one frame is presented and video hits EOF
+while audio plays to the end. Picture frozen on frame 0, seeking moves nothing,
+sound perfect — in mpv, in Fladder and in Jellyfin's clients alike.
+
+Gintama never showed it. Its audio is small enough that the gap stays under
+mpv's 150 MB queue; Air Gear's FLAC at 1.45 Mbps crosses it inside the first
+minute of the episode. The same muxing code had been shipping both.
+
+**Fix:** `-max_interleave_delta 0` on the mux, which lets ffmpeg buffer as far
+as it needs to interleave by timestamp. `mkvmerge` afterwards keeps the order.
+Measured on one delivered episode: 3 video packets in the first 3000 before,
+1054 after; mpv wrote 3 identical frames for four seconds of video before, 96
+frames with 91 distinct images after.
+
+Reading the interleave of a delivered file, which no other check here covers:
+
+```bash
+ffprobe -v error -show_entries packet=stream_index -of csv=p=0 FILE |
+  head -3000 | grep -c '^0$'
+```
+
+Under about 100 video packets in the first 3000 means the file is unplayable in
+mpv whatever everything else reports.
+
 ## Measurement mistakes
 
 - **Extrapolating throughput from TFLOPS was wrong every time.** Predicted 2–3 fps for a

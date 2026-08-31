@@ -494,7 +494,7 @@ EOF
   # -f matroska: ffmpeg cannot infer a container from the ".part" suffix
   ffmpeg -v error -f concat -safe 0 -i "$SEGDIR/list" -i "$LOCAL" \
          -map 0:v:0 -map "1:a?" -map "1:s?" -map "1:t?" \
-         -c copy -f matroska "$OUT.part" -y
+         -c copy -max_interleave_delta 0 -f matroska "$OUT.part" -y
   local final; final=$(vframes "$OUT.part")
   [ "$final" = "$TOTAL" ] || die "FINAL MISMATCH: $final frames, source had $TOTAL"
 
